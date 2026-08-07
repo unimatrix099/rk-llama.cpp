@@ -113,7 +113,7 @@ float calculate_entropy_amax(const float* data, size_t n_elements, int num_bins,
     const double bin_width = (double)abs_max_val * 2.0 / num_bins;
     for (size_t i = 0; i < n_elements; ++i) {
         int bin_index = static_cast<int>(((data[i] + abs_max_val) / bin_width));
-        bin_index = std::min(num_bins - 1, bin_index);
+        bin_index = std::max(0, std::min(num_bins - 1, bin_index));
         p_dist[bin_index]++;
     }
 
