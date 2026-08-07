@@ -12,6 +12,10 @@
 
 #include <omp.h>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #include <cassert>
 #include <cstring>
 #include <mutex>
@@ -1432,6 +1436,17 @@ static ggml_backend_dev_t ggml_backend_rknpu_reg_get_device(ggml_backend_reg_t r
 //
 
 GGML_API ggml_backend_reg_t ggml_backend_rknpu2_reg(void) {
+#if defined(__GLIBC__)
+    // librknnrt manages device memory mappings from its own worker threads and
+    // can unmap address ranges that alias glibc's mmap-served large malloc
+    // chunks, pulling pages out from under live allocations (observed as
+    // intermittent SIGSEGV in the calibration buffers during weight upload).
+    // Keeping large allocations on the brk heap moves them out of the
+    // contested mmap address range.
+    static const int rknpu_malloc_no_mmap = mallopt(M_MMAP_MAX, 0);
+    (void) rknpu_malloc_no_mmap;
+#endif
+
     static const struct ggml_backend_reg_i rknpu_reg_interface = {
         /* .get_name         = */ ggml_backend_rknpu_reg_get_name,
         /* .get_device_count = */ ggml_backend_rknpu_reg_get_device_count,
