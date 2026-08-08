@@ -1,0 +1,171 @@
+# RKNPU2 backend: optimization notes (RK3588)
+
+A record of every performance optimization attempted for this backend on
+RK3588 — what shipped, what failed, and the measurements behind each verdict.
+Failed attempts are documented deliberately: each one closes off a
+plausible-sounding path so future contributors don't re-walk it.
+
+Companion document: `RKNPU2-W4A4-investigation.md` (crash root-causes, bug
+fixes, environment details). All numbers: Orange Pi 5 Ultra (RK3588, 16 GB),
+`llama-bench -p 128 -n 64` unless noted.
+
+## The mental model that explains every result
+
+- **Token generation (M=1) is memory-bandwidth bound.** Every token re-reads
+  the full active weight set. Whoever reads fewer bytes wins; compute is
+  nearly irrelevant.
+- **Prompt processing (M large) is compute-amortized.** One weight read
+  serves the whole batch, so the NPU's matmul throughput dominates and it
+  beats the CPU.
+- The backend upconverts weights to the pipeline's precision: a Q4_0 GGUF on
+  `W8A8` doubles the NPU's per-token read vs the CPU's native Q4_0 read.
+  This single fact is why NPU decode loses on dense models, and it framed
+  every attempt below.
+
+## Baselines
+
+### Gemma 4 E4B Q4_0 (7.46 B dense — "effective 4B" applies only to
+Google's edge stack, not llama.cpp; see investigation doc)
+
+| Config | pp128 t/s | tg64 t/s |
+|---|---|---|
+| CPU only | 25.2 | 4.9 |
+| NPU `W8A8_STANDARD` | 39.8 | 3.3 |
+| NPU `W16A16_STANDARD` | 28.2 | 1.9 |
+| NPU `W4A4_HADAMARD` (default for Q4_0) | 7.7 | 3.4 |
+| NPU `W4A4_STANDARD` (control, broken accuracy) | 10.8 | n/a |
+| **NPU + `RKNPU_CPU_DECODE=32` (shipped)** | **41.3** | **4.9** |
+
+### Others
+
+| Model | Config | pp128 | tg64 |
+|---|---|---|---|
+| LFM2-8B-A1B Q8_0 (MoE, ~1.5B active) | NPU `W8A8` | 48.3 | 9.1 |
+| LFM2-8B-A1B Q8_0 | CPU only | 46.2 | 7.6 |
+| LFM2-8B-A1B Q8_0 | NPU + `CPU_DECODE=32` | 47.8 | 7.7 ← regression |
+| Qwen2.5-1.5B Q8_0 | NPU `W8A8` (interactive) | ~50 | ~5.0 |
+
+## ✅ Shipped: M-dependent routing (`RKNPU_CPU_DECODE=<M>`)
+
+**Hypothesis:** since NPU wins prefill and CPU wins decode (dense models),
+route per-op by batch size and get both.
+
+**Implementation:** opt-in env var. `supports_op` rejects MUL_MAT with
+M < threshold, so the scheduler runs decode on the CPU backend; the buffer
+keeps the original GGUF bytes host-resident next to the packed NPU copy
+(dual residency, `is_host` advertised) so the CPU computes in place with no
+per-graph copies.
+
+**Result:** E4B pp 41.3 / tg 4.9 — matches the better column of both
+baselines simultaneously; +49% tg over NPU-only.
+
+**Caveats (all measured or verified):**
+- Opt-in on purpose: models whose NPU decode already beats CPU regress
+  (LFM2 tg 9.1 → 7.7). Enable only when CPU-only tg > NPU tg for the model.
+- One extra model-size resident copy in RAM.
+- Requires mmap loading (default); `--no-mmap` would bypass `set_tensor`
+  for host-visible buffers and the NPU copy would never be built.
+- Prompts shorter than the threshold also run on CPU (M = prompt length at
+  prefill), visible as low pp on very short prompts.
+
+```sh
+RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32 \
+  ./build/bin/llama-cli -m gemma-4-E4B-it-Q4_0.gguf ...
+```
+
+## ✅ Shipped as guidance: pipeline pairing
+
+For throughput on RK3588, `W8A8_STANDARD` is the strongest NPU pipeline for
+every model tested — including Q4_0 GGUFs, where the default W4A4 mapping is
+5x slower at prefill. W4A4 is a capacity mode (halves NPU memory, fits
+larger models under the 4 GB/domain limit), not a speed mode. Prefer Q8_0
+GGUFs where possible (correct precision pairing); for Q4_0 files force
+`RKNPU_HYBRID=W8A8_STANDARD` when speed matters.
+
+## ❌ Dead end: mixed-precision pipelines (W4A16 / W8A16)
+
+**Hypothesis:** weight-only quantized NPU matmuls
+(`RKNN_FLOAT16_MM_INT4_TO_FLOAT32` etc.) would halve decode weight traffic
+vs W8A8, eliminate activation quantization error, and make the Hadamard
+transform unnecessary — the same semantics that make GGUF Q4_0 work on CPU.
+The types exist in the vendored `rknn_matmul_api.h`, and the fork already
+has every building block (FP16 A-path, INT4 B-path, CPU-side scaling).
+
+**Method:** standalone probe program creating matmul contexts for types
+1/2/10 (symmetric) and 5/7/11 (mixed) at aligned shapes, NATIVE B layout.
+
+**Result:** all symmetric types create successfully; **every mixed type
+fails with `unsupported matmul dtype in this platform`** — a runtime
+platform-capability rejection, not an alignment or layout issue. The
+vendored librknnrt 2.3.2 is the latest Rockchip has released (checked
+against airockchip/rknn-toolkit2), so there is no newer blob to swap in.
+The mixed types evidently target other Rockchip silicon.
+
+**Verdict:** not implementable on RK3588 until Rockchip enables these
+dtypes for it. Revisit if a librknnrt newer than 2.3.2 ships — the probe
+program takes minutes to re-run.
+
+## ❌ Dead end: tensor exclusion / offload heuristics
+
+**Hypothesis:** the giant vocab tensor (262144x2048, ~0.5 GB as INT8) or
+the many tiny AltUp/LAUREL/per-layer matmuls (NPU dispatch overhead) drag
+down E4B; excluding them from the NPU should help.
+
+**Method:** `--override-tensor` with three configs on E4B `W8A8`:
+big embedding/LM-head → CPU; small arch tensors → CPU; both.
+
+**Result:** pp 40.2–40.5, tg 3.29–3.31 — all within noise of the 39.8/3.28
+baseline.
+
+**Verdict:** no individual tensor class matters; the cost is the aggregate
+weight-byte volume. Size- or name-based offload filtering in
+`resolve_op_support` is not worth building. (This null result is also what
+pointed at bandwidth and motivated M-dependent routing.)
+
+## ❌ Dead end: offloading the Hadamard transform to the NPU
+
+**Hypothesis:** W4A4's per-token CPU Hadamard transform (needed to spread
+activation outliers before 4-bit quantization) is the reason W4A4 prefill
+is 5x slower than W8A8; the transform folds into a constant ±1 matrix and
+could run as an NPU matmul (QuaRot-style, block-diagonal to keep the M=1
+constant-matrix re-read affordable).
+
+**Method (control experiment):** benchmark `W4A4_STANDARD`, which runs the
+identical INT4 NPU path with zero transform cost (its output is numerically
+broken, but the timing isolates the transform).
+
+**Result:** pp only improves 7.7 → 10.8 t/s — still 3.7x slower than W8A8's
+39.8. The dominant cost is the INT4 matmul path inside the closed runtime
+itself, consistent with upstream's own dense-model benchmarks (Gemma3 1B:
+INT4 NPU pp 51 vs INT8 NPU pp 378).
+
+**Verdict:** even a perfect, free transform leaves W4A4 far behind W8A8.
+Research-grade surgery (block-Hadamard weight+compute changes, accuracy
+revalidation) to optimize the minor term of the slowdown is not worth it.
+
+## ⏸ Assessed and deprioritized
+
+- **QKV / gate-up matmul fusion** (fewer NPU dispatches, fewer of E4B's 603
+  graph splits/token): the exclusion experiments showed dispatch/split
+  overhead is not the decode bottleneck, so expected payoff is a minor
+  prefill gain at moderate complexity. Revisit only if profiling shows
+  dispatch overhead after other wins.
+- **Calibration caching to disk**: W4A4's entropy/KL scale search costs
+  minutes per load on big tensors; caching per-tensor scales (keyed by
+  tensor hash) would fix reload times. Load-time QoL only — and less
+  relevant while W4A4 remains a niche mode.
+- **Speculative decoding** (Gemma 4 E2B/270M draft for E4B via
+  `llama-speculative`): plausible tg multiplier, but draft and target share
+  the same bandwidth-starved memory bus on this board, so gains are
+  uncertain. Untested.
+
+## Summary table
+
+| Attempt | Verdict | Evidence |
+|---|---|---|
+| M-dependent routing (`RKNPU_CPU_DECODE`) | ✅ shipped | E4B tg +49%, pp preserved |
+| W8A8 pairing guidance | ✅ shipped (docs) | fastest pipeline on all models tested |
+| Mixed W4A16/W8A16 pipelines | ❌ platform-blocked | runtime rejects dtypes on RK3588 |
+| Tensor exclusion heuristics | ❌ no effect | 3 configs within noise |
+| Hadamard transform on NPU | ❌ not worth it | transform-free control still 3.7x slower |
+| QKV fusion, calib cache, speculative | ⏸ deprioritized | see above |
