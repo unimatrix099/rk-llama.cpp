@@ -157,6 +157,21 @@ private:
 };
 static IOMMUDomainManager g_domain_manager;
 
+// M-dependent routing threshold (RKNPU_CPU_DECODE env variable).
+// When set to M > 0, MUL_MAT ops whose batch dimension is below M are
+// rejected by supports_op so the scheduler runs them on the CPU backend.
+// Token generation (M=1) is memory-bandwidth bound and the NPU re-reads
+// weights at upconverted precision, so the CPU's native-quantization read
+// path can be faster. Requires keeping the original weight bytes
+// host-resident (see dual residency in set_tensor / get_alloc_size).
+static int rknpu_cpu_decode_threshold() {
+    static const int threshold = []() {
+        const char* env = std::getenv("RKNPU_CPU_DECODE");
+        return env ? std::atoi(env) : 0;
+    }();
+    return threshold;
+}
+
 // Macro for RKNN API calls
 #define RKNN_CHECK(stmt, msg)                                           \
     do {                                                                \
@@ -1154,6 +1169,13 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
         rknn_matmul_ctx sync_ctx = g_domain_manager.get_allocator_context(alloc.iommu_domain_id);
         RKNN_CHECK(rknn_mem_sync(sync_ctx, alloc.mem, RKNN_MEMORY_SYNC_TO_DEVICE), "sync B TO_DEVICE");
+
+        // Dual residency for M-dependent routing: keep the original bytes
+        // host-resident so the CPU backend can compute small-M mul_mats
+        // from them in place (get_alloc_size reserves the room).
+        if (rknpu_cpu_decode_threshold() > 0) {
+            memcpy((uint8_t*)tensor->data + offset, data, size);
+        }
     } else {
         memcpy((uint8_t*)tensor->data + offset, data, size);
     }
@@ -1162,6 +1184,13 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     auto * ctx = (ggml_backend_rknpu_buffer_context*)buffer->context;
     size_t tensor_offset_in_virtual = (uintptr_t)tensor->data - (uintptr_t)ctx->virtual_base;
+
+    // With dual residency the host region holds the original bytes, which is
+    // what readers expect (the DMA copy is packed in NPU-native layout).
+    if (rknpu_cpu_decode_threshold() > 0) {
+        memcpy(data, (uint8_t*)tensor->data + offset, size);
+        return;
+    }
 
     std::lock_guard<std::mutex> lock(ctx->mutex);
     auto it = ctx->tensor_allocs.find(tensor_offset_in_virtual);
@@ -1228,7 +1257,23 @@ static size_t ggml_backend_rknpu_buffer_type_get_alignment(ggml_backend_buffer_t
 
 static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
     UNUSED(buft);
-    return get_tensor_packed_size(tensor);
+    size_t size = get_tensor_packed_size(tensor);
+
+    // Dual residency needs room for the original bytes in the host region
+    // (the packed size can be smaller, e.g. INT4 packing of a Q4_0 tensor)
+    if (rknpu_cpu_decode_threshold() > 0) {
+        size = std::max(size, ggml_nbytes(tensor));
+    }
+    return size;
+}
+
+static bool ggml_backend_rknpu_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    UNUSED(buft);
+    // Only advertised with dual residency, where the host region holds valid
+    // original bytes the CPU backend can read in place. NOTE: this path
+    // requires mmap model loading (the default); --no-mmap bypasses
+    // set_tensor for host buffers and the NPU copy would never be built.
+    return rknpu_cpu_decode_threshold() > 0;
 }
 
 
@@ -1287,6 +1332,13 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             // Searching for available hardware pipeline for this tensor
             const auto* pipeline = config.resolve_op_support(src0);
             if (!pipeline) {
+                return false;
+            }
+
+            // M-dependent routing: reject small-M (token generation) mul_mats
+            // so the scheduler runs them on the CPU from the host-resident
+            // original bytes, while large-M (prefill) stays on the NPU
+            if (src1->ne[1] < rknpu_cpu_decode_threshold()) {
                 return false;
             }
 
@@ -1390,7 +1442,7 @@ static ggml_backend_dev_t ggml_backend_rknpu_reg_get_device(ggml_backend_reg_t r
         /* .get_alignment  = */ ggml_backend_rknpu_buffer_type_get_alignment,
         /* .get_max_size   = */ NULL,
         /* .get_alloc_size = */ ggml_backend_rknpu_buffer_type_get_alloc_size,
-        /* .is_host        = */ NULL,
+        /* .is_host        = */ ggml_backend_rknpu_buffer_type_is_host,
     };
 
     static struct ggml_backend_buffer_type rknpu_buffer_type = {
