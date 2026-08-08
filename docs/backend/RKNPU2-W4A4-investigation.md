@@ -147,6 +147,54 @@ Note this upconverts 4-bit weights to INT8 (no accuracy gain over the source
 Q4_0, per the README's "terrible case" pairing guidance) — prefer a Q8_0 GGUF
 when disk/bandwidth allows.
 
+## Improvement investigation (follow-up)
+
+### Mixed-precision matmul types: blocked on RK3588
+
+The obvious fix for the decode-bandwidth problem would be weight-only
+quantized NPU pipelines (W4A16 via `RKNN_FLOAT16_MM_INT4_TO_FLOAT32`,
+W8A16 via `RKNN_FLOAT16_MM_INT8_TO_FLOAT32`) - halving weight traffic and
+removing the need for activation quantization and the Hadamard transform
+entirely. The types exist in the API header, but a direct probe shows
+librknnrt 2.3.2 (the latest available runtime) rejects every mixed-dtype
+combination on RK3588 with `unsupported matmul dtype in this platform`.
+Only the symmetric types (FP16xFP16, INT8xINT8, INT4xINT4) create
+successfully. Until Rockchip enables these types for RK3588, weight-only
+NPU quantization is not implementable.
+
+Tensor-exclusion experiments (`--override-tensor` moving the giant
+embedding/LM-head or the small AltUp/LAUREL tensors to CPU) were also
+measured and land within noise of baseline - the bottleneck is aggregate
+weight bandwidth, not any individual tensor or dispatch overhead.
+
+### M-dependent routing (`RKNPU_CPU_DECODE`, implemented)
+
+Token generation (M=1) re-reads the full weight set per token; for a Q4_0
+model the NPU reads it at upconverted INT8 width (2x the CPU's native
+read), which is why NPU decode loses to CPU on dense models while NPU
+prefill wins. `RKNPU_CPU_DECODE=<M>` routes MUL_MAT ops with batch
+dimension below M to the CPU backend (computing in place from a
+host-resident copy of the original weights) while prefill stays on the
+NPU.
+
+Measured (Gemma 4 E4B Q4_0, `RKNPU_HYBRID=W8A8_STANDARD`, pp128/tg64):
+
+| Config | pp128 t/s | tg64 t/s |
+|---|---|---|
+| NPU only | 39.8 | 3.3 |
+| CPU only | 25.2 | 4.9 |
+| `RKNPU_CPU_DECODE=32` | **41.3** | **4.9** |
+
+```sh
+RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32 ./build/bin/llama-cli -m gemma-4-E4B-it-Q4_0.gguf ...
+```
+
+Caveats: costs one extra model-size resident copy in RAM; requires mmap
+loading (the default); prompts shorter than the threshold also run on
+CPU; and it is intentionally opt-in because models whose NPU decode
+already beats CPU regress (LFM2-8B-A1B tg: 9.1 -> 7.7). Rule of thumb:
+enable it when CPU-only tg beats NPU tg for your model.
+
 ## Operational notes
 
 - `ulimit -n 65536` before running is mandatory: the runtime opens one fd
