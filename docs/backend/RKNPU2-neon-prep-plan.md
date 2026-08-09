@@ -1,8 +1,7 @@
 # NEON vectorization of the W4A4 CPU-side prep: research + plan
 
 Branch: `feat/w4a4-neon-prep`, on top of the native-layout work
-(`RKNPU2-native-layout-plan.md`). Status: **research done, measured;
-implementation not started.**
+(`RKNPU2-native-layout-plan.md`). Status: **complete — implemented, validated, measured.**
 
 ## Why this is the next lever
 
@@ -85,3 +84,62 @@ with Qwen-class models (smaller K, prep-heavier mix) gaining
 proportionally more. The C-dequant and INT8-quantize bonuses also shave a
 little off every pipeline, including W8A8 itself. To be confirmed by
 benchmark, not asserted.
+
+## Implementation results (complete)
+
+All prep kernels vectorized behind `#ifdef __ARM_NEON` beside the scalar
+code (`rknpu2-quantization.cpp`: int4 pack, int8 quantize, new `amax_fp32`
+/ `mul_fp32` / `dequant_acc_int16_to_fp32` / `dequant_acc_int16_tiled`
+helpers; `rknpu2-calibration.cpp`: `fwht_iterative`; `ggml-rknpu2.cpp`
+uses the helpers in the A- and C-passes). Tests first
+(`test-rknpu2-prep-kernels.cpp`, `make -f Makefile.rknpu2-tools
+check-prep`): 170 checks, green at -O2 and -O0; all touched functions at
+100% line coverage (file total 99%, remainder unused std:: template
+instantiations).
+
+Measured end-to-end (llama-bench pp128/tg64):
+
+| Config | pre-NEON | post-NEON |
+|---|---|---|
+| E4B Q4_0 W4A4 (default) | 31.95 / 3.54 | **34.44 / 3.65** |
+| Qwen2.5-1.5B forced W4A4 | 93.88 / 3.00 | **105.69 / 3.02** |
+| E4B W8A8 (bonus: int8 quant NEON) | 41.10 / 3.40 | **41.53 / 3.41** |
+
+The projection band (36-39 for E4B) was optimistic: the prep is spread
+across OpenMP workers, so single-thread kernel gains dilute; the measured
++8% E4B / +13% Qwen is the honest outcome. W4A4 prefill now stands at
+7.7 -> 34.4 t/s cumulative (4.5x) on E4B.
+
+### The divergence investigation (validation earned its keep)
+
+End-to-end perplexity identity initially FAILED despite 167/167 exact
+unit checks. The bisect (scalar q4pack only -> bit-identical baseline)
+isolated the divergence to one semantic difference, which turned out to
+be a **pre-existing bug being fixed**: the scalar int4 packer casts
+`(int8_t)roundf(v)` BEFORE clamping, wrapping for |v| >= 127.5 and
+sign-flipping extreme outliers to the wrong clamp bound. Reachable only
+on the B side, where the entropy calibration deliberately clips
+(src/scale can far exceed 7). The NEON path clamps in int32 - correct
+sign. A/B under identical Hadamard seeds proved the fix is invisible in
+the real pipeline (bit-identical chunks: the transform smooths outliers
+below the wrap threshold) and only changes the numerically-broken
+`W4A4_STANDARD`. Extreme-value tests now pin the corrected semantics.
+
+Other findings pinned by tests along the way:
+- `vcvtaq` (round-half-away) matches `roundf`; `vcvtnq` (half-to-even)
+  silently differs on ties.
+- The dequant-accumulate must be explicitly fused (`vfmaq`/`fmaf`): GCC
+  contracts the original scalar loop to FMA at -O2 (verified by
+  disassembly), and an unfused NEON body or scalar tail diverges.
+- int8 has no clamp; NEON narrowing wraps identically to the scalar cast
+  (pinned by test; unreachable in the backend, where scale = amax/127).
+
+### Hadamard seeding fix (companion change)
+
+Validating the clamp fix required comparable runs, which exposed that the
+pointer-seeded sign vectors made W4A4_HADAMARD unreproducible even under
+`setarch -R` across different binaries. The seeds now come from an FNV-1a
+hash of the tensor name (address fallback for unnamed tensors):
+W4A4_HADAMARD perplexity is now bit-identical across runs and builds
+(verified), with `W4A4_STANDARD` unaffected. This closes the
+reproducibility issue first documented in the native-layout plan.

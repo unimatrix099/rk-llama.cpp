@@ -89,6 +89,24 @@ half the NPU memory of W8A8). Opt out with `RKNPU_AC_NATIVE=0`.
 W4A4 is thereby no longer the slowest NPU pipeline; the remaining gap to
 W8A8 prefill is CPU-side activation prep (scalar Hadamard + INT4 pack).
 
+## ✅ Shipped: NEON vectorization of the W4A4 CPU prep
+
+**Hypothesis (RKNPU2-neon-prep-plan.md):** after the native-layout fix,
+the W4A4 prefill gap to W8A8 is scalar CPU prep (FWHT, sign multiply,
+amax, int4 pack, C dequant); NEON should recover much of it.
+
+**Result:** kernel-level 3.0-4.0x (measured, `rknpu2-bench-prep`);
+end-to-end E4B W4A4 pp 31.95 -> **34.44** (+8%), Qwen forced-W4A4 pp
+93.88 -> **105.69** (+13%), W8A8 pp 41.10 -> 41.53 (free int8-quant
+bonus). Gains dilute across OpenMP workers, hence less than raw kernel
+speedups. Along the way the validation pipeline caught and fixed a
+pre-existing int4 clamp bug (extreme outliers sign-flipped via int8 wrap
+before clamping; only the broken W4A4_STANDARD pipeline was affected)
+and replaced pointer-seeded Hadamard sign vectors with name-hash seeding,
+making W4A4_HADAMARD reproducible across runs and builds for the first
+time. 170 exactness checks (`check-prep`), touched functions at 100%
+line coverage.
+
 ## ✅ Shipped as guidance: pipeline pairing
 
 For throughput on RK3588, `W8A8_STANDARD` is the strongest NPU pipeline for
