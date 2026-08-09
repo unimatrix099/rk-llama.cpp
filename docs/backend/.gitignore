@@ -1,0 +1,7 @@
+test-rknpu2-native-layout
+test-rknpu2-native-equivalence
+rknpu2-matmul-probe
+rknpu2-matmul-bench
+rknpu2-matmul-layout-bench
+rknpu2-layout-dims-probe
+.cov/
