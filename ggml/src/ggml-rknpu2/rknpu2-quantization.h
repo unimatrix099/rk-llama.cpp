@@ -54,6 +54,34 @@ void quantize_fp32_to_int8(const float * src, int8_t * dst, size_t n_elements, f
 void quantize_fp32_to_int4_packed(const float * src, uint8_t * dst, size_t n_elements, float scale);
 
 
+// --- Row helpers for the activation prep path ---
+
+/**
+ * @brief Returns max(|src[i]|) over the row (0 for an empty row).
+ */
+float amax_fp32(const float * src, size_t n_elements);
+
+/**
+ * @brief Elementwise multiply: dst[i] = a[i] * b[i].
+ * Used for the Hadamard sign-vector application.
+ */
+void mul_fp32(float * dst, const float * a, const float * b, size_t n_elements);
+
+/**
+ * @brief Dequantize-accumulate a row of INT16: dst[i] += src[i] * scale.
+ */
+void dequant_acc_int16_to_fp32(float * dst, const int16_t * src, size_t n_elements, float scale);
+
+/**
+ * @brief Dequantize-accumulate one row out of a native-layout INT16 C matrix
+ * ([outer, m_stride, sub] cells; see rknpu2-native-layout.h):
+ * dst[t*sub + j] += cell(t, m)[j] * scale, for t in [0, outer) and
+ * t*sub + j < n_limit.
+ */
+void dequant_acc_int16_tiled(float * dst, const int16_t * src_native,
+                             int32_t m, int32_t m_stride, int32_t outer, int32_t sub,
+                             int32_t n_limit, float scale);
+
 // --- Dequantization to FP32 ---
 
 /**

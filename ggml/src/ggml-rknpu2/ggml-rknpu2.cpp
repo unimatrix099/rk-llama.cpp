@@ -675,7 +675,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     if (is_hadamard) {
                         std::vector<float> signed_row(K);
                         std::vector<float> full_hadamard_row(K_op);
-                        for(int k=0; k<K; ++k) signed_row[k] = src_row[k] * s_vec[k];
+                        rknpu2_quantization::mul_fp32(signed_row.data(), src_row, s_vec.data(), K);
                         rknpu2_calibration::hadamard_transform(full_hadamard_row.data(), signed_row.data(), K, K_op);
 
                         memcpy(ready_row.data(), full_hadamard_row.data() + k_seg.offset_k, K_seg_op * sizeof(float));
@@ -690,18 +690,14 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         rknpu2_quantization::convert_fp32_to_fp16(ready_row.data(), dst_row, K_seg_op);
                     }
                     else if (pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8) {
-                        float amax_m = 0.0f;
-                        for (int k = 0; k < K_seg_op; ++k) amax_m = std::max(amax_m, std::abs(ready_row[k]));
-                        scales_A[m] = amax_m / 127.0f;
+                        scales_A[m] = rknpu2_quantization::amax_fp32(ready_row.data(), K_seg_op) / 127.0f;
 
                         int8_t* dst_ptr = (int8_t*)dst_base;
                         int8_t* dst_row = dst_ptr + (size_t)m * K_seg_op;
                         rknpu2_quantization::quantize_fp32_to_int8(ready_row.data(), dst_row, K_seg_op, scales_A[m]);
                     }
                     else if (pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
-                        float amax_m = 0.0f;
-                        for (int k = 0; k < K_seg_op; ++k) amax_m = std::max(amax_m, std::abs(ready_row[k]));
-                        scales_A[m] = amax_m / 7.0f;
+                        scales_A[m] = rknpu2_quantization::amax_fp32(ready_row.data(), K_seg_op) / 7.0f;
 
                         uint8_t* dst_ptr = (uint8_t*)dst_base;
                         if (a_native) {
@@ -826,21 +822,13 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                                 float* dst_ptr = dst_data + (size_t)m * N + N_offset;
 
                                 if (c_native[idx]) {
-                                    const int16_t* seg_base = (const int16_t*)mem_C_segments[idx]->virt_addr;
-                                    const int sub = c_geoms[idx].sub;
-                                    for (int t = 0; t < c_geoms[idx].outer; ++t) {
-                                        const int16_t* cell = seg_base + ((size_t)t * c_geoms[idx].m_stride + m) * sub;
-                                        const int n0 = t * sub;
-                                        const int lim = std::min(sub, N_segment - n0);
-                                        for (int j = 0; j < lim; ++j) {
-                                            dst_ptr[n0 + j] += (float)cell[j] * dequant_scale;
-                                        }
-                                    }
+                                    rknpu2_quantization::dequant_acc_int16_tiled(
+                                        dst_ptr, (const int16_t*)mem_C_segments[idx]->virt_addr,
+                                        m, c_geoms[idx].m_stride, c_geoms[idx].outer, c_geoms[idx].sub,
+                                        N_segment, dequant_scale);
                                 } else {
-                                    int16_t* src_ptr = (int16_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
-                                    for(int n=0; n<N_segment; ++n) {
-                                        dst_ptr[n] += (float)src_ptr[n] * dequant_scale;
-                                    }
+                                    const int16_t* src_ptr = (const int16_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
+                                    rknpu2_quantization::dequant_acc_int16_to_fp32(dst_ptr, src_ptr, N_segment, dequant_scale);
                                 }
                             }
                             break;
@@ -1138,7 +1126,19 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
         // Initializing Hadamard Transform Logic
         if (pipeline->use_hadamard) {
             std::vector<float> s_vec(K_op, 1.0f);
-            std::mt19937 gen(reinterpret_cast<uintptr_t>(tensor));
+            // Seed from the tensor NAME (FNV-1a), not its address: pointer
+            // seeds change with ASLR, making W4A4_HADAMARD results
+            // unreproducible across runs and builds. Fall back to the
+            // address only for unnamed tensors.
+            uint64_t seed = 1469598103934665603ull;
+            if (tensor->name[0] != '\0') {
+                for (const char* c = tensor->name; *c; ++c) {
+                    seed = (seed ^ (uint8_t)*c) * 1099511628211ull;
+                }
+            } else {
+                seed = reinterpret_cast<uintptr_t>(tensor);
+            }
+            std::mt19937 gen((std::mt19937::result_type)seed);
             std::uniform_int_distribution<int> distrib(0, 1);
 
             for(int k = 0; k < K_op; ++k) {
