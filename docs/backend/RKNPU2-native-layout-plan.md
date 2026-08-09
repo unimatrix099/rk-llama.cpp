@@ -278,3 +278,25 @@ ggml-rknpu2.cpp), which changes with ASLR. Perplexity on the same model
 and text varied 19.7 vs 58.6 across identical flag-off runs. Seeding from
 a stable key (e.g. tensor name hash) would make results reproducible.
 Not addressed by this change; both flag states inherit it equally.
+
+## Phase 3 results (complete)
+
+Full validation matrix, llama-bench pp128/tg64, pinned clocks:
+
+| Test | Result |
+|---|---|
+| E4B W4A4 flag on + `RKNPU_CPU_DECODE=32` | **pp 31.88 / tg 5.35** — best W4A4 config; combines cleanly with routing |
+| E4B W8A8 with flag on (contamination check) | pp 41.10 / tg 3.40 ≈ baseline (39.8/3.3) — INT8 pipelines unaffected |
+| Qwen2.5-1.5B forced W4A4, flag off | pp 25.65 / tg 2.99 |
+| Qwen2.5-1.5B forced W4A4, flag on | **pp 93.88 / tg 3.00** — 3.7x |
+| Hadamard end-to-end identity (`setarch -R` pins ASLR, hence the pointer-seeded sign vectors) | perplexity chunks bit-identical flag on vs off: `[23.2655, 22.0139, 22.3048]` both |
+| Hybrid NORM+NATIVE contexts (`RKNPU_HYBRID=W8A8_STANDARD,W4A4_HADAMARD`, flag on) | runs clean, pp 49.9 on Qwen — mixed-layout contexts coexist |
+| Stress: 5x E4B W4A4 flag-on load+generate | 5/5 exit 0, no crashes |
+
+W4A4 standings on E4B after phases 1–3: pp 7.7 → **31.9** (4.15x), tg 3.4 →
+**5.35** (with routing), at half the NPU memory of W8A8. Remaining prefill
+gap to W8A8 (41.1) is CPU-side activation prep (scalar Hadamard + INT4
+packing) — the documented next lever, outside this plan's scope.
+
+Phase 4 remains: flip the default for INT4 pipelines and prepare the
+upstream PR.
