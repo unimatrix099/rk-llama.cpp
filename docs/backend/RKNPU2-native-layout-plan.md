@@ -22,7 +22,7 @@ until validated.
 
 ## 2. Research: the native formats (probed, RK3588, librknnrt 2.3.2)
 
-`layout_dims_probe.c` results, all with B_layout=NATIVE:
+`rknpu2-layout-dims-probe.c` results, all with B_layout=NATIVE:
 
 ```
 type  AC      M    K     N     A dims        C dims       sizes
