@@ -84,7 +84,68 @@ adds OpenCL enqueue/sync latency that could exceed the ~3 t/s prize.
 **Verdict: not worth building _until_ Idea 0 shows the INT4 ceiling can be
 lifted.** If the ceiling does lift, this becomes valuable again.
 
-## Idea 0 (do this first): where does INT4's 4x deficit actually live?
+## Idea 0 — RESOLVED by measurement: INT4 compute is not accelerated
+
+**Run it yourself:** `rknpu2-matmul-bench.c` next to this file. Raw
+`rknn_matmul_run` only, single NPU core (`RKNN_NPU_CORE_0`), K=N=2048,
+clocks pinned via `scripts/fix_freq_rk3588.sh` from the rknn-llm repo.
+
+```
+M     FP16xFP16->FP32      INT8xINT8->INT32     INT4xINT4->INT16
+1       0.764 ms   11 GOPS   0.390 ms   22 GOPS   0.203 ms   41 GOPS
+32      0.797 ms  337 GOPS   0.400 ms  670 GOPS   6.053 ms   44 GOPS
+128     1.688 ms  636 GOPS   0.638 ms 1683 GOPS  24.172 ms   44 GOPS
+512     6.740 ms  637 GOPS   2.494 ms 1722 GOPS  96.632 ms   44 GOPS
+```
+
+Two clean facts fall out.
+
+**1. INT4 has no parallel compute path.** Its throughput is pinned at
+~44 GOPS at every batch size, and its cost is a flat ~189 us per row of A
+(203/189/189/189 us at M=1/32/128/512) — the signature of serial per-row
+processing, not a MAC array. For scale: INT8 reaches 1722 GOPS, which is
+86% of the RK3588's theoretical 2 TOPS per core, so the harness is sound
+and the chip is delivering its rated INT8 performance. **INT4 runs at 2.6%
+of the INT8 peak** and is 38x slower at M=512. Whether this is emulation in
+the runtime or an unaccelerated hardware mode, it is not something a backend
+can fix.
+
+**2. At M=1 everything is purely memory-bandwidth bound, and INT4 wins
+exactly as predicted.** Dividing B-matrix bytes by time gives 10.98 / 10.75 /
+10.33 GB/s per core for FP16 / INT8 / INT4 — the same bandwidth for all
+three, so the only thing that matters at decode is how many bytes the weights
+occupy. INT4 reads half of INT8 and takes half the time (0.203 vs 0.390 ms,
+1.92x). This is the bandwidth model of this whole investigation confirmed
+directly at the hardware level.
+
+### Consequences
+
+- **INT4 can never help prefill on RK3588.** The 44 GOPS ceiling is a hard
+  wall. This also explains the end-to-end W4A4 prefill deficit measured in
+  the fork (7.7 vs 39.8 t/s) — and the fork actually does *better* than the
+  raw 38x ratio, because it spreads work over 3 cores and much of prefill
+  time is spent outside the NPU.
+- **INT4's only real advantage is decode latency**, and it is genuine at the
+  matmul level (1.9x). But end-to-end the fork measures W4A4 tg 3.4 vs W8A8
+  3.3 — the win is largely eaten by per-token CPU work (Hadamard transform,
+  scalar INT4 activation packing, INT16 output dequant) and by the fact that
+  decode time on a model like E4B is dominated by non-matmul work anyway
+  (~600 backend splits per token).
+- **Even fully captured, it would lose to the shipped routing.** CPU decode
+  already reads Q4_0 weights natively at 4 bits with no dispatch overhead and
+  delivers 4.9 t/s (`RKNPU_CPU_DECODE=32`), above any plausible INT4-on-NPU
+  decode projection.
+
+### Verdicts this settles
+
+- **Idea 1 (GPU activation prep): dead.** It targets prefill, where INT4 is
+  capped at 2.6% of INT8 regardless of how fast activations are prepared.
+- **Idea 2 (offline transform elimination): downgraded.** Still the right
+  way to make INT4 cheaper, but the prize is now known to be small — it
+  cannot lift the 44 GOPS ceiling.
+- **A new, narrower idea replaces them** (see Idea 4 below).
+
+## Idea 0 (original framing, kept for context): where does INT4's deficit live?
 
 The measurements above say the cost is *inside the INT4 path*, but not
 whether that is the silicon or this backend's INT4 plumbing. Suspects on the
@@ -118,6 +179,29 @@ Outcomes and consequences:
   1-3 should be dropped.
 
 Cost: ~15 minutes. Everything else in this document is gated on it.
+*(Done — see the resolved section above.)*
+
+## Idea 4 (new, post-measurement): M-dependent *pipeline* selection
+
+The measurement says INT4 is good at exactly one thing: M=1 matmul latency,
+where it is 1.9x faster than INT8 because it reads half the bytes. That is
+the mirror image of prefill, where it is 38x slower.
+
+So rather than choosing one pipeline per tensor for the whole run, choose
+per *call*: **INT8 when M is large, INT4 when M == 1.** The backend already
+has the plumbing — `RKNPU_CPU_DECODE` demonstrates M-dependent dispatch in
+`supports_op`, and `resolve_op_support` already selects pipelines per
+tensor; this would extend selection to depend on the activation batch size,
+keeping both a packed INT8 and a packed INT4 copy of each weight resident
+(1.5x weight memory).
+
+Honest expectations, from the numbers above: the ceiling is the ~0.19 ms
+saved per matmul at M=1, against a token time dominated by non-matmul work,
+and the result would still have to beat CPU decode at 4.9 t/s — which reads
+4-bit weights natively with zero dispatch overhead. **Probably not worth it
+on RK3588**; recorded because it is the only remaining shape in which INT4
+is not strictly worse, and because on a chip with a real INT4 datapath (or
+w4a16, i.e. RK3576+) the same design would be clearly correct.
 
 ## Idea 2: remove the runtime transform instead of accelerating it
 
@@ -156,18 +240,28 @@ Nobody has mapped this trade-off curve on a real model. Cheap to explore
 the only listed idea that could improve *decode* on the NPU without new
 hardware capability.
 
-## Priority
+## Priority (revised after Idea 0)
 
-1. **Idea 0** — the 15-minute timing probe. Gates everything else.
-2. **Idea 3** — hybrid patterns; no code required, measurable immediately.
-3. **Idea 2** — offline transform elimination (bigger effort, real upside).
-4. **Idea 1** — GPU activation prep; only if Idea 0 lifts the ceiling.
+1. ~~**Idea 0**~~ — **done**; INT4 compute is capped at 2.6% of INT8.
+2. **Idea 3** — hybrid per-layer patterns; still free to explore
+   (`RKNPU_HYBRID`, no code changes) and now clearly framed: any layer put
+   on W4A4 pays a 38x prefill penalty for that layer, so useful only for
+   fitting larger models, not for speed.
+3. **Idea 4** — M-dependent pipeline selection; small expected prize,
+   documented mainly for RK3576+ where it would pay off properly.
+4. ~~**Idea 2**~~ — downgraded; cannot lift the ceiling.
+5. ~~**Idea 1**~~ — dead; targets a phase where INT4 cannot compete.
 
 ## Reality check
 
-Even in the best case, INT4 on RK3588 is a *bandwidth* play, not a compute
-play, and the shipped `RKNPU_CPU_DECODE` routing already captures much of
-the available decode win by letting the CPU read 4-bit weights natively
-(41.3 / 4.9 on E4B). A successful INT4 program would have to beat that, on a
-chip whose NPU cannot read 4-bit weights without also quantising activations
-to 4-bit. Set expectations accordingly.
+INT4 on RK3588 is a *bandwidth* play, not a compute play — and now that is
+measured rather than inferred: 44 GOPS flat versus INT8's 1722 GOPS, with
+equal ~10 GB/s memory bandwidth for both at M=1. The practical consequence
+is that W4A4's honest role on this chip is **fitting larger models under the
+4 GB per-IOMMU-domain limit**, at a large speed cost, and the shipped
+`RKNPU_CPU_DECODE` routing (41.3 / 4.9 on E4B) already captures the decode
+bandwidth win in the only place this hardware makes it available: the CPU,
+which reads 4-bit weights natively and unpacks them in registers.
+
+The path to real 4-bit LLM acceleration on Rockchip runs through silicon
+with a w4a16 datapath (RK3576 and later), not through this backend.
