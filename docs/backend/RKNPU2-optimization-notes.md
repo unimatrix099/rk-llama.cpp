@@ -73,6 +73,22 @@ RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32 \
   ./build/bin/llama-cli -m gemma-4-E4B-it-Q4_0.gguf ...
 ```
 
+## ✅ Shipped: native A/C layout for INT4 pipelines (default on)
+
+**Hypothesis (from the INT4 research doc):** the NORM-layout A/C matrices
+force a serial per-run repack inside librknnrt that caps INT4 matmuls at
+~44 GOPS; producing A in the NPU's native tiling and untiling C in the
+existing dequant pass should recover the hardware's 3.6-3.9 TOPS.
+
+**Result (phases 1-4 in `RKNPU2-native-layout-plan.md`):** E4B Q4_0
+prefill 7.7 -> **31.9 t/s** (4.15x); Qwen2.5-1.5B forced W4A4 25.7 ->
+**93.9 t/s** (3.7x); decode unchanged (layout-neutral at M=1, as
+measured); results bit-identical to the NORM path; W8A8/W16A16
+unaffected. Composes with `RKNPU_CPU_DECODE` (E4B: pp 31.9 / tg 5.35 at
+half the NPU memory of W8A8). Opt out with `RKNPU_AC_NATIVE=0`.
+W4A4 is thereby no longer the slowest NPU pipeline; the remaining gap to
+W8A8 prefill is CPU-side activation prep (scalar Hadamard + INT4 pack).
+
 ## ✅ Shipped as guidance: pipeline pairing
 
 For throughput on RK3588, `W8A8_STANDARD` is the strongest NPU pipeline for

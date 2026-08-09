@@ -300,3 +300,45 @@ packing) — the documented next lever, outside this plan's scope.
 
 Phase 4 remains: flip the default for INT4 pipelines and prepare the
 upstream PR.
+
+## Phase 4 results (complete): default flipped
+
+Native A/C layout is now the **default** for the INT4 pipelines;
+`RKNPU_AC_NATIVE=0` opts back into the old NORM behaviour (diagnostic).
+Verified both directions on Qwen2.5-1.5B forced W4A4: default pp 94.13,
+opt-out pp 25.70.
+
+All four phases of this plan are complete. Upstream PR intentionally not
+opened from this branch — see the suggested description below.
+
+### Suggested upstream PR description
+
+> **rknpu2: native A/C layout for the INT4 pipelines (~4x prefill)**
+>
+> With `AC_layout = RKNN_MM_LAYOUT_NORM` (the current setting for every
+> matmul context), librknnrt performs a serial per-run repack of the A
+> matrix that caps INT4 matmul throughput at ~44 GOPS regardless of shape
+> — 2.6% of what the hardware delivers. With native-layout A/C the same
+> matmuls reach 3.6–3.9 TOPS (~2x the INT8 path). Standalone benchmarks
+> demonstrating this are included under `docs/backend/`.
+>
+> This PR produces A directly in the NPU's native tiling ([K/32, M, 32]
+> cells) during the existing activation-quantization pass and untiles C
+> ([N/8, M, 8] int16) inside the existing dequant-accumulate loop, for the
+> W4A4 pipelines only (INT8's NORM/NATIVE trade-off is shape-dependent and
+> left unchanged). Tile geometry is read from `io_attr` dims at context
+> creation rather than hard-coded. Default on; `RKNPU_AC_NATIVE=0` opts
+> out.
+>
+> Measured (RK3588, llama-bench pp128/tg64, pinned clocks):
+> - Gemma-4-E4B Q4_0 (default W4A4_HADAMARD): pp 7.7 → **31.9** (4.15x)
+> - Qwen2.5-1.5B forced W4A4: pp 25.7 → **93.9** (3.7x)
+> - W8A8/W16A16 pipelines unaffected (41.1/3.40 on E4B, = baseline)
+>
+> Correctness: a unit-tested tiling module (100% line+branch coverage), an
+> on-NPU equivalence test proving bit-identical results vs the NORM layout
+> across decode- and prefill-scale shapes, and end-to-end perplexity
+> bit-identical with the flag on vs off (under `setarch -R`, since
+> W4A4_HADAMARD is already nondeterministic across processes due to
+> pointer-seeded Hadamard sign vectors — a separate pre-existing issue
+> documented in `docs/backend/RKNPU2-native-layout-plan.md`).

@@ -129,17 +129,19 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
         custom_cores = parse_int_list(env_cores);
     }
 
-    // Native A/C layout for the INT4 pipelines (RKNPU_AC_NATIVE=1 to opt
-    // in). Removes the runtime's serial per-run A repack that caps INT4
-    // matmul throughput at ~44 GOPS with the NORM layout; with NATIVE the
-    // same matmuls reach 3.6-3.9 TOPS. Read once - the value must not
-    // change at runtime because created matmul contexts and cached A/C
-    // buffers depend on it.
+    // Native A/C layout for the INT4 pipelines (default on; set
+    // RKNPU_AC_NATIVE=0 to opt out). Removes the runtime's serial per-run
+    // A repack that caps INT4 matmul throughput at ~44 GOPS with the NORM
+    // layout; with NATIVE the same matmuls reach 3.6-3.9 TOPS (E4B Q4_0
+    // prefill 7.7 -> 31.9 t/s end to end, bit-identical results - see
+    // docs/backend/RKNPU2-native-layout-plan.md). Read once - the value
+    // must not change at runtime because created matmul contexts and
+    // cached A/C buffers depend on it.
     const char* env_ac_native = std::getenv("RKNPU_AC_NATIVE");
     const rknn_matmul_layout w4a4_ac_layout =
-        (env_ac_native != nullptr && std::atoi(env_ac_native) != 0)
-            ? RKNN_MM_LAYOUT_NATIVE
-            : RKNN_MM_LAYOUT_NORM;
+        (env_ac_native != nullptr && std::atoi(env_ac_native) == 0)
+            ? RKNN_MM_LAYOUT_NORM
+            : RKNN_MM_LAYOUT_NATIVE;
 
     // --- Define RK3588 Configuration ---
     Rknpu2DeviceConfig rk3588_config;
