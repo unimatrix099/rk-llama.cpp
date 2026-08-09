@@ -5,3 +5,5 @@ rknpu2-matmul-bench
 rknpu2-matmul-layout-bench
 rknpu2-layout-dims-probe
 .cov/
+test-rknpu2-prep-kernels
+rknpu2-bench-prep
