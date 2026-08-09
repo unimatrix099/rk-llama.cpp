@@ -19,7 +19,7 @@ TOOLS := rknpu2-matmul-probe rknpu2-matmul-bench rknpu2-matmul-layout-bench rknp
 NL_SRC := ../../ggml/src/ggml-rknpu2/rknpu2-native-layout.c
 NL_INC := -I ../../ggml/src/ggml-rknpu2
 
-all: $(TOOLS) test-rknpu2-native-layout test-rknpu2-native-equivalence
+all: $(TOOLS) test-rknpu2-native-layout test-rknpu2-native-equivalence rknpu2-bench-prep
 
 %: %.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
@@ -31,6 +31,10 @@ test-rknpu2-native-layout: test-rknpu2-native-layout.c $(NL_SRC)
 # Hardware equivalence test (needs the NPU; see file header)
 test-rknpu2-native-equivalence: test-rknpu2-native-equivalence.c $(NL_SRC)
 	$(CC) $(CFLAGS) $(NL_INC) $^ -o $@ $(LDLIBS)
+
+# NEON prep research benchmark (CPU only, no NPU needed)
+rknpu2-bench-prep: rknpu2-bench-prep.c
+	$(CC) -O2 -march=armv8.2-a+fp16 $< -o $@ -lm
 
 # Run the CPU unit tests
 check: test-rknpu2-native-layout
@@ -49,7 +53,7 @@ check-hw: test-rknpu2-native-equivalence
 	LD_LIBRARY_PATH=$(LIBS_DIR) ./test-rknpu2-native-equivalence
 
 clean:
-	rm -f $(TOOLS) test-rknpu2-native-layout test-rknpu2-native-equivalence
+	rm -f $(TOOLS) test-rknpu2-native-layout test-rknpu2-native-equivalence rknpu2-bench-prep
 	rm -rf .cov
 
 .PHONY: all clean check check-hw coverage
