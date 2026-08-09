@@ -16,12 +16,40 @@ LDLIBS   := $(LIBS_DIR)/librknnrt.so
 
 TOOLS := rknpu2-matmul-probe rknpu2-matmul-bench rknpu2-matmul-layout-bench rknpu2-layout-dims-probe
 
-all: $(TOOLS)
+NL_SRC := ../../ggml/src/ggml-rknpu2/rknpu2-native-layout.c
+NL_INC := -I ../../ggml/src/ggml-rknpu2
+
+all: $(TOOLS) test-rknpu2-native-layout test-rknpu2-native-equivalence
 
 %: %.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
 
-clean:
-	rm -f $(TOOLS)
+# Unit tests for the native-layout tiling module (pure CPU, runs anywhere)
+test-rknpu2-native-layout: test-rknpu2-native-layout.c $(NL_SRC)
+	$(CC) -O0 -g $(NL_INC) $^ -o $@
 
-.PHONY: all clean
+# Hardware equivalence test (needs the NPU; see file header)
+test-rknpu2-native-equivalence: test-rknpu2-native-equivalence.c $(NL_SRC)
+	$(CC) $(CFLAGS) $(NL_INC) $^ -o $@ $(LDLIBS)
+
+# Run the CPU unit tests
+check: test-rknpu2-native-layout
+	./test-rknpu2-native-layout
+
+# Line/branch coverage for the tiling module (gcov)
+coverage:
+	rm -rf .cov && mkdir .cov
+	$(CC) -O0 -g --coverage $(NL_INC) test-rknpu2-native-layout.c $(NL_SRC) -o .cov/tnl
+	cd .cov && ./tnl > /dev/null
+	 cd .cov && gcov -b tnl-rknpu2-native-layout | grep -E "Lines|Branches|Taken"
+	rm -f *.gcov
+
+# Run the on-NPU equivalence test (ulimit -n 65536 first)
+check-hw: test-rknpu2-native-equivalence
+	LD_LIBRARY_PATH=$(LIBS_DIR) ./test-rknpu2-native-equivalence
+
+clean:
+	rm -f $(TOOLS) test-rknpu2-native-layout test-rknpu2-native-equivalence
+	rm -rf .cov
+
+.PHONY: all clean check check-hw coverage

@@ -22,7 +22,7 @@ until validated.
 
 ## 2. Research: the native formats (probed, RK3588, librknnrt 2.3.2)
 
-`rknpu2-layout-dims-probe.c` results, all with B_layout=NATIVE:
+`layout_dims_probe.c` results, all with B_layout=NATIVE:
 
 ```
 type  AC      M    K     N     A dims        C dims       sizes
@@ -211,3 +211,34 @@ research doc + benchmarks attached. Keep the flag as an opt-out.
 
 Total: ~2.5 days of focused work, of which the genuinely novel part —
 the tiling formulas — is already established by the probes above.
+
+## Phase 1 results (complete)
+
+Delivered on branch `feat/int4-native-layout`:
+
+- `ggml/src/ggml-rknpu2/rknpu2-native-layout.{h,c}` — the tiling module
+  Phase 2 will reuse (geometry parse from io_attr dims, scatter/gather).
+  **Coverage: 100% lines, 100% branches** (make -f Makefile.rknpu2-tools
+  coverage), 341 unit checks.
+- `docs/backend/test-rknpu2-native-layout.c` — CPU unit tests (TDD:
+  written before the implementation).
+- `docs/backend/test-rknpu2-native-equivalence.c` — on-NPU test:
+  **bit-identical NORM vs NATIVE results and 100% agreement with a CPU
+  int32 reference** at M=1/K=256/N=256, M=5/K=320/N=256 (non-pow2 M),
+  M=32/K=2048/N=2048 and M=128/K=1024/N=512.
+
+Contract confirmations and findings for Phase 2:
+
+1. A native tiling `[K/32, M, 32]` with plain byte-copy of 16-byte cells is
+   exactly right — nibble order inside cells matches
+   `quantize_fp32_to_int4_packed` (low nibble = even element); the
+   nibble-swap hypothesis is refuted.
+2. C native `[N/8, M, 8]` int16 gathers back with the same generic cell
+   copy.
+3. `rknn_mem_sync` TO_DEVICE after CPU writes / FROM_DEVICE before CPU
+   reads is mandatory for correctness on cached mappings (the backend
+   already does this; standalone tools must too).
+4. `rknn_B_normal_layout_to_native_layout` takes **unpacked** int4 input
+   (one value per byte, K*N bytes). Feeding nibble-packed data makes it
+   read K*N/2 bytes past the buffer — silent heap overread producing
+   nondeterministic results. Worth remembering for any future tool.
