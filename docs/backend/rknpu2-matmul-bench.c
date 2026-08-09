@@ -7,6 +7,12 @@
 // or from the NPU's INT4 matmul path itself. Nothing but rknn_matmul_run is
 // inside the timed loop: no quantisation, no packing, no scaling.
 //
+// WARNING: this tool uses AC_layout=NORM (matching ggml-rknpu2's own
+// configuration). That path carries a large SDK conversion penalty for INT4
+// specifically (~80x). Do not draw conclusions about INT4 hardware capability
+// from this tool alone -- use rknpu2-matmul-layout-bench.c, which sweeps the
+// layout flag, and see RKNPU2-int4-research.md.
+//
 // Build and run on the target board:
 //   gcc rknpu2-matmul-bench.c -o rknpu2-matmul-bench -O2 \
 //       -I ../../ggml/src/ggml-rknpu2/libs/include \
