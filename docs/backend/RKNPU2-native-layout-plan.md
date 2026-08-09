@@ -242,3 +242,39 @@ Contract confirmations and findings for Phase 2:
    (one value per byte, K*N bytes). Feeding nibble-packed data makes it
    read K*N/2 bytes past the buffer — silent heap overread producing
    nondeterministic results. Worth remembering for any future tool.
+
+## Phase 2 results (complete)
+
+Implementation as specified in §4, gated behind `RKNPU_AC_NATIVE=1`
+(read once at config construction; contexts and cached buffers depend on
+it, so it must not change mid-process).
+
+Measured (llama-bench pp128/tg64, default W4A4_HADAMARD):
+
+| Model | flag off | flag on | speedup |
+|---|---|---|---|
+| Gemma-4-E4B Q4_0 | pp 7.7 / tg 3.4 | **pp 31.95 / tg 3.54** | 4.15x pp |
+| Qwen2.5-1.5B Q8 (forced W4A4, llama-cli) | pp 5.6 | **pp 44.8** | 8x pp |
+
+The remaining gap to W8A8 (39.8 pp on E4B) is CPU-side activation prep
+(Hadamard transform + scalar INT4 packing), as predicted — that is the
+next lever, not the matmul.
+
+Correctness validation:
+- Hardware equivalence extended to prefill-scale shapes
+  (M=512, K=8192/N=1536, K=2048/N=8960): still bit-identical, still 100%
+  vs CPU reference.
+- End-to-end identity: `W4A4_STANDARD` perplexity (chunks to 4 decimal
+  places) is bit-identical flag-on vs flag-off, and deterministic across
+  runs for both.
+- `dims` in `rknn_matmul_tensor_attr` is `uint32_t[]`; the tiling module
+  signature was aligned accordingly (C++ would reject the implicit cast).
+
+**Incidental finding (pre-existing, worth an upstream issue):**
+`W4A4_HADAMARD` results are not reproducible across process runs — the
+per-tensor Hadamard sign vectors are seeded from the tensor's memory
+address (`std::mt19937 gen(reinterpret_cast<uintptr_t>(tensor))`,
+ggml-rknpu2.cpp), which changes with ASLR. Perplexity on the same model
+and text varied 19.7 vs 58.6 across identical flag-off runs. Seeding from
+a stable key (e.g. tensor name hash) would make results reproducible.
+Not addressed by this change; both flag states inherit it equally.

@@ -129,6 +129,18 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
         custom_cores = parse_int_list(env_cores);
     }
 
+    // Native A/C layout for the INT4 pipelines (RKNPU_AC_NATIVE=1 to opt
+    // in). Removes the runtime's serial per-run A repack that caps INT4
+    // matmul throughput at ~44 GOPS with the NORM layout; with NATIVE the
+    // same matmuls reach 3.6-3.9 TOPS. Read once - the value must not
+    // change at runtime because created matmul contexts and cached A/C
+    // buffers depend on it.
+    const char* env_ac_native = std::getenv("RKNPU_AC_NATIVE");
+    const rknn_matmul_layout w4a4_ac_layout =
+        (env_ac_native != nullptr && std::atoi(env_ac_native) != 0)
+            ? RKNN_MM_LAYOUT_NATIVE
+            : RKNN_MM_LAYOUT_NORM;
+
     // --- Define RK3588 Configuration ---
     Rknpu2DeviceConfig rk3588_config;
     rk3588_config.device_name = "RK3588";
@@ -144,7 +156,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 16,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ false
+            /* .use_hadamard  = */ false,
+            /* .ac_layout     = */ RKNN_MM_LAYOUT_NORM
         },
         {
             /* .pipeline_name = */ "W16A16_HADAMARD",
@@ -155,7 +168,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 16,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ true
+            /* .use_hadamard  = */ true,
+            /* .ac_layout     = */ RKNN_MM_LAYOUT_NORM
         },
         {
             /* .pipeline_name = */ "W8A8_STANDARD",
@@ -166,7 +180,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 32,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ false
+            /* .use_hadamard  = */ false,
+            /* .ac_layout     = */ RKNN_MM_LAYOUT_NORM
         },
         {
             /* .pipeline_name = */ "W8A8_HADAMARD",
@@ -177,7 +192,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 32,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ true
+            /* .use_hadamard  = */ true,
+            /* .ac_layout     = */ RKNN_MM_LAYOUT_NORM
         },
         {
             /* .pipeline_name = */ "W4A4_STANDARD",
@@ -188,7 +204,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 64,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ false
+            /* .use_hadamard  = */ false,
+            /* .ac_layout     = */ w4a4_ac_layout
         },
         {
             /* .pipeline_name = */ "W4A4_HADAMARD",
@@ -199,7 +216,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 64,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ true
+            /* .use_hadamard  = */ true,
+            /* .ac_layout     = */ w4a4_ac_layout
         }
     };
 

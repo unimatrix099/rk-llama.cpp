@@ -6,6 +6,7 @@
 #include "rknpu2-quantization.h"
 #include "rknpu2-calibration.h"
 #include "rknpu2-configuration.h"
+#include "rknpu2-native-layout.h"
 
 #include <rknn_api.h>
 #include <rknn_matmul_api.h>
@@ -347,14 +348,14 @@ struct rknpu_matmul_context {
     bool b_bound = false;
     std::shared_ptr<rknn_tensor_mem> mem_B;
 
-    rknpu_matmul_context(int M, int K, int N, rknn_matmul_type type, int32_t domain_id) {
+    rknpu_matmul_context(int M, int K, int N, rknn_matmul_type type, rknn_matmul_layout ac_layout, int32_t domain_id) {
         memset(&info, 0, sizeof(info));
         info.M = M;
         info.K = K;
         info.N = N;
         info.type = type;
         info.B_layout = RKNN_MM_LAYOUT_NATIVE;
-        info.AC_layout = RKNN_MM_LAYOUT_NORM;
+        info.AC_layout = ac_layout;
         info.iommu_domain_id = domain_id;
 
         int ret = rknn_matmul_create(&ctx, &info, &io_attr);
@@ -384,16 +385,16 @@ struct ggml_backend_rknpu_context {
     // C-matrices cache (M, N, core_id, npu_type_c, domain_id)
     std::unordered_map<std::tuple<int, int, int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> c_buffer_cache;
 
-    std::shared_ptr<rknpu_matmul_context> get_matmul_ctx(uintptr_t tensor_id, size_t offset, int M, int K, int N, int core_id, rknn_matmul_type type, int32_t domain_id) {
+    std::shared_ptr<rknpu_matmul_context> get_matmul_ctx(uintptr_t tensor_id, size_t offset, int M, int K, int N, int core_id, rknn_matmul_type type, rknn_matmul_layout ac_layout, int32_t domain_id) {
         std::lock_guard<std::mutex> lock(mutex);
 
-        auto key = std::make_tuple(tensor_id, offset, M, K, N, core_id, (int)type, (int)domain_id);
+        auto key = std::make_tuple(tensor_id, offset, M, K, N, core_id, (int)type + ((int)ac_layout << 8), (int)domain_id);
         auto it = matmul_ctx_cache.find(key);
         if (it != matmul_ctx_cache.end()) {
             return it->second;
         }
 
-        auto ctx = std::make_shared<rknpu_matmul_context>(M, K, N, type, domain_id);
+        auto ctx = std::make_shared<rknpu_matmul_context>(M, K, N, type, ac_layout, domain_id);
         if (ctx->ctx == 0) {
             return nullptr;
         }
@@ -606,7 +607,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         // Getting matmul context from cache
                         matmul_ctxs[idx] = backend_ctx->get_matmul_ctx(
                             (uintptr_t)tensor_virt_addr, offset_in_dma, M_op, K_seg_op, n_seg.size_n,
-                            n_seg.core_id, matmul_type, b_domain_id
+                            n_seg.core_id, matmul_type, pipeline->ac_layout, b_domain_id
                         );
                         if (!matmul_ctxs[idx] || matmul_ctxs[idx]->ctx == 0) return GGML_STATUS_FAILED;
 
@@ -657,6 +658,14 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 const int row_stride = (int)(src1->nb[1] / sizeof(float));
                 void* dst_base = mem_A_shared->virt_addr;
 
+                // Native A layout: produce rows directly in the NPU tiling
+                // ([K/sub, M, sub] cells) instead of row-major, skipping the
+                // runtime's serial per-run repack
+                rknpu2_native_geom a_geom = {0, 0, 0};
+                const bool a_native = pipeline->ac_layout == RKNN_MM_LAYOUT_NATIVE &&
+                    rknpu2_native_geom_from_dims(matmul_ctx_0->io_attr.A.dims,
+                                                 matmul_ctx_0->io_attr.A.n_dims, &a_geom) == 0;
+
                 #pragma omp parallel for
                 for (int m = 0; m < M; ++m) {
                     const float* src_row = x + (size_t)m * row_stride;
@@ -695,8 +704,15 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         scales_A[m] = amax_m / 7.0f;
 
                         uint8_t* dst_ptr = (uint8_t*)dst_base;
-                        uint8_t* dst_row = dst_ptr + (size_t)m * (K_seg_op / 2);
-                        rknpu2_quantization::quantize_fp32_to_int4_packed(ready_row.data(), dst_row, K_seg_op, scales_A[m]);
+                        if (a_native) {
+                            std::vector<uint8_t> packed_row(K_seg_op / 2);
+                            rknpu2_quantization::quantize_fp32_to_int4_packed(ready_row.data(), packed_row.data(), K_seg_op, scales_A[m]);
+                            rknpu2_native_scatter_row(dst_ptr, packed_row.data(), m,
+                                                      a_geom.m_stride, a_geom.outer, a_geom.sub / 2);
+                        } else {
+                            uint8_t* dst_row = dst_ptr + (size_t)m * (K_seg_op / 2);
+                            rknpu2_quantization::quantize_fp32_to_int4_packed(ready_row.data(), dst_row, K_seg_op, scales_A[m]);
+                        }
                     }
                 }
 
@@ -748,6 +764,19 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
                 const float hadamard_divisor = pipeline->use_hadamard ? (float)K_op : 1.0f;
 
+                // Native C layout: each segment's C comes back as
+                // [N_seg/sub, M, sub] cells and is untiled inside the
+                // dequantization pass below (address arithmetic only)
+                std::vector<rknpu2_native_geom> c_geoms(num_active_segments);
+                std::vector<uint8_t> c_native(num_active_segments, 0);
+                if (pipeline->ac_layout == RKNN_MM_LAYOUT_NATIVE) {
+                    for (size_t idx = 0; idx < num_active_segments; idx++) {
+                        c_native[idx] = rknpu2_native_geom_from_dims(
+                            matmul_ctxs[idx]->io_attr.C.dims,
+                            matmul_ctxs[idx]->io_attr.C.n_dims, &c_geoms[idx]) == 0;
+                    }
+                }
+
                 #pragma omp parallel for
                 for (int m = 0; m < M; m++) {
                     // Handling types and quantizations
@@ -795,10 +824,23 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                                 int N_offset = active_n_segments[idx].offset_n;
                                 int N_segment = active_n_segments[idx].size_n;
                                 float* dst_ptr = dst_data + (size_t)m * N + N_offset;
-                                int16_t* src_ptr = (int16_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
 
-                                for(int n=0; n<N_segment; ++n) {
-                                    dst_ptr[n] += (float)src_ptr[n] * dequant_scale;
+                                if (c_native[idx]) {
+                                    const int16_t* seg_base = (const int16_t*)mem_C_segments[idx]->virt_addr;
+                                    const int sub = c_geoms[idx].sub;
+                                    for (int t = 0; t < c_geoms[idx].outer; ++t) {
+                                        const int16_t* cell = seg_base + ((size_t)t * c_geoms[idx].m_stride + m) * sub;
+                                        const int n0 = t * sub;
+                                        const int lim = std::min(sub, N_segment - n0);
+                                        for (int j = 0; j < lim; ++j) {
+                                            dst_ptr[n0 + j] += (float)cell[j] * dequant_scale;
+                                        }
+                                    }
+                                } else {
+                                    int16_t* src_ptr = (int16_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
+                                    for(int n=0; n<N_segment; ++n) {
+                                        dst_ptr[n] += (float)src_ptr[n] * dequant_scale;
+                                    }
                                 }
                             }
                             break;

@@ -30,9 +30,10 @@ typedef struct {
     int32_t sub;        // dims[2]: elements per cell
 } rknpu2_native_geom;
 
-// Parse a [outer, m, sub] dims triple as reported by rknn_matmul_io_attr.
-// Returns 0 on success; -1 if n_dims != 3 or any dim is not positive.
-int rknpu2_native_geom_from_dims(const int32_t * dims, uint32_t n_dims,
+// Parse a [outer, m, sub] dims triple as reported by rknn_matmul_io_attr
+// (which stores dims as uint32_t). Returns 0 on success; -1 if n_dims != 3
+// or any dim is zero or exceeds INT32_MAX.
+int rknpu2_native_geom_from_dims(const uint32_t * dims, uint32_t n_dims,
                                  rknpu2_native_geom * out);
 
 // Scatter one row-major row (row_cells * cell_bytes contiguous bytes) into a
