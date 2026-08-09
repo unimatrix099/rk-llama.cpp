@@ -1,18 +1,21 @@
 #include "rknpu2-native-layout.h"
 
 #include <string.h>
+#include <stdint.h>
 
-int rknpu2_native_geom_from_dims(const int32_t * dims, uint32_t n_dims,
+int rknpu2_native_geom_from_dims(const uint32_t * dims, uint32_t n_dims,
                                  rknpu2_native_geom * out) {
     if (dims == NULL || out == NULL || n_dims != 3) {
         return -1;
     }
-    if (dims[0] <= 0 || dims[1] <= 0 || dims[2] <= 0) {
+    if (dims[0] == 0 || dims[0] > (uint32_t)INT32_MAX ||
+        dims[1] == 0 || dims[1] > (uint32_t)INT32_MAX ||
+        dims[2] == 0 || dims[2] > (uint32_t)INT32_MAX) {
         return -1;
     }
-    out->outer    = dims[0];
-    out->m_stride = dims[1];
-    out->sub      = dims[2];
+    out->outer    = (int32_t)dims[0];
+    out->m_stride = (int32_t)dims[1];
+    out->sub      = (int32_t)dims[2];
     return 0;
 }
 

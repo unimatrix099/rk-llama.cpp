@@ -7,6 +7,7 @@ ggml_add_backend_library(ggml-rknpu2
     rknpu2-quantization.cpp
     rknpu2-calibration.cpp
     rknpu2-configuration.cpp
+    rknpu2-native-layout.c
 )
 
 # Linking rknpu2 header files

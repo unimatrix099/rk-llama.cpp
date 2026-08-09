@@ -38,39 +38,39 @@ static uint32_t prng(void) {
 static void test_geom_parse_ok(void) {
     // Probed real dims on RK3588 (see RKNPU2-native-layout-plan.md):
     // INT4 A at M=32 K=2048: [64, 32, 32]; INT4 C at N=2048: [256, 32, 8]
-    const int32_t a_dims[3] = {64, 32, 32};
+    const uint32_t a_dims[3] = {64, 32, 32};
     rknpu2_native_geom g;
     CHECK(rknpu2_native_geom_from_dims(a_dims, 3, &g) == 0, "A dims parse");
     CHECK(g.outer == 64 && g.m_stride == 32 && g.sub == 32,
           "A geom values %d %d %d", g.outer, g.m_stride, g.sub);
 
-    const int32_t c_dims[3] = {256, 32, 8};
+    const uint32_t c_dims[3] = {256, 32, 8};
     CHECK(rknpu2_native_geom_from_dims(c_dims, 3, &g) == 0, "C dims parse");
     CHECK(g.outer == 256 && g.m_stride == 32 && g.sub == 8,
           "C geom values %d %d %d", g.outer, g.m_stride, g.sub);
 
     // M=1 degenerate case must parse too: [64, 1, 32]
-    const int32_t m1_dims[3] = {64, 1, 32};
+    const uint32_t m1_dims[3] = {64, 1, 32};
     CHECK(rknpu2_native_geom_from_dims(m1_dims, 3, &g) == 0, "M=1 parse");
     CHECK(g.m_stride == 1, "M=1 stride");
 }
 
 static void test_geom_parse_rejects(void) {
     rknpu2_native_geom g;
-    const int32_t two[2] = {32, 2048};          // NORM layout reports 2 dims
+    const uint32_t two[2] = {32, 2048};          // NORM layout reports 2 dims
     CHECK(rknpu2_native_geom_from_dims(two, 2, &g) == -1, "reject n_dims=2");
-    const int32_t four[4] = {1, 2, 3, 4};
+    const uint32_t four[4] = {1, 2, 3, 4};
     CHECK(rknpu2_native_geom_from_dims(four, 4, &g) == -1, "reject n_dims=4");
-    const int32_t zero[3] = {64, 0, 32};
+    const uint32_t zero[3] = {64, 0, 32};
     CHECK(rknpu2_native_geom_from_dims(zero, 3, &g) == -1, "reject zero dim[1]");
-    const int32_t neg[3] = {64, -1, 32};
-    CHECK(rknpu2_native_geom_from_dims(neg, 3, &g) == -1, "reject negative dim[1]");
-    const int32_t zero0[3] = {0, 32, 32};
+    const uint32_t huge[3] = {64, 0x80000000u, 32};
+    CHECK(rknpu2_native_geom_from_dims(huge, 3, &g) == -1, "reject dim[1] > INT32_MAX");
+    const uint32_t zero0[3] = {0, 32, 32};
     CHECK(rknpu2_native_geom_from_dims(zero0, 3, &g) == -1, "reject zero dim[0]");
-    const int32_t zero2[3] = {64, 32, 0};
+    const uint32_t zero2[3] = {64, 32, 0};
     CHECK(rknpu2_native_geom_from_dims(zero2, 3, &g) == -1, "reject zero dim[2]");
     CHECK(rknpu2_native_geom_from_dims(NULL, 3, &g) == -1, "reject NULL dims");
-    const int32_t ok[3] = {64, 32, 32};
+    const uint32_t ok[3] = {64, 32, 32};
     CHECK(rknpu2_native_geom_from_dims(ok, 3, NULL) == -1, "reject NULL out");
 }
 

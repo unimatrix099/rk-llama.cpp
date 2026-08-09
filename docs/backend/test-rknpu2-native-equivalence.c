@@ -259,6 +259,11 @@ int main(void) {
         {5,   320,  256},
         {32,  2048, 2048},
         {128, 1024, 512},
+        // Prefill-scale shapes (ubatch 512) and model-like dims: these are
+        // what the backend actually runs during perplexity/prompt processing
+        {512, 2048, 2048},
+        {512, 8192, 1536},
+        {512, 2048, 8960},
     };
     int failures = 0;
     for (unsigned i = 0; i < sizeof(shapes)/sizeof(shapes[0]); ++i) {
