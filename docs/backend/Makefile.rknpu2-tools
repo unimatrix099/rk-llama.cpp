@@ -1,0 +1,27 @@
+# Build the RKNPU2 diagnostic/benchmark tools on the target board.
+#
+#   cd docs/backend && make -f Makefile.rknpu2-tools
+#   ulimit -n 65536
+#   LD_LIBRARY_PATH=$(LIBS_DIR) ./rknpu2-matmul-layout-bench
+#
+# Tools (see RKNPU2-int4-research.md for what each one established):
+#   rknpu2-matmul-probe         dtype support probe (mixed types rejected on RK3588)
+#   rknpu2-matmul-bench         raw throughput, AC_layout=NORM (carries a WARNING - see header)
+#   rknpu2-matmul-layout-bench  NORM vs NATIVE sweep (the ~80x INT4 finding)
+#   rknpu2-layout-dims-probe    native A/C tiling formats (input for the layout plan)
+
+LIBS_DIR := ../../ggml/src/ggml-rknpu2/libs
+CFLAGS   := -O2 -I $(LIBS_DIR)/include
+LDLIBS   := $(LIBS_DIR)/librknnrt.so
+
+TOOLS := rknpu2-matmul-probe rknpu2-matmul-bench rknpu2-matmul-layout-bench rknpu2-layout-dims-probe
+
+all: $(TOOLS)
+
+%: %.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
+
+clean:
+	rm -f $(TOOLS)
+
+.PHONY: all clean
