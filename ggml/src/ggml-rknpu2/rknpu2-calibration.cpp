@@ -7,6 +7,10 @@
 #include <cstring>
 #include <omp.h>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 namespace rknpu2_calibration {
 
 // --- Calibration Implementations ---
@@ -187,6 +191,39 @@ static bool is_power_of_two(int n) {
 
 // Iterative Fast Walsh-Hadamard Transform (in-place)
 static void fwht_iterative(float* data, int size) {
+#ifdef __ARM_NEON
+    if (size >= 4) {
+        // stage h=1: pairwise butterflies inside each 4-lane vector.
+        // [a,b,c,d] -> [a+b, a-b, c+d, c-d]: even lanes from v+rev,
+        // odd lanes from v-rev (vtrn1 interleaves them back).
+        for (int i = 0; i < size; i += 4) {
+            float32x4_t v   = vld1q_f32(data + i);
+            float32x4_t sw  = vrev64q_f32(v);
+            float32x4_t sum = vaddq_f32(v, sw);
+            float32x4_t dif = vsubq_f32(v, sw);
+            vst1q_f32(data + i, vtrn1q_f32(sum, dif));
+        }
+        // stage h=2: butterflies between the two lane pairs of one vector
+        for (int i = 0; i < size; i += 4) {
+            float32x4_t v = vld1q_f32(data + i);
+            float32x2_t lo = vget_low_f32(v), hi = vget_high_f32(v);
+            vst1_f32(data + i,     vadd_f32(lo, hi));
+            vst1_f32(data + i + 2, vsub_f32(lo, hi));
+        }
+        // stages h>=4: contiguous 4-wide butterflies
+        for (int h = 4; h < size; h <<= 1) {
+            for (int i = 0; i < size; i += h * 2) {
+                for (int j = i; j < i + h; j += 4) {
+                    float32x4_t x = vld1q_f32(data + j);
+                    float32x4_t y = vld1q_f32(data + j + h);
+                    vst1q_f32(data + j,     vaddq_f32(x, y));
+                    vst1q_f32(data + j + h, vsubq_f32(x, y));
+                }
+            }
+        }
+        return;
+    }
+#endif
     for (int h = 1; h < size; h <<= 1) {
         for (int i = 0; i < size; i += h * 2) {
             for (int j = i; j < i + h; ++j) {
