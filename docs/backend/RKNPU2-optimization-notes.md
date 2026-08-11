@@ -126,10 +126,26 @@ libgomp respawns its workers ~once per graph split (~550 threads/token on
 E4B NPU decode). `OMP_NUM_THREADS=4` stops the churn (+42% on NPU decode
 by itself) and fixes the strict-taskset pathology the sweep had flagged.
 
-**Recommended:** `OMP_NUM_THREADS=4 taskset -c 4-7 ... -t 4`
-(servers: add `--threads 4 --threads-batch 8`). E4B best measured:
-routed pp 42.62 / tg 5.50. A code fix in the backend (uniform team size)
-should make the env var unnecessary — planned.
+**Recommended:** `taskset -c 4-7 ... -t 4` (servers:
+`--threads 4 --threads-batch 8`). E4B best measured: routed pp 42.52 /
+tg 5.50. The backend code fix below made `OMP_NUM_THREADS=4` unnecessary
+for the recommended routed config; it remains an optional micro-tune for
+NPU-decode-only setups.
+
+## ✅ Shipped: churn-free M=1 path in the backend (dispatch pool + if(M>1))
+
+**Hypothesis (decode research #3):** the per-node OMP team respawn can be
+eliminated in code so the env workaround isn't needed.
+
+**Result (2026-08-11):** `if(M > 1)` on the A-prep/C-dequant regions and a
+persistent 2-worker dispatch pool replacing the `num_threads(3)` run
+region. Thread creations during decode -97%; E4B NPU decode tg +28%
+(3.00→3.84), W4A4 decode tg +18% (3.65→4.31), routed at its best with no
+env vars. Bit-identical outputs (W8A8 + W4A4 greedy), 170 kernel checks
+green. Known trade-offs: W4A4 prefill -3%, and pure NPU decode stays
+~0.4 t/s below the old-code+env optimum (pool wake latency vs GOMP's
+hot-team dispatch — see decode research #3 for the structural fix if it
+ever matters). Spin-harder/pre-wake variants measured and rejected.
 
 ## ✅ Shipped as guidance: pipeline pairing
 
@@ -231,5 +247,5 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | Hadamard transform on NPU | ❌ not worth it | transform-free control still 3.7x slower |
 | Cooperative CPU+NPU decode | ❌ probe: gate failed | +5-9% at fat shapes, <25% gate (decode research #2) |
 | Speculative decoding (draft, ngram, NPU-verify) | ❌ all variants lose | decode research #1 tables |
-| Backend overhead surgery | ⏭ root cause found | libgomp team respawn ~1/split; env fix shipped, code fix planned (decode research #3) |
+| Backend overhead surgery (OMP churn) | ✅ shipped | dispatch pool + if(M>1): clone3 -97%, NPU tg +28%, W4A4 tg +18%, env-free (decode research #3) |
 | QKV fusion, calib cache | ⏸ after the OMP code fix | re-profile once churn is gone |
