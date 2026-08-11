@@ -34,7 +34,12 @@ Google's edge stack, not llama.cpp; see investigation doc)
 | NPU `W16A16_STANDARD` | 28.2 | 1.9 |
 | NPU `W4A4_HADAMARD` (default for Q4_0) | 7.7 | 3.4 |
 | NPU `W4A4_STANDARD` (control, broken accuracy) | 10.8 | n/a |
-| **NPU + `RKNPU_CPU_DECODE=32` (shipped)** | **41.3** | **4.9** |
+| NPU + `RKNPU_CPU_DECODE=32` (shipped) | 41.3 | 4.9 |
+| **Current best (2026-08-11): W8A8 + `CPU_DECODE=32`, `taskset -c 4-7 -t 4`, churn-free backend** | **42.5** | **5.5** |
+
+(The default-threading rows above predate the threading guidance and the
+churn fix; they remain as the historical baseline each entry below built
+on. Cumulative: pp 39.8→42.5, tg 3.3→5.5 at identical accuracy.)
 
 ### Others
 
@@ -42,8 +47,9 @@ Google's edge stack, not llama.cpp; see investigation doc)
 |---|---|---|---|
 | LFM2-8B-A1B Q8_0 (MoE, ~1.5B active) | NPU `W8A8` | 48.3 | 9.1 |
 | LFM2-8B-A1B Q8_0 | CPU only | 46.2 | 7.6 |
-| LFM2-8B-A1B Q8_0 | NPU + `CPU_DECODE=32` | 47.8 | 7.7 ← regression |
+| LFM2-8B-A1B Q8_0 | NPU + `CPU_DECODE=32` | 47.8 | 7.7 ← regression at default threads; **13.66 at t=4 pinned** |
 | Qwen2.5-1.5B Q8_0 | NPU `W8A8` (interactive) | ~50 | ~5.0 |
+| Qwen2.5-1.5B Q8_0 | NPU + `CPU_DECODE=32`, t=4 pinned | 280.8 | **13.52** |
 
 ## ✅ Shipped: M-dependent routing (`RKNPU_CPU_DECODE=<M>`)
 

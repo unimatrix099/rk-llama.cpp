@@ -292,7 +292,11 @@ Pin clocks (`scripts/fix_freq_rk3588.sh`) and `ulimit -n 65536` first.
 - Everything lives on `github.com/unimatrix099/rk-llama.cpp`; the current
   tip branch is `feat/w4a4-neon-prep` (stacked on
   `feat/int4-native-layout` ← `feat/mixed-precision-pipelines` ←
-  `fix/w4a4-calibration-crashes` ← upstream `rknpu2` + PR #21).
+  `fix/w4a4-calibration-crashes` ← upstream `rknpu2` + PR #21). The
+  2026-08-10/11 sessions added three commits on that branch: measured
+  verdicts + tooling, profiling results, and the churn-free backend
+  decode path (`rknpu_dispatch_pool`); the board's `~/rk-llama.cpp` has
+  the same files applied and `libggml-rknpu2.so` rebuilt from them.
 - The board (Orange Pi 5 Ultra) has the repo at `~/rk-llama.cpp`, models
   in `~/models/` (`gemma-4-E4B-it-Q4_0.gguf`, `gemma-4-E2B-it-Q4_0.gguf`,
   `qwen2.5-1.5b-instruct-q8_0.gguf`, `qwen2.5-0.5b-instruct-q8_0.gguf`,
