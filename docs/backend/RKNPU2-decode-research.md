@@ -4,11 +4,11 @@ Research thread with **measured verdicts as of 2026-08-11** (board
 sessions: probe + sweeps + perf/strace/gdb profiling; tooling under
 "Experiment tooling" below). Summary: #5 threading is a shipped big win
 (+19–66% tg, no code); #1 speculative and #2 cooperative decode are
-measured dead ends; **#3 found its root cause** — the backend's per-node
-OMP regions make libgomp respawn its thread team ~once per graph split;
-`OMP_NUM_THREADS=4` recovers +42% NPU-decode tg today, and a small
-backend fix (uniform team size) should replace the env var. No backend
-code changes yet. Companion documents:
+measured dead ends; **#3 found its root cause and shipped the fix** —
+the backend's per-node OMP regions made libgomp respawn its thread team
+~once per graph split; the backend now runs the M=1 path without OMP
+teams (persistent dispatch pool + `if(M>1)`), making the decode paths
++18–28% faster with no env vars. Companion documents:
 `RKNPU2-optimization-notes.md` (shipped work + dead ends),
 `RKNPU2-int4-research.md` (INT4 fundamentals), `RKNPU2-neon-prep-plan.md`
 (prefill prep). Numbers: Orange Pi 5 Ultra (RK3588, 16 GB), pinned clocks,
@@ -174,15 +174,43 @@ libgomp's default team is 4, but without `OMP_NUM_THREADS` the 8-thread
 regions still thrash. Pinning without the env var is what was
 pathological.
 
-**Remaining code work (next session):** make the backend's OMP usage
-churn-free — one consistent team size across its regions (respect
-`omp_get_max_threads()` instead of `num_threads(3)`, or a persistent
-worker pattern like the coop probe's). After that, re-profile: the
-remaining gap to the ~7 t/s W8A8 read-floor (4.1 GB/token at the
-measured 28.6 GB/s) is split across per-split scheduler cost, A-prep,
-C-dequant and futex wakes — then QKV/gate-up fusion becomes the next
-candidate. Cheap bs>1 verification would also revive ngram speculation
-for servers (see #1).
+**Code fix, implemented and shipped (2026-08-11):** the backend no longer
+forms OMP teams on the M=1 path — `if(M > 1)` on the A-prep and C-dequant
+regions (a single row is a few us of NEON, serial), and the
+`num_threads(3)` dispatch region replaced by a persistent 2-worker pool
+(`rknpu_dispatch_pool`: caller runs segment 0, spin-then-sleep workers run
+the rest). clone3 during decode: 33,030 -> 910 per 30 s window (-97%).
+Greedy outputs bit-identical (W8A8 and W4A4), 170 prep-kernel checks
+green. Measured (E4B, t=4, no env vars):
+
+| Config | before | after |
+|---|---|---|
+| NPU decode tg128 | 3.00 | **3.84** (+28%) |
+| NPU decode tg128, pinned | ~3.4 | **3.94** |
+| W4A4 default tg | 3.65 | **4.31** (+18%) |
+| routed pinned pp128/tg64 | needed env: 42.62/5.50 | **42.52/5.49 env-free** |
+| W4A4 default pp128 | 34.44 | 33.39 (-3%) |
+
+Honest trade-offs, both measured:
+- The old code WITH `OMP_NUM_THREADS=4` still beats the pool on the pure
+  NPU-decode path (4.27-4.55 vs 3.84-3.97): GOMP's team barrier dispatches
+  onto threads that just finished the prep region and are still hot,
+  where the pool pays a ~0.1 ms futex wake per node. The same latency
+  explains the -3% on W4A4 prefill. Structural fix if NPU decode ever
+  matters: have each worker do its own segment's set_io so dispatch
+  overlaps the driver calls. Low priority — routed decode (faster on
+  every model tested) is unaffected and at its best with no env at all.
+- Spinning harder does NOT fix it (tried): longer spins + pre-waking
+  workers before the job is ready steal the cores the prep regions and
+  CPU graph ops need (routed pp 42.5 -> 37.9, pinned NPU tg halved).
+- Residual ~50 clone3/s remains from outside the backend (negligible;
+  unattributed — candidates: librknnrt internals, disposable pools at
+  graph boundaries).
+
+Next after this: re-profile the remaining gap to the ~7 t/s W8A8
+read-floor (per-split scheduler cost, A-prep, C-dequant, futex wakes),
+then QKV/gate-up fusion. Cheap bs>1 verification would also revive ngram
+speculation for servers (see #1).
 
 ### 4. Read fewer bytes
 
