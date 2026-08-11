@@ -1,12 +1,14 @@
 # RKNPU2: improving 4-bit token-generation (decode) speed — research notes
 
-Research thread with **measured verdicts as of 2026-08-10** (board session:
-probe + sweeps, tooling under "Experiment tooling" below). Summary: #5
-threading is a shipped big win (+19–66% tg, no code); #1 speculative and
-#2 cooperative decode are measured dead ends; **#3 backend overhead
-surgery is now the main code lever** — the probe showed the NPU driver
-path itself sustains ~28.6 GB/s at M=1, so the decode gap lives in the
-backend/CPU side. No backend code changes yet. Companion documents:
+Research thread with **measured verdicts as of 2026-08-11** (board
+sessions: probe + sweeps + perf/strace/gdb profiling; tooling under
+"Experiment tooling" below). Summary: #5 threading is a shipped big win
+(+19–66% tg, no code); #1 speculative and #2 cooperative decode are
+measured dead ends; **#3 found its root cause** — the backend's per-node
+OMP regions make libgomp respawn its thread team ~once per graph split;
+`OMP_NUM_THREADS=4` recovers +42% NPU-decode tg today, and a small
+backend fix (uniform team size) should replace the env var. No backend
+code changes yet. Companion documents:
 `RKNPU2-optimization-notes.md` (shipped work + dead ends),
 `RKNPU2-int4-research.md` (INT4 fundamentals), `RKNPU2-neon-prep-plan.md`
 (prefill prep). Numbers: Orange Pi 5 Ultra (RK3588, 16 GB), pinned clocks,
@@ -19,8 +21,8 @@ memory-bandwidth bound. For Gemma-4-E4B Q4_0 (7.46 B dense):
 
 | Decode path | tg64 t/s | effective read rate |
 |---|---|---|
-| CPU (`RKNPU_CPU_DECODE=32`, native Q4_0 reads, ~2.4 GB/token) | ~~5.35~~ **5.50** at t=4 | ~~13~~ **~25 GB/s at t=4 big-core** (13 was an 8-thread artifact — see #5) |
-| NPU W4A4 native layout (~2.05 GB/token INT4) | 3.65 (4.54 W8A8 at t=4) | ~7.5 GB/s aggregate |
+| CPU (`RKNPU_CPU_DECODE=32`, native Q4_0 reads, ~2.4 GB/token) | ~~5.35~~ **5.50** (t=4 + OMP fix; pp 42.62) | ~~13~~ **~25 GB/s at t=4 big-core** (13 was an 8-thread artifact — see #5) |
+| NPU W4A4 native layout (~2.05 GB/token INT4) | 3.65 (W8A8: 4.55 with t=4 + OMP fix) | ~7.5 GB/s aggregate |
 
 Two framing "facts" — **both revised by the 2026-08-10 measurements**:
 
@@ -44,12 +46,18 @@ here it fails structurally, and no variant beat its no-spec baseline
 
 | Variant | t/s | acceptance | baseline |
 |---|---|---|---|
-| draft model (0.5B, draft-max 8) | 4.30 | 41.7% | 13.52 (bench) |
-| ngram-simple, repetitive rewrite prompt | 10.76 | 43% (42 drafted) | 12.15 (server) |
-| ngram-map-k, repetitive rewrite | 11.86 | 4/7 | 12.15 |
-| ngram-simple + verify on NPU (`RKNPU_CPU_DECODE=16` or `8`) | 11.62 | 60% (48 drafted) | 12.15 |
-| any ngram type, creative prompt | 12.17–12.20 | no drafts trigger | 12.15 |
-| E4B ngram-simple, repetitive | 3.64 | 2/16 | 4.17 (server) |
+| draft model (0.5B, draft-max 8) | 4.30* | 41.7% | 13.52 (bench) |
+| ngram-simple, repetitive rewrite (clean board, OMP fix) | **13.80** | 43% (18/42) | **13.81** (server) |
+| ngram-simple + verify on NPU (`RKNPU_CPU_DECODE=16` or `8`) | 11.62* | 60% (48 drafted) | 12.15* |
+| any ngram type, creative prompt | 12.17–12.20* | no drafts trigger | 12.15* |
+| E4B ngram-simple, repetitive | 3.64* | 2/16 | 4.17* (server) |
+
+*Measured while a stuck background process burned one core (found and
+killed 2026-08-11); relative comparisons shared that handicap, so the
+verdicts hold. The headline pair was re-verified on a clean board with
+`OMP_NUM_THREADS=4`: ngram-simple is exactly **neutral** (13.80 vs
+13.81), not the loss the dirty numbers suggested — the drafts that
+trigger pay for their verification and no more.
 
 Why each fails:
 - **Draft model**: qwen-0.5B is 1/3 of the target's bytes — even at 100%
@@ -130,26 +138,51 @@ mechanism (see `feat/mixed-precision-pipelines`).
 
 </details>
 
-### 3. Backend overhead surgery — NOW THE MAIN CODE LEVER (re-ranked 2026-08-10)
+### 3. Backend overhead surgery — PROFILED: root cause found (2026-08-11)
 
-The coop probe changed this avenue's status and its target. Measured: the
-per-node M=1 driver sequence (A set/sync, 3 parallel runs, 3 C syncs)
-sustains ~28.6 GB/s — an E4B NPU-decode read floor of ~72 ms/token
-(~14 t/s), and the t=4 CPU path reads at ~25 GB/s (~8-9 t/s potential).
-Actual: 3.65-5.50. The missing 100-200 ms/token is backend/CPU-side and
-unprofiled. Plan:
+The profiling chain (perf cycles → strace -c → gdb breakpoint backtraces,
+all on verified decode steady state) attributed the NPU-decode overhead:
 
-1. `perf record` a real decode step (llama-bench tg, routed and NPU-only)
-   and attribute time: ggml scheduler splits/copies, backend cache
-   lookups under mutex, A-prep, C dequant, thread-pool wake/sync,
-   between-node CPU ops.
-2. Fix in measured order. Candidates from earlier analysis: per-split
-   scheduler cost (~600 splits/token on E4B), QKV/gate-up fusion (~40%
-   fewer dispatches), batching the 3 per-node `rknn_mem_sync` calls.
-- The old caveat ("splits are not the prefill bottleneck") measured
-  aggregate byte volume, not fixed per-node costs at M=1 — it does not
-  contradict this. The speculative results add a second motivation:
-  cheap bs>1 verification would revive ngram speculation for servers.
+- perf cycles: ~95% of on-CPU samples in libgomp spin-wait; the CPU does
+  almost no real work during NPU decode. Driver `ioctl`s: ~3% of wall
+  time (~75k calls/30s at 13 us) — the NPU driver is NOT the bottleneck,
+  confirming the coop-probe finding.
+- strace -c: ~33k `clone3` in 30 s of decode — **~550 thread creations
+  per token, ~1 per graph split** (E4B: 603 splits/token at bs=1
+  NPU-decode; the routed path has 1 split at bs=1, which is why it never
+  suffered).
+- gdb on `pthread_create`: every spawn is
+  `GOMP_parallel <- ggml_backend_rknpu_graph_compute`, with libgomp
+  tearing down and re-creating its team around the backend's per-node
+  OMP regions. The backend's regions request heterogeneous team sizes
+  (default 8 for A-prep/C-dequant, `num_threads(3)` for the matmul runs)
+  while ggml-cpu's regions use `-t` (4); libgomp responds by respawning
+  workers region-to-region.
+
+**Env-level fix, verified (E4B, W8A8, t=4, clean board):**
+`OMP_NUM_THREADS=4` alone lifts NPU decode tg128 3.00 -> 4.27 (+42%).
+Combined best config `taskset -c 4-7` + `-t 4` + `OMP_NUM_THREADS=4`:
+
+| E4B config | pp128 | tg64 |
+|---|---|---|
+| NPU decode, pinned big-4 | 42.01 | 4.55 |
+| routed, pinned big-4 | **42.62 ± 0.02** | **5.50** |
+
+This also **resolves the "strict-taskset anomaly"** from the affinity
+sweep (was pp 8.75 ± 2.10, now 42.62 ± 0.02): under `taskset -c 4-7`,
+libgomp's default team is 4, but without `OMP_NUM_THREADS` the 8-thread
+regions still thrash. Pinning without the env var is what was
+pathological.
+
+**Remaining code work (next session):** make the backend's OMP usage
+churn-free — one consistent team size across its regions (respect
+`omp_get_max_threads()` instead of `num_threads(3)`, or a persistent
+worker pattern like the coop probe's). After that, re-profile: the
+remaining gap to the ~7 t/s W8A8 read-floor (4.1 GB/token at the
+measured 28.6 GB/s) is split across per-split scheduler cost, A-prep,
+C-dequant and futex wakes — then QKV/gate-up fusion becomes the next
+candidate. Cheap bs>1 verification would also revive ngram speculation
+for servers (see #1).
 
 ### 4. Read fewer bytes
 
@@ -186,14 +219,17 @@ underestimate, and it moves every baseline in these docs:
   so `RKNPU_CPU_DECODE=32` stops being model-conditional once threading
   is right (revalidate per model, but the known counterexample is gone).
 - Qwen prefill also gains from pinning: pp128 215 -> 280 t/s.
-- NPU decode gains too (+32-40%): the between-node CPU work contends
-  with idle-thread scheduling — more evidence for the avenue #3 finding.
-- Anomaly to recheck: E4B routed with strict `taskset -c 4-7` was noisy
-  and slow (pp 8.75 +/- 2.10); t=4 WITHOUT taskset was clean and best.
-  Until understood, recommend `-t 4` unpinned for E4B-class models and
-  pinning only smaller models.
-- Deployment note: for servers, use `--threads 4 --threads-batch 8`
-  (decode wants 4 big; prefill prep still profits from 8).
+- NPU decode gains too (+32-40%). Root cause found the next day: under
+  `taskset -c 4-7` libgomp defaults to 4 threads, which damps the OMP
+  team-respawn churn diagnosed in avenue #3 — much of the "affinity"
+  gain on NPU-heavy configs is really the OMP effect.
+- ~~Anomaly to recheck: E4B routed with strict taskset was noisy/slow~~
+  RESOLVED (see #3): pinning without `OMP_NUM_THREADS=4` thrashes the
+  8-thread backend regions on 4 cores. With the env var set, strict
+  pinning is clean and fastest (pp 42.62 ± 0.02).
+- **Recommended config (RK3588, 2026-08-11):**
+  `OMP_NUM_THREADS=4 taskset -c 4-7 ... -t 4` for CLI/bench; servers add
+  `--threads 4 --threads-batch 8`.
 - Still to do: re-tune `RKNPU_CPU_DECODE` threshold per model at t=4.
 
 ### 6. Batch serving (throughput only)
@@ -235,8 +271,12 @@ Pin clocks (`scripts/fix_freq_rk3588.sh`) and `ulimit -n 65536` first.
   `LFM2-8B-A1B-Q8_0.gguf`), binaries in `build/bin/` incl.
   `llama-speculative`. Remember `ulimit -n 65536` and
   `scripts/fix_freq_rk3588.sh` (in `~/rknn-llm/scripts/`) before benching.
-- Raw logs from the 2026-08-10 session are archived on the board in
-  `~/bench-logs/2026-08-10/`.
+- Raw logs are archived on the board: `~/bench-logs/2026-08-10/` (probe,
+  sweeps, speculative) and `~/bench-logs/2026-08-11/` (perf/strace/gdb
+  profiling, OMP experiments, clean re-verification).
+- Measurement hygiene, learned the hard way: before benching, check for
+  stale processes (`pgrep -af llama`) — a stuck llama-cli burned one core
+  through part of the 2026-08-10 evening (numbers marked * in #1).
 - Diagnostic tools build from `docs/backend/Makefile.rknpu2-tools`
   (`make all`, `check`, `check-prep`, `check-hw`, `coverage`).
 - Reference numbers to beat: decode table above; prefill state in
