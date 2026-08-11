@@ -107,20 +107,29 @@ making W4A4_HADAMARD reproducible across runs and builds for the first
 time. 170 exactness checks (`check-prep`), touched functions at 100%
 line coverage.
 
-## ✅ Shipped as guidance: 4 big-core threads for decode (`-t 4`)
+## ✅ Shipped as guidance: threading config (`-t 4` + `OMP_NUM_THREADS=4` + big cores)
 
 **Hypothesis (decode research #5):** default threading (8 threads across
 A55+A76) drags the critical decode path; big-cores-only could swing ±10%.
 
-**Result (measured 2026-08-10, `rknpu2-affinity-sweep.sh`):** far larger —
-tg64 +19% to +66% across every model tested, no code changes:
+**Result (measured 2026-08-10/11, `rknpu2-affinity-sweep.sh` + profiling):**
+far larger — tg64 +19% to +66% across every model tested, no code changes:
 Qwen routed 8.93→13.52, E4B W8A8+routed 4.64→5.50, E4B NPU decode
-3.43→4.54, LFM2 NPU 9.47→13.25, LFM2 routed 8.22→13.66. The old "~13 GB/s
+3.43→4.55, LFM2 NPU 9.47→13.25, LFM2 routed 8.22→13.66. The old "~13 GB/s
 CPU decode ceiling" was an 8-thread artifact; t=4 big-core reaches ~25
 GB/s effective. LFM2's routing regression (see `RKNPU_CPU_DECODE` caveats
-above) disappears at t=4. Caveats: pin with `taskset -c 4-7` for small
-models; E4B-class was noisy when strictly pinned (recheck open) — use
-plain `-t 4` there. Servers: `--threads 4 --threads-batch 8`.
+above) disappears at t=4.
+
+Profiling then found the second half of the story (decode research #3):
+the backend's per-node OMP regions request heterogeneous team sizes and
+libgomp respawns its workers ~once per graph split (~550 threads/token on
+E4B NPU decode). `OMP_NUM_THREADS=4` stops the churn (+42% on NPU decode
+by itself) and fixes the strict-taskset pathology the sweep had flagged.
+
+**Recommended:** `OMP_NUM_THREADS=4 taskset -c 4-7 ... -t 4`
+(servers: add `--threads 4 --threads-batch 8`). E4B best measured:
+routed pp 42.62 / tg 5.50. A code fix in the backend (uniform team size)
+should make the env var unnecessary — planned.
 
 ## ✅ Shipped as guidance: pipeline pairing
 
@@ -216,11 +225,11 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | W8A8 pairing guidance | ✅ shipped (docs) | fastest pipeline on all models tested |
 | Native A/C layout for INT4 | ✅ shipped | E4B W4A4 pp 4.15x, bit-identical |
 | NEON W4A4 prep | ✅ shipped | pp +8-13%, 170 exactness checks |
-| 4 big-core threads (`-t 4`) | ✅ shipped (docs) | tg +19-66% on every model tested |
+| Threading config (`-t 4` + `OMP_NUM_THREADS=4` + big cores) | ✅ shipped (docs) | tg +19-66%; +42% NPU decode from OMP fix alone |
 | Mixed W4A16/W8A16 pipelines | ❌ platform-blocked | runtime rejects dtypes on RK3588 |
 | Tensor exclusion heuristics | ❌ no effect | 3 configs within noise |
 | Hadamard transform on NPU | ❌ not worth it | transform-free control still 3.7x slower |
 | Cooperative CPU+NPU decode | ❌ probe: gate failed | +5-9% at fat shapes, <25% gate (decode research #2) |
 | Speculative decoding (draft, ngram, NPU-verify) | ❌ all variants lose | decode research #1 tables |
-| Backend overhead surgery | ⏭ next code lever | NPU driver path ~28.6 GB/s at M=1; 100-200 ms/token unattributed |
-| QKV fusion, calib cache | ⏸ folded into overhead surgery | profile first |
+| Backend overhead surgery | ⏭ root cause found | libgomp team respawn ~1/split; env fix shipped, code fix planned (decode research #3) |
+| QKV fusion, calib cache | ⏸ after the OMP code fix | re-profile once churn is gone |
