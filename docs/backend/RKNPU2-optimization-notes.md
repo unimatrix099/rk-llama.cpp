@@ -107,6 +107,21 @@ making W4A4_HADAMARD reproducible across runs and builds for the first
 time. 170 exactness checks (`check-prep`), touched functions at 100%
 line coverage.
 
+## ✅ Shipped as guidance: 4 big-core threads for decode (`-t 4`)
+
+**Hypothesis (decode research #5):** default threading (8 threads across
+A55+A76) drags the critical decode path; big-cores-only could swing ±10%.
+
+**Result (measured 2026-08-10, `rknpu2-affinity-sweep.sh`):** far larger —
+tg64 +19% to +66% across every model tested, no code changes:
+Qwen routed 8.93→13.52, E4B W8A8+routed 4.64→5.50, E4B NPU decode
+3.43→4.54, LFM2 NPU 9.47→13.25, LFM2 routed 8.22→13.66. The old "~13 GB/s
+CPU decode ceiling" was an 8-thread artifact; t=4 big-core reaches ~25
+GB/s effective. LFM2's routing regression (see `RKNPU_CPU_DECODE` caveats
+above) disappears at t=4. Caveats: pin with `taskset -c 4-7` for small
+models; E4B-class was noisy when strictly pinned (recheck open) — use
+plain `-t 4` there. Servers: `--threads 4 --threads-batch 8`.
+
 ## ✅ Shipped as guidance: pipeline pairing
 
 For throughput on RK3588, `W8A8_STANDARD` is the strongest NPU pipeline for
@@ -199,7 +214,13 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 |---|---|---|
 | M-dependent routing (`RKNPU_CPU_DECODE`) | ✅ shipped | E4B tg +49%, pp preserved |
 | W8A8 pairing guidance | ✅ shipped (docs) | fastest pipeline on all models tested |
+| Native A/C layout for INT4 | ✅ shipped | E4B W4A4 pp 4.15x, bit-identical |
+| NEON W4A4 prep | ✅ shipped | pp +8-13%, 170 exactness checks |
+| 4 big-core threads (`-t 4`) | ✅ shipped (docs) | tg +19-66% on every model tested |
 | Mixed W4A16/W8A16 pipelines | ❌ platform-blocked | runtime rejects dtypes on RK3588 |
 | Tensor exclusion heuristics | ❌ no effect | 3 configs within noise |
 | Hadamard transform on NPU | ❌ not worth it | transform-free control still 3.7x slower |
-| QKV fusion, calib cache, speculative | ⏸ deprioritized | see above |
+| Cooperative CPU+NPU decode | ❌ probe: gate failed | +5-9% at fat shapes, <25% gate (decode research #2) |
+| Speculative decoding (draft, ngram, NPU-verify) | ❌ all variants lose | decode research #1 tables |
+| Backend overhead surgery | ⏭ next code lever | NPU driver path ~28.6 GB/s at M=1; 100-200 ms/token unattributed |
+| QKV fusion, calib cache | ⏸ folded into overhead surgery | profile first |
