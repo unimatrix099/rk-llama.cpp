@@ -203,14 +203,57 @@ Honest trade-offs, both measured:
 - Spinning harder does NOT fix it (tried): longer spins + pre-waking
   workers before the job is ready steal the cores the prep regions and
   CPU graph ops need (routed pp 42.5 -> 37.9, pinned NPU tg halved).
-- Residual ~50 clone3/s remains from outside the backend (negligible;
-  unattributed — candidates: librknnrt internals, disposable pools at
-  graph boundaries).
+- ~~Residual ~50 clone3/s remains~~ CORRECTED by the clean re-profile
+  below: decode-window clone3 is exactly **zero**; the residual was
+  load-phase spillover into the measurement window.
 
-Next after this: re-profile the remaining gap to the ~7 t/s W8A8
-read-floor (per-split scheduler cost, A-prep, C-dequant, futex wakes),
-then QKV/gate-up fusion. Cheap bs>1 verification would also revive ngram
-speculation for servers (see #1).
+#### Re-profile of the churn-free path (2026-08-13): both decode paths are near their floors
+
+Wall-time decomposition via an LD_PRELOAD shim timing every librknnrt
+entry point (`rknpu2-driver-shim.c`; cycle sampling cannot see blocked
+time), plus decode-only perf/strace windows. E4B, W8A8, t=4.
+
+**NPU decode (3.90 t/s = 256 ms/token):**
+
+| Component | ms/token | share |
+|---|---|---|
+| `rknn_matmul_run` wall (3 cores concurrent; 1,277 calls at 0.374 ms) | ~159 | 62% |
+| `set_io_mem` (2,554 calls) + `mem_sync` (1,704 calls) | ~5 | 2% |
+| sequential CPU graph phase | ~92 | 36% |
+
+The 159 ms is 4.1 GB at ~26 GB/s — within 10% of the coop probe's
+28.6 GB/s driver ceiling, so the NPU part is essentially at its floor.
+The 92 ms CPU phase is real model compute (perf: bf16/f16 attention dots,
+GLU, tanh — the AltUp/LAUREL/activation ops), sequentially dependent on
+the matmuls, not overlappable within a single stream. ~53% of on-CPU
+samples are idle spin (ggml's team barrier while the NPU runs + the
+dispatch pool between nodes) — cosmetic, those cores have nothing else
+to do. Zero thread creation, futex+ioctl only.
+
+**Routed decode (5.50 t/s = 182 ms/token):** ~92% of cycles are
+productive memory-bound kernels (66% Q4_0 weight GEMV, 16% Q8 dot, 8%
+bf16, 1.6% f16). No software waste left; purely bandwidth-bound.
+
+**Implications:**
+- QKV/gate-up fusion is now bounded: it can only attack the ~5 ms
+  driver-misc slice plus per-node fixed costs inside the 159 ms — no
+  longer a 40% lever. Deprioritized again, this time with numbers.
+- The remaining engineering frontier is BYTES. Concretely: W4A4 NPU
+  decode reads ~2.05 GB (floor ~79 ms) yet measures 4.31 t/s
+  (232 ms/token) — its CPU-side is ~153 ms vs W8A8's 92 ms. **Closing
+  that ~60 ms gap (Hadamard prep + INT16 dequant remnants on the M=1
+  path) would put W4A4 decode at ~5.8 t/s — above routed — while
+  halving NPU memory.** That is the next investigation.
+- Measurement pitfalls fixed along the way: the "decode detector"
+  (utime slope + thread count) also fires during load's OMP
+  quantization burst, which had contaminated two earlier profile
+  windows (the "set_tensor eats 10% of decode" reading and the
+  "residual clone3" were both load-tail artifacts — set_tensor at
+  decode is zero). Decode windows are now taken at a fixed offset
+  validated against the shim's run-call timeline.
+
+Cheap bs>1 verification reviving ngram speculation for servers remains
+open (see #1).
 
 ### 4. Read fewer bytes
 
@@ -286,6 +329,14 @@ Pin clocks (`scripts/fix_freq_rk3588.sh`) and `ulimit -n 65536` first.
    Draft GGUFs now in `~/models` on the board.
 3. **`rknpu2-affinity-sweep.sh`** (produced the #5 verdict) — llama-bench
    across thread count x taskset for routed, NPU-only and MoE configs.
+4. **`rknpu2-driver-shim.c`** (produced the #3 re-profile) — LD_PRELOAD
+   shim timing every librknnrt entry point, cumulative counters printed
+   every 5 s; the steady-window slope over the token rate gives ms/token
+   per driver call. `make -f Makefile.rknpu2-tools rknpu2-driver-shim.so`,
+   then `LD_PRELOAD=./rknpu2-driver-shim.so llama-bench ... 2>shim.log`.
+   Also the reference for decode-window timing: take profile windows at a
+   fixed offset validated against the shim's run-call slope — utime-based
+   "decode detectors" fire during load's quantization burst too.
 
 ## Handover notes (continuing on another machine)
 

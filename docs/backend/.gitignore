@@ -8,3 +8,4 @@ rknpu2-layout-dims-probe
 test-rknpu2-prep-kernels
 rknpu2-bench-prep
 rknpu2-coop-decode-probe
+rknpu2-driver-shim.so

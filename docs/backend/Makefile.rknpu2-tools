@@ -10,6 +10,7 @@
 #   rknpu2-matmul-layout-bench  NORM vs NATIVE sweep (the ~80x INT4 finding)
 #   rknpu2-layout-dims-probe    native A/C tiling formats (input for the layout plan)
 #   rknpu2-coop-decode-probe    do CPU+NPU bandwidths sum at M=1? (decode research #2)
+#   rknpu2-driver-shim.so       LD_PRELOAD wall-time accounting of librknnrt calls
 
 LIBS_DIR := ../../ggml/src/ggml-rknpu2/libs
 CFLAGS   := -O2 -I $(LIBS_DIR)/include
@@ -24,6 +25,10 @@ NL_INC := -I ../../ggml/src/ggml-rknpu2
 # +dotprod so the Q4_0 GEMV matches llama.cpp's CPU kernels (A76 has it).
 rknpu2-coop-decode-probe: rknpu2-coop-decode-probe.c
 	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -pthread $< -o $@ $(LDLIBS)
+
+# Driver-call wall-time shim (usage in the file header; no rknn deps)
+rknpu2-driver-shim.so: rknpu2-driver-shim.c
+	$(CC) -O2 -shared -fPIC $< -o $@ -ldl -lpthread
 
 all: $(TOOLS) rknpu2-coop-decode-probe test-rknpu2-native-layout test-rknpu2-native-equivalence
 
