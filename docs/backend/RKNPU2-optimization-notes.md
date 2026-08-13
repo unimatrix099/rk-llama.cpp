@@ -253,5 +253,7 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | Hadamard transform on NPU | ❌ not worth it | transform-free control still 3.7x slower |
 | Cooperative CPU+NPU decode | ❌ probe: gate failed | +5-9% at fat shapes, <25% gate (decode research #2) |
 | Speculative decoding (draft, ngram, NPU-verify) | ❌ all variants lose | decode research #1 tables |
-| Backend overhead surgery (OMP churn) | ✅ shipped | dispatch pool + if(M>1): clone3 -97%, NPU tg +28%, W4A4 tg +18%, env-free (decode research #3) |
-| QKV fusion, calib cache | ⏸ after the OMP code fix | re-profile once churn is gone |
+| Backend overhead surgery (OMP churn) | ✅ shipped | dispatch pool + if(M>1): decode clone3 = 0, NPU tg +28%, W4A4 tg +18%, env-free (decode research #3) |
+| QKV fusion | ❌ bounded out | re-profile: can only attack ~5 ms/token of driver misc (decode research #3 re-profile) |
+| W4A4 M=1 CPU-phase gap (~60 ms/token vs W8A8) | ⏭ next investigation | closing it ≈ 5.8 t/s W4A4 decode, above routed, at half the memory |
+| Calib cache | ⏸ load-time QoL | unchanged |
