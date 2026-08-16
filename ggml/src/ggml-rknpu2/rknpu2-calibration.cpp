@@ -3,6 +3,7 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <cstring>
 #include <omp.h>
@@ -248,33 +249,62 @@ int next_power_of_two(int n) {
     return n;
 }
 
+// RKNPU_HADAMARD_BLOCK semantics (read once: packed buffers, matmul
+// contexts and the dequant divisor depend on it — no runtime changes):
+//   1 (default) pure block-diagonal: block = largest pow2 divisor of K,
+//               zero padding — fastest and smallest (E4B: tg +28%, NPU
+//               memory -29%) at a measured W4A4 quality cost (wikitext
+//               PPL 228.9 vs 198.4 legacy on an already heavily degraded
+//               capacity mode; W8A8 reference 37.8)
+//   0           legacy: pad K to the next power of two, one full FWHT —
+//               the pre-2026-08-16 behavior, bit-identical
+//   <pow2 n>    minimum block n, K padded to the next block multiple.
+//               Measured WORSE than both (n=1024: PPL 280.4, tg 5.13 —
+//               the half-empty pad block hurts more than small blocks
+//               do); kept for experiments only.
+// See RKNPU2-decode-research.md #3b for all measurements.
+static int hadamard_min_block() {
+    static const int min_block = []() {
+        const char* env = std::getenv("RKNPU_HADAMARD_BLOCK");
+        int v = env ? std::atoi(env) : 1;
+        if (v < 0) v = 0;
+        if (v > 1 && (v & (v - 1)) != 0) v = next_power_of_two(v);
+        return v;
+    }();
+    return min_block;
+}
+
+int hadamard_block_len(int K) {
+    const int mb = hadamard_min_block();
+    if (mb == 0) return next_power_of_two(K);   // legacy
+    // at least the min block for outlier spreading, but never beyond the
+    // next power of two (a K=256 row must not inflate to a 1024 block)
+    const int divisor = K & (-K);
+    return std::min(std::max(divisor, mb), next_power_of_two(K));
+}
+
+int hadamard_k_op(int K) {
+    const int mb = hadamard_min_block();
+    if (mb == 0) return next_power_of_two(K);   // legacy
+    const int block = hadamard_block_len(K);
+    return ((K + block - 1) / block) * block;   // next multiple of block
+}
+
 void hadamard_transform(float* dst, const float* src, int K, int padded_size) {
-    // If no padding is needed, copy and perform in-place.
-    if (K == padded_size) {
-        memcpy(dst, src, K * sizeof(float));
-        fwht_iterative(dst, K);
-        return;
-    }
+    // padded_size is hadamard_k_op(K): a multiple of the block length,
+    // which is a power of two. Legacy mode degenerates to one full-length
+    // transform (block == padded_size == next_pow2(K)); power-of-two K is
+    // bit-identical in every mode. dst must hold padded_size elements and
+    // never aliases src at the call sites.
+    const int block = hadamard_block_len(K);
 
-    // Using a thread-local buffer to avoid repeated heap allocations.
-    thread_local static std::vector<float> padded_data;
-    
-    // Resizing the buffer only if the current one is too small.
-    if (padded_data.size() < (size_t)padded_size) {
-        padded_data.resize(padded_size);
-    }
-    
-    // Copying source data and zero-fill the rest (padding).
-    memcpy(padded_data.data(), src, K * sizeof(float));
+    memcpy(dst, src, K * sizeof(float));
     if (padded_size > K) {
-        memset(padded_data.data() + K, 0, (padded_size - K) * sizeof(float));
+        memset(dst + K, 0, (padded_size - K) * sizeof(float));
     }
-
-    // Applying the transform to our temporary buffer
-    fwht_iterative(padded_data.data(), padded_size);
-
-    // Copying the result to the destination buffer
-    memcpy(dst, padded_data.data(), padded_size * sizeof(float));
+    for (int off = 0; off < padded_size; off += block) {
+        fwht_iterative(dst + off, block);
+    }
 }
 
 } // namespace rknpu2_calibration

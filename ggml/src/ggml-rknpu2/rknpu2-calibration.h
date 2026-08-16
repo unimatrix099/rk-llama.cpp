@@ -65,4 +65,28 @@ void hadamard_transform(float* dst, const float* src, int K, int padded_size);
  */
 int next_power_of_two(int n);
 
+/**
+ * @brief The K the Hadamard pipelines operate at for a weight row of K elements.
+ *
+ * Block-diagonal mode (default): K itself — the FWHT is applied per
+ * power-of-two block (see hadamard_block_len), so no zero-padding is stored,
+ * uploaded, or read back. Legacy mode (RKNPU_HADAMARD_BLOCK=0): the next
+ * power of two, zero-padding the row for one full-length transform — on
+ * non-power-of-two models (Gemma-4 E4B: K=2560/10240/10752) that inflates
+ * every weight read by ~1.5-1.6x. The mode is read once from the
+ * environment; it must not change at runtime (packed buffers and matmul
+ * contexts depend on it).
+ */
+int hadamard_k_op(int K);
+
+/**
+ * @brief The FWHT block length used for rows of K elements.
+ *
+ * Block-diagonal mode: the largest power of two dividing K (K & -K) — for
+ * power-of-two K this is K, making the transform identical to the legacy
+ * full-length one. Also the dequantization divisor: H*H^T = B*I per block.
+ * Legacy mode: next_power_of_two(K).
+ */
+int hadamard_block_len(int K);
+
 } // namespace rknpu2_calibration
