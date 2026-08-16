@@ -650,9 +650,12 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         const auto* pipeline = config.resolve_op_support(src0);
         if (!pipeline) continue;
 
-        // Initializing Hadamard Transform Logic
+        // Initializing Hadamard Transform Logic. Block-diagonal FWHT keeps
+        // K_op == K (no zero-padding: on non-power-of-two models the legacy
+        // padding inflated every NPU weight read ~1.5-1.6x — see
+        // RKNPU2-decode-research.md #3 re-profile).
         const bool is_hadamard = (pipeline->use_hadamard);
-        const int K_op = is_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
+        const int K_op = is_hadamard ? rknpu2_calibration::hadamard_k_op(K) : K;
 
         const rknn_matmul_type matmul_type = pipeline->mm_type;
         const int alignment = pipeline->n_align;
@@ -891,7 +894,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     RKNN_CHECK(rknn_mem_sync(matmul_ctxs[idx]->ctx, mem_C_segments[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
                 }
 
-                const float hadamard_divisor = pipeline->use_hadamard ? (float)K_op : 1.0f;
+                // H*H^T = block_len * I per FWHT block (legacy: block = K_op)
+                const float hadamard_divisor = pipeline->use_hadamard ? (float)rknpu2_calibration::hadamard_block_len(K) : 1.0f;
 
                 // Native C layout: each segment's C comes back as
                 // [N_seg/sub, M, sub] cells and is untiled inside the
@@ -993,7 +997,7 @@ static size_t get_tensor_packed_size(const struct ggml_tensor * tensor) {
         const int K = (int)tensor->ne[0];
         const int N = (int)tensor->ne[1];
 
-        const int K_op = pipeline->use_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
+        const int K_op = pipeline->use_hadamard ? rknpu2_calibration::hadamard_k_op(K) : K;
 
         int k_limit = config.max_k_limit;
         if (pipeline->effective_k > 0) {
@@ -1254,7 +1258,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     if (pipeline) {
         const int K = (int)tensor->ne[0];
         const int N = (int)tensor->ne[1];
-        const int K_op = pipeline->use_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
+        const int K_op = pipeline->use_hadamard ? rknpu2_calibration::hadamard_k_op(K) : K;
 
         // Initializing Hadamard Transform Logic
         if (pipeline->use_hadamard) {

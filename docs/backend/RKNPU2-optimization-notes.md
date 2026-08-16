@@ -138,6 +138,23 @@ tg 5.50. The backend code fix below made `OMP_NUM_THREADS=4` unnecessary
 for the recommended routed config; it remains an optional micro-tune for
 NPU-decode-only setups.
 
+## ✅ Shipped: block-diagonal Hadamard (W4A4 K-padding removed)
+
+**Hypothesis (decode research #3b):** the Hadamard pipelines' pad-K-to-
+next-pow2 inflates every W4A4 weight read and allocation ~1.5-1.6x on
+non-power-of-two models (E4B: K=2560→4096, 10240→16384; GGUF census:
+5.22 GB read/token vs 3.38 nominal).
+
+**Result (2026-08-16):** FWHT applied per largest-pow2-divisor block
+(2560→5x512, 10240→5x2048), K_op = K, divisor = block; legacy behavior
+verified bit-identical behind `RKNPU_HADAMARD_BLOCK=0`. E4B W4A4:
+tg 4.31→**5.51** (equals the routed path as a pure-NPU mode), pp
+34.4→**38.0**, NPU model buffer 3569→**2521 MiB (−29%)**. Measured
+quality cost on the already-degraded capacity mode: wikitext PPL
+198→229 (W8A8 reference: 37.8); a min-block-1024 middle variant was
+measured strictly worse (PPL 280, tg 5.13) and rejected. 203 kernel
+checks. Cumulative W4A4 prefill since the start: 7.7 → 38.0 t/s (4.9x).
+
 ## ✅ Shipped: churn-free M=1 path in the backend (dispatch pool + if(M>1))
 
 **Hypothesis (decode research #3):** the per-node OMP team respawn can be
@@ -255,5 +272,5 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | Speculative decoding (draft, ngram, NPU-verify) | ❌ all variants lose | decode research #1 tables |
 | Backend overhead surgery (OMP churn) | ✅ shipped | dispatch pool + if(M>1): decode clone3 = 0, NPU tg +28%, W4A4 tg +18%, env-free (decode research #3) |
 | QKV fusion | ❌ bounded out | re-profile: can only attack ~5 ms/token of driver misc (decode research #3 re-profile) |
-| W4A4 M=1 CPU-phase gap (~60 ms/token vs W8A8) | ⏭ next investigation | closing it ≈ 5.8 t/s W4A4 decode, above routed, at half the memory |
+| W4A4 K-padding (block-diagonal FWHT) | ✅ shipped | tg 4.31→5.51, pp 34.4→38.0, NPU mem −29%; PPL 198→229 (capacity mode; `RKNPU_HADAMARD_BLOCK=0` restores) — decode research #3b |
 | Calib cache | ⏸ load-time QoL | unchanged |

@@ -255,6 +255,55 @@ bf16, 1.6% f16). No software waste left; purely bandwidth-bound.
 Cheap bs>1 verification reviving ngram speculation for servers remains
 open (see #1).
 
+### 3b. The W4A4 K-padding find — MEASURED AND FIXED (2026-08-16)
+
+Follow-up to the #3 re-profile's "W4A4 has ~60 ms/token more CPU work"
+hypothesis — which turned out to be wrong in an interesting way. The
+driver shim on W4A4 decode (4.17 t/s = 240 ms/token) showed the CPU
+phase is the SAME as W8A8 (~97 ms); the real problem was on the NPU
+side: run wall 137 ms where halved bytes predicted ~80.
+
+Root cause: the Hadamard pipelines padded K to the next power of two
+(one full-length FWHT needs pow2). Gemma-4 E4B's dims are NOT powers of
+two, and a GGUF census (`rknpu2-gguf-census.py`, headers only) showed the
+damage: **216 tensors at K=2560 -> 4096 and the FFN downs at
+10240 -> 16384, both 1.60x; in total 5.22 GB stored/read per token
+instead of the nominal 3.38 GB (1.54x)**. The padding silently ate most
+of INT4's byte advantage — in memory as well as bandwidth.
+
+Fix: **block-diagonal FWHT** (QuaRot-style). Block = largest power of
+two dividing K (`K & -K`: 2560 -> 512, 10240 -> 2048, 10752 -> 512;
+power-of-two K keeps block = K, bit-identical). K_op == K everywhere: no
+padding stored, uploaded, read, or transformed. Dequant divisor becomes
+the block length (H*H^T = B*I per block). Blocks need not align with
+K-segments — segments only split the summation. `RKNPU_HADAMARD_BLOCK`
+selects the mode: 1 = pure block-diagonal (default), 0 = legacy padded
+(bit-identical to the pre-change build, verified by greedy diff), pow2 n
+= minimum block with padding to a block multiple (measured, rejected).
+
+Measured (E4B Q4_0, default W4A4_HADAMARD, t=4, wikitext-2 8 chunks;
+W8A8 reference PPL 37.78 — W4A4 is a capacity mode, heavily degraded in
+every variant):
+
+| W4A4 mode | PPL | tg64 | pp128 | NPU buffer |
+|---|---|---|---|---|
+| legacy (pad to next pow2) | 198.4 | 4.17-4.31 | 33.4-34.4 | 3569 MiB |
+| **pure block-diagonal (new default)** | 228.9 (+15%) | **5.51** (+28%) | **37.98** (+11%) | **2521 MiB (-29%)** |
+| min-block 1024 (pad to block multiple) | 280.4 | 5.13 | 37.39 | 2765 MiB |
+
+- **W4A4 decode now equals the routed path (5.51 vs 5.50) as a pure-NPU
+  mode at -29% NPU memory**, with the CPU left mostly free — exactly
+  what the capacity mode is for. Prefill 7.7 -> 38.0 cumulative (4.9x).
+- The quality ordering is instructive: full-row padded (198) beats pure
+  512-blocks (229) beats mixed half-empty 1024-blocks (280). Spreading
+  outliers over MORE lanes helps; a block that is half zero-padding
+  hurts worse than a smaller full block — so the intermediate mode is
+  dominated and kept only for experiments.
+- Quality-sensitive W4A4 users set `RKNPU_HADAMARD_BLOCK=0` (legacy
+  speed/memory, old numerics). 203 prep-kernel checks green (blocked
+  exactness vs per-block scalar reference, involution, helper
+  semantics, both-mode degenerate cases).
+
 ### 4. Read fewer bytes
 
 - **Hybrid per-layer patterns** (`RKNPU_HYBRID="W8A8_STANDARD,W4A4_HADAMARD"`):

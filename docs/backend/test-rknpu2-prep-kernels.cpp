@@ -252,10 +252,10 @@ static void test_existing_conversions(void) {
 }
 
 static void test_hadamard(void) {
-    // K == padded (pure pow2 FWHT) and K < padded (zero-fill path)
+    // cases where the default (pure block-diagonal) mode degenerates to
+    // one full-length FWHT: power-of-two K
     struct { int K, padded; } cases[] = {
         {4, 4}, {8, 8}, {32, 32}, {2048, 2048},
-        {3, 4}, {1536, 2048}, {2560, 4096},
         {1, 1}, {2, 2},                          // scalar fallback path
     };
     for (auto& c : cases) {
@@ -274,6 +274,50 @@ static void test_hadamard(void) {
     }
 }
 
+static void test_hadamard_blocked(void) {
+    // Default mode (RKNPU_HADAMARD_BLOCK unset = pure block-diagonal):
+    // block = largest pow2 divisor of K, K_op == K, no padding. E4B dims:
+    // 2560 -> 512-blocks, 10240 -> 2048-blocks, 10752 -> 512-blocks.
+    // Element-exact vs a per-block scalar reference.
+    struct { int K, block, k_op; } cases[] = {
+        {2560, 512, 2560}, {10240, 2048, 10240}, {10752, 512, 10752},
+        {1536, 512, 1536}, {256, 256, 256}, {96, 32, 96},
+        {12, 4, 12}, {5, 1, 5}, {2048, 2048, 2048},
+    };
+    for (auto& c : cases) {
+        CHECK(rknpu2_calibration::hadamard_block_len(c.K) == c.block,
+              "block_len K=%d", c.K);
+        CHECK(rknpu2_calibration::hadamard_k_op(c.K) == c.k_op, "k_op K=%d", c.K);
+
+        std::vector<float> src(c.K);
+        for (auto& v : src) v = frand();
+
+        std::vector<float> ref(c.k_op, 0.0f);
+        memcpy(ref.data(), src.data(), c.K * sizeof(float));
+        for (int off = 0; off < c.k_op; off += c.block) {
+            ref_fwht(ref.data() + off, c.block);
+        }
+        std::vector<float> out(c.k_op, -777.0f);
+        rknpu2_calibration::hadamard_transform(out.data(), src.data(), c.K, c.k_op);
+        CHECK(memcmp(ref.data(), out.data(), c.k_op * 4) == 0,
+              "blocked hadamard K=%d block=%d", c.K, c.block);
+
+        // semantic sanity: H(H(x)) = block * x per block (float-tolerant:
+        // the two passes reassociate the sums). Only valid when the padded
+        // length keeps the same block (K=1536 pads to 2048 whose block is
+        // 2048, so a second transform would use a different H).
+        if (rknpu2_calibration::hadamard_block_len(c.k_op) == c.block) {
+            std::vector<float> twice(c.k_op, -777.0f);
+            rknpu2_calibration::hadamard_transform(twice.data(), out.data(), c.k_op, c.k_op);
+            bool ok = true;
+            for (int i = 0; i < c.K; ++i) {
+                ok &= std::fabs(twice[i] - src[i] * (float)c.block) <= 1e-3f * c.block;
+            }
+            CHECK(ok, "involution K=%d block=%d", c.K, c.block);
+        }
+    }
+}
+
 int main(void) {
     test_quantize_int8();
     test_quantize_int4();
@@ -283,6 +327,7 @@ int main(void) {
     test_dequant_acc_tiled();
     test_existing_conversions();
     test_hadamard();
+    test_hadamard_blocked();
     CHECK(rknpu2_calibration::next_power_of_two(0) == 1, "npot 0");
     CHECK(rknpu2_calibration::next_power_of_two(1) == 1, "npot 1");
     CHECK(rknpu2_calibration::next_power_of_two(3) == 4, "npot 3");
