@@ -82,6 +82,25 @@ void dequant_acc_int16_tiled(float * dst, const int16_t * src_native,
                              int32_t m, int32_t m_stride, int32_t outer, int32_t sub,
                              int32_t n_limit, float scale);
 
+/**
+ * @brief Per-output-channel variant of dequant_acc_int16_to_fp32:
+ * dst[i] += src[i] * (chan_scales[i] * common). Used by the INT4 pipeline's
+ * per-channel weight scales (decode research #3b follow-up): the channel
+ * scale factors out of the K summation, so applying it here upgrades the
+ * weight-scale granularity from one-per-segment to one-per-output-channel
+ * at zero NPU cost.
+ */
+void dequant_acc_int16_to_fp32_perchan(float * dst, const int16_t * src, size_t n_elements,
+                                       float common, const float * chan_scales);
+
+/**
+ * @brief Per-output-channel variant of dequant_acc_int16_tiled.
+ * chan_scales is indexed by the segment-local output channel (t*sub + j).
+ */
+void dequant_acc_int16_tiled_perchan(float * dst, const int16_t * src_native,
+                                     int32_t m, int32_t m_stride, int32_t outer, int32_t sub,
+                                     int32_t n_limit, float common, const float * chan_scales);
+
 // --- Dequantization to FP32 ---
 
 /**

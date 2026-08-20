@@ -89,4 +89,17 @@ int hadamard_k_op(int K);
  */
 int hadamard_block_len(int K);
 
+/**
+ * @brief Whether INT4 weights get one scale per output channel (default)
+ * instead of one per matmul segment.
+ *
+ * The channel scale factors out of the hardware's K summation and is
+ * applied in the existing C dequant pass, so the finer granularity costs
+ * no NPU work. Per-channel scales use a plain amax (no entropy search —
+ * also removes the minutes-long W4A4 calibration at load). Legacy
+ * per-segment entropy scales behind RKNPU_PER_CHANNEL=0. Read once; the
+ * packed weights and scale-grid layout depend on it.
+ */
+bool per_channel_b_scales();
+
 } // namespace rknpu2_calibration
