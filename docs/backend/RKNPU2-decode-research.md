@@ -282,8 +282,12 @@ selects the mode: 1 = pure block-diagonal (default), 0 = legacy padded
 = minimum block with padding to a block multiple (measured, rejected).
 
 Measured (E4B Q4_0, default W4A4_HADAMARD, t=4, wikitext-2 8 chunks;
-W8A8 reference PPL 37.78 — W4A4 is a capacity mode, heavily degraded in
-every variant):
+references on the same chunks: **W8A8 NPU 37.78, pure CPU 37.66** — the
+Q4_0 file itself is essentially lossless through llama.cpp's native
+Q4_0xQ8_0 path with per-32 scales; the W4A4 degradation below is the
+price of the NPU's INT4xINT4 scheme — 4-bit activations plus one weight
+scale per segment — not of the 4-bit file and not of this backend's
+code):
 
 | W4A4 mode | PPL | tg64 | pp128 | NPU buffer |
 |---|---|---|---|---|
