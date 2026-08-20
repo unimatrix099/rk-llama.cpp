@@ -142,6 +142,41 @@ void dequant_acc_int16_tiled(float * dst, const int16_t * src_native,
     }
 }
 
+void dequant_acc_int16_to_fp32_perchan(float * dst, const int16_t * src, size_t n_elements,
+                                       float common, const float * chan_scales) {
+    size_t i = 0;
+#ifdef __ARM_NEON
+    const float32x4_t vc = vdupq_n_f32(common);
+    for (; i + 8 <= n_elements; i += 8) {
+        int16x8_t s16 = vld1q_s16(src + i);
+        float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16)));
+        float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16)));
+        float32x4_t sc0 = vmulq_f32(vld1q_f32(chan_scales + i),     vc);
+        float32x4_t sc1 = vmulq_f32(vld1q_f32(chan_scales + i + 4), vc);
+        vst1q_f32(dst + i,     vfmaq_f32(vld1q_f32(dst + i),     f0, sc0));
+        vst1q_f32(dst + i + 4, vfmaq_f32(vld1q_f32(dst + i + 4), f1, sc1));
+    }
+#endif
+    for (; i < n_elements; ++i) {
+        // mul-then-fma, matching the vector body exactly
+        dst[i] = fmaf((float)src[i], chan_scales[i] * common, dst[i]);
+    }
+}
+
+void dequant_acc_int16_tiled_perchan(float * dst, const int16_t * src_native,
+                                     int32_t m, int32_t m_stride, int32_t outer, int32_t sub,
+                                     int32_t n_limit, float common, const float * chan_scales) {
+    for (int32_t t = 0; t < outer; ++t) {
+        const int16_t * cell = src_native + ((size_t)t * m_stride + m) * sub;
+        const int32_t n0 = t * sub;
+        const int32_t lim = std::min(sub, n_limit - n0);
+        if (lim <= 0) {
+            break;
+        }
+        dequant_acc_int16_to_fp32_perchan(dst + n0, cell, (size_t)lim, common, chan_scales + n0);
+    }
+}
+
 // --- Dequantization to FP32 ---
 
 void dequantize_int16_to_fp32(const int16_t * src, float * dst, size_t n_elements, float scale) {

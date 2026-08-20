@@ -290,6 +290,14 @@ int hadamard_k_op(int K) {
     return ((K + block - 1) / block) * block;   // next multiple of block
 }
 
+bool per_channel_b_scales() {
+    static const bool per_channel = []() {
+        const char* env = std::getenv("RKNPU_PER_CHANNEL");
+        return !(env != nullptr && std::atoi(env) == 0);
+    }();
+    return per_channel;
+}
+
 void hadamard_transform(float* dst, const float* src, int K, int padded_size) {
     // padded_size is hadamard_k_op(K): a multiple of the block length,
     // which is a power of two. Legacy mode degenerates to one full-length

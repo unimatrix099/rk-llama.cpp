@@ -222,6 +222,55 @@ static void test_dequant_acc_tiled(void) {
     }
 }
 
+// per-output-channel variants (INT4 per-channel weight scales)
+static void test_dequant_acc_perchan(void) {
+    const float common = 0.0173f;
+    for (size_t si = 0; si < N_SIZES; ++si) {
+        size_t n = SIZES[si];
+        std::vector<int16_t> src(n);
+        for (auto& v : src) v = (int16_t)(prng() % 4001 - 2000);
+        std::vector<float> chan(n);
+        for (auto& v : chan) v = 0.001f + std::fabs(frand());
+        std::vector<float> a(n), b(n);
+        for (size_t i = 0; i < n; ++i) a[i] = b[i] = frand();
+        for (size_t i = 0; i < n; ++i) {
+            a[i] = fmaf((float)src[i], chan[i] * common, a[i]);   // mul-then-fma, as impl
+        }
+        rknpu2_quantization::dequant_acc_int16_to_fp32_perchan(b.data(), src.data(), n, common, chan.data());
+        CHECK(memcmp(a.data(), b.data(), n * 4) == 0, "dq16acc-pc n=%zu", n);
+    }
+}
+
+static void test_dequant_acc_tiled_perchan(void) {
+    const float common = 0.0173f;
+    struct { int outer, m_stride, sub, n_limit; } cases[] = {
+        {8, 4, 8, 64}, {256, 32, 8, 2048}, {3, 1, 8, 20},
+        {1, 5, 8, 8},
+    };
+    for (auto& c : cases) {
+        size_t total = (size_t)c.outer * c.m_stride * c.sub;
+        std::vector<int16_t> native(total);
+        for (auto& v : native) v = (int16_t)(prng() % 4001 - 2000);
+        std::vector<float> chan(c.n_limit);
+        for (auto& v : chan) v = 0.001f + std::fabs(frand());
+        for (int m = 0; m < c.m_stride; ++m) {
+            std::vector<float> a(c.n_limit), b(c.n_limit);
+            for (int i = 0; i < c.n_limit; ++i) a[i] = b[i] = frand();
+            for (int t = 0; t < c.outer; ++t) {
+                const int16_t* cell = native.data() + ((size_t)t * c.m_stride + m) * c.sub;
+                for (int j = 0; j < c.sub && t * c.sub + j < c.n_limit; ++j) {
+                    int nn = t * c.sub + j;
+                    a[nn] = fmaf((float)cell[j], chan[nn] * common, a[nn]);
+                }
+            }
+            rknpu2_quantization::dequant_acc_int16_tiled_perchan(
+                b.data(), native.data(), m, c.m_stride, c.outer, c.sub, c.n_limit, common, chan.data());
+            CHECK(memcmp(a.data(), b.data(), (size_t)c.n_limit * 4) == 0,
+                  "dq16tiled-pc outer=%d ms=%d m=%d", c.outer, c.m_stride, m);
+        }
+    }
+}
+
 // existing conversion/dequant functions: regression-guard them too
 static void test_existing_conversions(void) {
     for (size_t si = 0; si < N_SIZES; ++si) {
@@ -325,6 +374,8 @@ int main(void) {
     test_mul();
     test_dequant_acc_int16();
     test_dequant_acc_tiled();
+    test_dequant_acc_perchan();
+    test_dequant_acc_tiled_perchan();
     test_existing_conversions();
     test_hadamard();
     test_hadamard_blocked();

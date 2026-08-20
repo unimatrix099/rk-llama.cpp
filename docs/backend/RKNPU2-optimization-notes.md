@@ -138,6 +138,22 @@ tg 5.50. The backend code fix below made `OMP_NUM_THREADS=4` unnecessary
 for the recommended routed config; it remains an optional micro-tune for
 NPU-decode-only setups.
 
+## ✅ Shipped: per-output-channel W4A4 weight scales (the quality fix)
+
+**Hypothesis (decode research #3c):** most of W4A4's quality tier is the
+one-scale-per-segment weight quantization, not the 4-bit activations —
+and the channel dimension factors out of the hardware K-sum, so
+per-channel scales are free in the existing C dequant pass.
+
+**Result (2026-08-20):** wikitext PPL **228.9 -> 45.35 (5x)** at
+unchanged speed (tg 5.54 / pp 36.9) and -29% NPU memory; W4A4 now costs
+~20% PPL over W8A8 (37.8) instead of ~5x. Per-channel amax replaces the
+segment entropy search, cutting W4A4 load from minutes to seconds. With
+honest scales, blocked-FWHT also beats padded on quality (45.4 vs 49.1)
+— the #3b trade-off is gone. W8A8 untouched (bit-identical); full-legacy
+env combo reproduces the original build exactly; 254 kernel checks.
+Opt-out: `RKNPU_PER_CHANNEL=0`.
+
 ## ✅ Shipped: block-diagonal Hadamard (W4A4 K-padding removed)
 
 **Hypothesis (decode research #3b):** the Hadamard pipelines' pad-K-to-
@@ -272,5 +288,6 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | Speculative decoding (draft, ngram, NPU-verify) | ❌ all variants lose | decode research #1 tables |
 | Backend overhead surgery (OMP churn) | ✅ shipped | dispatch pool + if(M>1): decode clone3 = 0, NPU tg +28%, W4A4 tg +18%, env-free (decode research #3) |
 | QKV fusion | ❌ bounded out | re-profile: can only attack ~5 ms/token of driver misc (decode research #3 re-profile) |
-| W4A4 K-padding (block-diagonal FWHT) | ✅ shipped | tg 4.31→5.51, pp 34.4→38.0, NPU mem −29%; PPL 198→229 (capacity mode; `RKNPU_HADAMARD_BLOCK=0` restores) — decode research #3b |
+| W4A4 K-padding (block-diagonal FWHT) | ✅ shipped | tg 4.31→5.51, pp 34.4→38.0, NPU mem −29% — decode research #3b |
+| W4A4 per-channel weight scales | ✅ shipped | PPL 228.9→45.35 (5x, W8A8=37.8) at equal speed; load minutes→seconds — decode research #3c |
 | Calib cache | ⏸ load-time QoL | unchanged |

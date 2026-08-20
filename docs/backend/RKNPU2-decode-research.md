@@ -303,10 +303,49 @@ code):
   outliers over MORE lanes helps; a block that is half zero-padding
   hurts worse than a smaller full block — so the intermediate mode is
   dominated and kept only for experiments.
-- Quality-sensitive W4A4 users set `RKNPU_HADAMARD_BLOCK=0` (legacy
-  speed/memory, old numerics). 203 prep-kernel checks green (blocked
-  exactness vs per-block scalar reference, involution, helper
-  semantics, both-mode degenerate cases).
+- ~~Quality-sensitive W4A4 users set `RKNPU_HADAMARD_BLOCK=0`~~
+  Superseded by #3c: with per-channel weight scales the blocked
+  transform wins on quality too (45.4 vs 49.1) — there is no trade-off
+  left and no reason to use the legacy mode except as a regression
+  anchor.
+
+### 3c. Per-output-channel weight scales — the W4A4 quality fix (2026-08-20)
+
+The PPL post-mortem of #3b blamed the W4A4 quality tier on two suspects:
+4-bit activations and the coarse per-segment weight scales. Measured
+verdict: **it was mostly the scales.** The channel dimension factors out
+of the hardware's K summation, so a per-output-channel scale can be
+applied in the existing C dequant pass — finer granularity at zero NPU
+cost. INT4 weights now get one amax scale per output channel per
+k-segment (grid `[k_idx * N + n]`, applied via `*_perchan` dequant
+helpers); the segment-wide entropy search is gone, which also cuts the
+W4A4 calibration load from minutes to seconds. W8A8 is untouched
+(already at CPU parity). Legacy: `RKNPU_PER_CHANNEL=0`.
+
+E4B Q4_0, same 8 wikitext chunks:
+
+| W4A4 config | PPL | tg64 | pp128 |
+|---|---|---|---|
+| segment scales + padded FWHT (original) | 198.4 | 4.17-4.31 | 33.4-34.4 |
+| segment scales + blocked FWHT | 228.9 | 5.51 | 37.98 |
+| **per-channel + blocked (new default)** | **45.35** | **5.54** | 36.87 |
+| per-channel + padded (`RKNPU_HADAMARD_BLOCK=0`) | 49.09 | — | — |
+| W8A8 / pure CPU reference | 37.78 / 37.66 | — | — |
+
+- **W4A4 PPL 228.9 -> 45.35 (5x)** at unchanged speed: the capacity mode
+  now costs ~20% PPL over the 8-bit tier instead of ~5x, at -29% NPU
+  memory and NPU-decode speed equal to the routed path.
+- With honest weight scales, blocked-FWHT also beats padded on quality
+  (45.4 vs 49.1): the padded transform's "advantage" in #3b was partly
+  compensating the segment scale with more outlier smearing.
+- Bit-identity anchors held: W8A8 unchanged; `RKNPU_HADAMARD_BLOCK=0
+  RKNPU_PER_CHANNEL=0` reproduces the original build's greedy output
+  exactly. 254 prep-kernel checks (perchan dequant flat + tiled vs
+  fused scalar references).
+- Remaining gap to 37.8 = the true cost of 4-bit activations at
+  per-row scales (+ residual weight coarseness along K). Next candidates
+  if it ever matters: finer K-segmentation (speed trade), MSE-clipped
+  A-scales.
 
 ### 4. Read fewer bytes
 
