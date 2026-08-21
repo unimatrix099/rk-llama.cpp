@@ -347,6 +347,32 @@ E4B Q4_0, same 8 wikitext chunks:
   if it ever matters: finer K-segmentation (speed trade), MSE-clipped
   A-scales.
 
+**Hardened validation (2026-08-21, 32 chunks = 4x the sample; absolute
+values shift with the larger text window, compare within the column):**
+
+| Config | PPL (32 chunks) |
+|---|---|
+| E4B pure CPU | 27.01 ± 1.13 |
+| E4B W8A8 | 27.29 ± 1.14 |
+| E4B W4A4 (per-channel + blocked) | **34.36 ± 1.37** (+27% vs CPU) |
+| Qwen2.5-1.5B pure CPU | 8.88 ± 0.26 |
+| Qwen W8A8 | 12.24 ± 0.37 (**+38% vs CPU** — see below) |
+| Qwen forced W4A4 (per-channel + blocked) | 26.87 ± 0.92 |
+| Qwen forced W4A4 (legacy scales + pad) | 44.31 ± 1.50 |
+
+- The per-channel fix generalizes: Qwen W4A4 44.3 -> 26.9 (1.65x).
+  W4A4's relative cost is model-dependent (E4B +27%, Qwen ~3x vs CPU).
+- **New finding: W8A8's per-segment scales are NOT free on every model.**
+  E4B W8A8 == CPU, but Qwen W8A8 is +38% over CPU. Extending
+  per-channel scales to INT8 is now a data-justified follow-up (the C
+  INT32 dequant pass is elementwise over n, so the same zero-NPU-cost
+  argument applies; it would change W8A8 numerics, moving the
+  bit-identity anchor — do it deliberately).
+- Chat smoke test (E4B W4A4, chat template): coherent, well-structured
+  output. Note E4B is a reasoning model — completions land in
+  `reasoning_content` first; short max_tokens can leave `content` empty
+  (finish_reason=length), which is model behavior, not a backend bug.
+
 ### 4. Read fewer bytes
 
 - **Hybrid per-layer patterns** (`RKNPU_HYBRID="W8A8_STANDARD,W4A4_HADAMARD"`):

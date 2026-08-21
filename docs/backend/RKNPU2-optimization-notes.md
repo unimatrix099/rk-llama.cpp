@@ -289,5 +289,6 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | Backend overhead surgery (OMP churn) | ✅ shipped | dispatch pool + if(M>1): decode clone3 = 0, NPU tg +28%, W4A4 tg +18%, env-free (decode research #3) |
 | QKV fusion | ❌ bounded out | re-profile: can only attack ~5 ms/token of driver misc (decode research #3 re-profile) |
 | W4A4 K-padding (block-diagonal FWHT) | ✅ shipped | tg 4.31→5.51, pp 34.4→38.0, NPU mem −29% — decode research #3b |
-| W4A4 per-channel weight scales | ✅ shipped | PPL 228.9→45.35 (5x, W8A8=37.8) at equal speed; load minutes→seconds — decode research #3c |
+| W4A4 per-channel weight scales | ✅ shipped | PPL 228.9→45.35 (5x, W8A8=37.8) at equal speed; load minutes→seconds; confirmed at 32 chunks + on Qwen — decode research #3c |
+| W8A8 per-channel scales (INT8) | ⏭ data-justified | Qwen W8A8 is +38% PPL vs CPU (E4B is not); same zero-NPU-cost mechanism — decode research #3c |
 | Calib cache | ⏸ load-time QoL | unchanged |
