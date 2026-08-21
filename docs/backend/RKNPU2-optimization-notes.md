@@ -35,11 +35,14 @@ Google's edge stack, not llama.cpp; see investigation doc)
 | NPU `W4A4_HADAMARD` (default for Q4_0) | 7.7 | 3.4 |
 | NPU `W4A4_STANDARD` (control, broken accuracy) | 10.8 | n/a |
 | NPU + `RKNPU_CPU_DECODE=32` (shipped) | 41.3 | 4.9 |
-| **Current best (2026-08-11): W8A8 + `CPU_DECODE=32`, `taskset -c 4-7 -t 4`, churn-free backend** | **42.5** | **5.5** |
+| **Current best, quality (2026-08-21): W8A8 + `CPU_DECODE=32`, pinned t=4** | **42.5** | **5.5** |
+| **Current best, memory (2026-08-21): default W4A4 (block-FWHT + per-channel scales)** | **36.9** | **5.54** |
 
 (The default-threading rows above predate the threading guidance and the
 churn fix; they remain as the historical baseline each entry below built
-on. Cumulative: pp 39.8→42.5, tg 3.3→5.5 at identical accuracy.)
+on. Cumulative: routed pp 39.8→42.5 / tg 3.3→5.5 at identical accuracy;
+W4A4 pp 7.7→36.9 / tg 3.4→5.54 with PPL going from ~5x-over-CPU to +27%
+and NPU memory −29%.)
 
 ### Others
 
@@ -186,14 +189,23 @@ green. Known trade-offs: W4A4 prefill -3%, and pure NPU decode stays
 hot-team dispatch — see decode research #3 for the structural fix if it
 ever matters). Spin-harder/pre-wake variants measured and rejected.
 
-## ✅ Shipped as guidance: pipeline pairing
+## ✅ Shipped as guidance: pipeline pairing (rewritten 2026-08-21)
 
-For throughput on RK3588, `W8A8_STANDARD` is the strongest NPU pipeline for
-every model tested — including Q4_0 GGUFs, where the default W4A4 mapping is
-5x slower at prefill. W4A4 is a capacity mode (halves NPU memory, fits
-larger models under the 4 GB/domain limit), not a speed mode. Prefer Q8_0
-GGUFs where possible (correct precision pairing); for Q4_0 files force
-`RKNPU_HYBRID=W8A8_STANDARD` when speed matters.
+The original guidance ("W4A4 is 5x slower at prefill, capacity-only")
+predates the native-layout, NEON-prep, dispatch-pool, block-FWHT and
+per-channel-scale work. Current state on E4B Q4_0:
+
+| Pipeline choice | pp128 | tg64 | quality (PPL tier) | NPU memory |
+|---|---|---|---|---|
+| routed: `RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32` | 42.5 | 5.50 | reference (decode CPU-exact) | high (dual residency) |
+| default W4A4 (no env) | 36.9 | 5.54 | +27% vs CPU tier | **2.5 GB (−29%)**, CPU mostly free |
+| `RKNPU_HYBRID=W8A8_STANDARD` (NPU decode) | 42.5 | 4.55 | reference on E4B; model-dependent (Qwen +38%) | high |
+
+Pick routed for max quality+speed, W4A4 for memory/CPU-headroom at a
+modest quality premium. Prefer Q8_0 GGUFs when the model fits and
+quality is paramount. Caveat: W8A8's per-segment scales are lossless on
+E4B but cost +38% PPL on Qwen — check per model until per-channel INT8
+scales ship (decode research #3c).
 
 ## ❌ Dead end: mixed-precision pipelines (W4A16 / W8A16)
 

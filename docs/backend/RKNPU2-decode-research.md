@@ -1,14 +1,27 @@
 # RKNPU2: improving 4-bit token-generation (decode) speed — research notes
 
-Research thread with **measured verdicts as of 2026-08-11** (board
-sessions: probe + sweeps + perf/strace/gdb profiling; tooling under
-"Experiment tooling" below). Summary: #5 threading is a shipped big win
-(+19–66% tg, no code); #1 speculative and #2 cooperative decode are
-measured dead ends; **#3 found its root cause and shipped the fix** —
-the backend's per-node OMP regions made libgomp respawn its thread team
-~once per graph split; the backend now runs the M=1 path without OMP
-teams (persistent dispatch pool + `if(M>1)`), making the decode paths
-+18–28% faster with no env vars. Companion documents:
+Research thread with **measured verdicts as of 2026-08-21** (five board
+sessions; tooling under "Experiment tooling" below). Where each avenue
+landed:
+
+- **#1 speculative decoding** — dead end, every variant measured.
+- **#2 cooperative CPU+NPU decode** — dead end (probe gate failed), but
+  its measurements re-aimed everything that followed.
+- **#3 backend overhead** — root cause found (libgomp team respawn ~1x
+  per graph split) and fixed in code (persistent dispatch pool +
+  `if(M>1)`): decode +18–28% with no env vars.
+- **#3b W4A4 K-padding** — found (1.5–1.6x inflated reads on
+  non-pow2 models) and fixed (block-diagonal FWHT): W4A4 tg +28%, NPU
+  memory −29%.
+- **#3c W4A4 per-channel weight scales** — the quality fix: PPL 5x
+  better at equal speed, W4A4 load minutes → seconds; confirmed at 32
+  chunks and across models.
+- **#5 threading** — shipped guidance (`-t 4` big cores): +19–66% tg.
+
+Net effect on the flagship (Gemma-4 E4B Q4_0), from the state at the
+start of these sessions to now: routed pp 41.3/tg 4.9 → **42.5/5.50**;
+pure-NPU W4A4 pp 33/tg 4.2/PPL ~198-tier → **pp 36.9/tg 5.54/PPL
++27%-over-CPU at −29% NPU memory**. Companion documents:
 `RKNPU2-optimization-notes.md` (shipped work + dead ends),
 `RKNPU2-int4-research.md` (INT4 fundamentals), `RKNPU2-neon-prep-plan.md`
 (prefill prep). Numbers: Orange Pi 5 Ultra (RK3588, 16 GB), pinned clocks,
@@ -19,10 +32,11 @@ teams (persistent dispatch pool + `if(M>1)`), making the decode paths
 Decode re-reads the active weight set for every generated token, so it is
 memory-bandwidth bound. For Gemma-4-E4B Q4_0 (7.46 B dense):
 
-| Decode path | tg64 t/s | effective read rate |
+| Decode path (current) | tg64 t/s | notes |
 |---|---|---|
-| CPU (`RKNPU_CPU_DECODE=32`, native Q4_0 reads, ~2.4 GB/token) | ~~5.35~~ **5.50** (t=4 + OMP fix; pp 42.62) | ~~13~~ **~25 GB/s at t=4 big-core** (13 was an 8-thread artifact — see #5) |
-| NPU W4A4 native layout (~2.05 GB/token INT4) | 3.65 (W8A8: 4.55 with t=4 + OMP fix) | ~7.5 GB/s aggregate |
+| Routed CPU decode (`RKNPU_CPU_DECODE=32`, native Q4_0 reads) | **5.50** (pp 42.5) | CPU-exact decode quality; ~25 GB/s at t=4 big-core (the old "13 GB/s wall" was an 8-thread artifact — #5) |
+| NPU W4A4 (block-FWHT + per-channel scales, defaults) | **5.54** (pp 36.9) | −29% NPU memory, CPU left free, PPL +27% vs CPU tier (#3b/#3c) |
+| NPU W8A8 | 4.55 | reference-quality on E4B; on Qwen it is +38% PPL vs CPU (per-channel INT8 pending, #3c) |
 
 Two framing "facts" — **both revised by the 2026-08-10 measurements**:
 
@@ -427,7 +441,19 @@ Multiple concurrent streams share each weight read — large aggregate
 gains, zero single-stream latency gain. Relevant only if the workload
 becomes a server.
 
-## Experiment tooling (all run on the board 2026-08-10; reusable)
+## Backend environment variables added by this thread
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RKNPU_HADAMARD_BLOCK` | 1 | 1 = block-diagonal FWHT (no K padding); 0 = legacy pad-to-pow2; pow2 n = min-block experiment mode (measured worse) — #3b |
+| `RKNPU_PER_CHANNEL` | 1 | 1 = per-output-channel INT4 weight scales (amax, fast load); 0 = legacy per-segment entropy scales — #3c |
+| `OMP_NUM_THREADS=4` | unset | no longer required (the #3 code fix); still harmless |
+
+`RKNPU_HADAMARD_BLOCK=0 RKNPU_PER_CHANNEL=0` together reproduce the
+pre-2026-08-16 W4A4 numerics bit-exactly (regression anchor). W8A8 and
+the routed path are unaffected by all of the above.
+
+## Experiment tooling (2026-08-10..21; reusable)
 
 Everything compiles/links on any aarch64 Linux; running needs the board.
 Pin clocks (`scripts/fix_freq_rk3588.sh`) and `ulimit -n 65536` first.
@@ -447,14 +473,24 @@ Pin clocks (`scripts/fix_freq_rk3588.sh`) and `ulimit -n 65536` first.
    Draft GGUFs now in `~/models` on the board.
 3. **`rknpu2-affinity-sweep.sh`** (produced the #5 verdict) — llama-bench
    across thread count x taskset for routed, NPU-only and MoE configs.
-4. **`rknpu2-driver-shim.c`** (produced the #3 re-profile) — LD_PRELOAD
-   shim timing every librknnrt entry point, cumulative counters printed
-   every 5 s; the steady-window slope over the token rate gives ms/token
-   per driver call. `make -f Makefile.rknpu2-tools rknpu2-driver-shim.so`,
-   then `LD_PRELOAD=./rknpu2-driver-shim.so llama-bench ... 2>shim.log`.
+4. **`rknpu2-driver-shim.c`** (produced the #3 re-profile and the #3b
+   wall-time decomposition) — LD_PRELOAD shim timing every librknnrt
+   entry point, cumulative counters printed every 5 s; the steady-window
+   slope over the token rate gives ms/token per driver call.
+   `make -f Makefile.rknpu2-tools rknpu2-driver-shim.so`, then
+   `LD_PRELOAD=./rknpu2-driver-shim.so llama-bench ... 2>shim.log`.
    Also the reference for decode-window timing: take profile windows at a
    fixed offset validated against the shim's run-call slope — utime-based
    "decode detectors" fire during load's quantization burst too.
+5. **`rknpu2-gguf-census.py`** (produced the #3b padding find) — parses
+   GGUF headers only; per-tensor dims/types and the K-padding byte
+   inflation table.
+6. **Quality methodology (#3b/#3c):** wikitext-2 (`~/wikitext-2-raw/` on
+   the board) via `llama-perplexity --chunks 8` for quick gates, 32 for
+   hardened claims; always compare configs on the same chunk count, and
+   read relative gaps, not absolute values (instruct model on raw
+   encyclopedia text inflates absolutes). Greedy bit-identity via
+   llama-server temp-0 completions anchors refactors.
 
 ## Handover notes (continuing on another machine)
 
@@ -462,19 +498,26 @@ Pin clocks (`scripts/fix_freq_rk3588.sh`) and `ulimit -n 65536` first.
   tip branch is `feat/w4a4-neon-prep` (stacked on
   `feat/int4-native-layout` ← `feat/mixed-precision-pipelines` ←
   `fix/w4a4-calibration-crashes` ← upstream `rknpu2` + PR #21). The
-  2026-08-10/11 sessions added three commits on that branch: measured
-  verdicts + tooling, profiling results, and the churn-free backend
-  decode path (`rknpu_dispatch_pool`); the board's `~/rk-llama.cpp` has
-  the same files applied and `libggml-rknpu2.so` rebuilt from them.
+  2026-08-10..21 sessions added the commits from "measured decode
+  verdicts" through "32-chunk validation": tooling, profiling, the
+  churn-free dispatch pool, block-diagonal Hadamard, and per-channel
+  INT4 scales. NOTE: as of 2026-08-21 the stack is committed locally in
+  the dev container and mirrored file-for-file on the board, but NOT yet
+  pushed (no GitHub credentials on either machine) — push before
+  anything else. The board's `libggml-rknpu2.so` is rebuilt from the
+  same sources.
 - The board (Orange Pi 5 Ultra) has the repo at `~/rk-llama.cpp`, models
   in `~/models/` (`gemma-4-E4B-it-Q4_0.gguf`, `gemma-4-E2B-it-Q4_0.gguf`,
   `qwen2.5-1.5b-instruct-q8_0.gguf`, `qwen2.5-0.5b-instruct-q8_0.gguf`,
   `LFM2-8B-A1B-Q8_0.gguf`), binaries in `build/bin/` incl.
   `llama-speculative`. Remember `ulimit -n 65536` and
   `scripts/fix_freq_rk3588.sh` (in `~/rknn-llm/scripts/`) before benching.
-- Raw logs are archived on the board: `~/bench-logs/2026-08-10/` (probe,
-  sweeps, speculative) and `~/bench-logs/2026-08-11/` (perf/strace/gdb
-  profiling, OMP experiments, clean re-verification).
+- Raw logs are archived on the board under `~/bench-logs/<date>/`:
+  2026-08-10 (probe, sweeps, speculative), 2026-08-11 (perf/strace/gdb
+  profiling, OMP experiments), 2026-08-13 (driver-shim re-profile),
+  2026-08-16 (padding census, block-FWHT PPL matrix), 2026-08-20
+  (per-channel validation, CPU PPL reference), 2026-08-21 (32-chunk
+  hardening, chat smoke).
 - Measurement hygiene, learned the hard way: before benching, check for
   stale processes (`pgrep -af llama`) — a stuck llama-cli burned one core
   through part of the 2026-08-10 evening (numbers marked * in #1).
