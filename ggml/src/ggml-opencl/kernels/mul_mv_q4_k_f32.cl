@@ -1,3 +1,5 @@
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+
 #ifdef cl_intel_required_subgroup_size
 #pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
 #define INTEL_GPU 1
@@ -8,6 +10,26 @@
 #define ADRENO_GPU 1
 #define REQD_SUBGROUP_SIZE_64  __attribute__((qcom_reqd_sub_group_size("half")))
 #define REQD_SUBGROUP_SIZE_128 __attribute__((qcom_reqd_sub_group_size("full")))
+#else
+// Arm Mali. Valhall and later execute in 16-wide warps and expose no vendor
+// attribute for a required subgroup size, so the REQD_* macros expand to
+// nothing and the compiler picks the hardware width. The tuning constants
+// guarded by INTEL_GPU are reused because every kernel's Intel path assumes
+// a 16-wide subgroup, which matches Valhall exactly (verified: no kernel
+// sets N_SIMDWIDTH 32 under INTEL_GPU). INTEL_GPU guards tuning constants
+// only - no Intel-specific intrinsics - so this is a width selection, not a
+// vendor claim.
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+#define INTEL_GPU 1
+// Valhall is 16 wide, so BOTH requests are pinned to 16. Leaving the width
+// unpinned is not an option: the kernels assume the subgroup size the host
+// passes for local-memory sizing, and an unpinned compiler choice silently
+// corrupts the reductions (measured: PPL 22.7 -> 107.7). Serving the 32-wide
+// request at 16 is safe because those kernels reduce generically, via
+// sub_group_reduce_add and get_num_sub_groups(), and the host sizes their
+// scratch from the matching subgroup_size = 16.
+#define REQD_SUBGROUP_SIZE_16 __attribute__((reqd_sub_group_size(16)))
+#define REQD_SUBGROUP_SIZE_32 __attribute__((reqd_sub_group_size(16)))
 #endif
 
 //------------------------------------------------------------------------------

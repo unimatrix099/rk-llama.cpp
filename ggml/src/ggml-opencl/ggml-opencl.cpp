@@ -87,6 +87,7 @@ static fastdiv_vals init_fastdiv_values(uint64_t d_64) {
 enum GPU_FAMILY {
     ADRENO,
     INTEL,
+    MALI,
     UNKNOWN,
 };
 
@@ -400,6 +401,12 @@ struct ggml_backend_opencl_context {
     ggml_cl_compiler_version adreno_cl_compiler_version;
 
     int adreno_wave_size;
+
+    // Subgroup width of the device, set once from gpu_family. Several
+    // kernels size local-memory arguments as nth/subgroup_size, so an
+    // incorrect value under-allocates that scratch space and silently
+    // corrupts reductions — it is not merely a tuning parameter.
+    size_t subgroup_size;
 
     cl_bool non_uniform_workgroups;
     size_t  image_max_buffer_size;
@@ -3017,8 +3024,23 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
 
         // Use wave size of 64 for all Adreno GPUs.
         backend_ctx->adreno_wave_size = 64;
+        backend_ctx->subgroup_size    = 64;
     } else if (strstr(dev_ctx->device_name.c_str(), "Intel")) {
-        backend_ctx->gpu_family = GPU_FAMILY::INTEL;
+        backend_ctx->gpu_family    = GPU_FAMILY::INTEL;
+        backend_ctx->subgroup_size = 32;
+    } else if (strstr(dev_ctx->device_name.c_str(), "Mali")) {
+        // Arm Mali. Valhall (G57/G6xx/G7xx) and later execute in 16-wide
+        // warps; Bifrost and older are narrower and are not claimed here.
+        backend_ctx->gpu_family    = GPU_FAMILY::MALI;
+        backend_ctx->subgroup_size = 16;
+        if (!strstr(dev_ctx->device_name.c_str(), "-G5") &&
+            !strstr(dev_ctx->device_name.c_str(), "-G6") &&
+            !strstr(dev_ctx->device_name.c_str(), "-G7")) {
+            GGML_LOG_ERROR("Unsupported Mali GPU (Valhall or newer required): %s\n",
+                dev_ctx->device_name.c_str());
+            backend_ctx->gpu_family = GPU_FAMILY::UNKNOWN;
+            return nullptr;
+        }
     } else {
         GGML_LOG_ERROR("Unsupported GPU: %s\n", dev_ctx->device_name.c_str());
         backend_ctx->gpu_family = GPU_FAMILY::UNKNOWN;
@@ -6426,12 +6448,7 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nb2));
     CL_CHECK(clSetKernelArg(kernel, 18, sizeof(cl_ulong), &nb3));
 
-    int nth0 = 64;
-    if (backend_ctx->gpu_family == INTEL) {
-        nth0 = 32;
-    } else if (backend_ctx->gpu_family == ADRENO) {
-        nth0 = 64;
-    }
+    int nth0 = (int) backend_ctx->subgroup_size;
 
     int max_workgroup_size = backend_ctx->get_kernel_workgroup_size(kernel);
     while (nth0 < nblk0 && nth0 < max_workgroup_size) {
@@ -7745,18 +7762,8 @@ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, c
     // depends on subgroup size.
     // Note, this requires OpenCL 2.1 and above
     // For now we use fixed subgroup size to simplify support for OpenCL 2.0.
-    size_t sgs;
-    //CL_CHECK(clGetKernelSubGroupInfo(kernel, dev_ctx->device,
-    //    CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE,
-    //    sizeof(local_work_size), local_work_size,
-    //    sizeof(size_t), &sgs, NULL));
-    if (backend_ctx->gpu_family == ADRENO) {
-        sgs = 64;
-    } else if (backend_ctx->gpu_family == INTEL) {
-        sgs = 32;
-    } else {
-        GGML_ASSERT(false && "Unsupported GPU");
-    }
+    const size_t sgs = backend_ctx->subgroup_size;
+    GGML_ASSERT(sgs != 0 && "subgroup size not set for this GPU family");
 
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),    &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong),  &offset0));
@@ -7836,14 +7843,8 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
 
     GGML_ASSERT(ne00 % 4 == 0);
 
-    size_t sgs;
-    if (backend_ctx->gpu_family == ADRENO) {
-        sgs = 64;
-    } else if (backend_ctx->gpu_family == INTEL) {
-        sgs = 32;
-    } else {
-        GGML_ASSERT(false && "Unsupported GPU");
-    }
+    const size_t sgs = backend_ctx->subgroup_size;
+    GGML_ASSERT(sgs != 0 && "subgroup size not set for this GPU family");
 
     cl_kernel kernel = backend_ctx->kernel_rms_norm_mul;
 
@@ -7918,10 +7919,8 @@ static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm
     const cl_ulong nb21 = src2->nb[1], nb22 = src2->nb[2], nb23 = src2->nb[3];
     const cl_ulong nbd1 = dst->nb[1], nbd2 = dst->nb[2], nbd3 = dst->nb[3];
 
-    size_t sgs;
-    if (backend_ctx->gpu_family == ADRENO) sgs = 64;
-    else if (backend_ctx->gpu_family == INTEL) sgs = 32;
-    else GGML_ASSERT(false && "Unsupported GPU");
+    const size_t sgs = backend_ctx->subgroup_size;
+    GGML_ASSERT(sgs != 0 && "subgroup size not set for this GPU family");
 
     cl_kernel kernel = backend_ctx->kernel_norm_mul_add;
 
@@ -8048,14 +8047,8 @@ static void ggml_cl_group_norm(ggml_backend_t backend, const ggml_tensor * src0,
 
     cl_kernel kernel = backend_ctx->kernel_group_norm;
 
-    size_t sgs = 64;
-    if (backend_ctx->gpu_family == ADRENO) {
-        sgs = 64;
-    } else if (backend_ctx->gpu_family == INTEL) {
-        sgs = 32;
-    } else {
-        GGML_ASSERT(false && "Unsupported GPU");
-    }
+    const size_t sgs = backend_ctx->subgroup_size;
+    GGML_ASSERT(sgs != 0 && "subgroup size not set for this GPU family");
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
@@ -8093,14 +8086,8 @@ static void ggml_cl_l2_norm(ggml_backend_t backend, const ggml_tensor * src0, co
     GGML_TENSOR_LOCALS(int,      ne0, src0, ne);
     GGML_TENSOR_LOCALS(cl_ulong, nb0, src0, nb);
 
-    size_t sgs;
-    if (backend_ctx->gpu_family == ADRENO) {
-        sgs = 64;
-    } else if (backend_ctx->gpu_family == INTEL) {
-        sgs = 32;
-    } else {
-        GGML_ASSERT(false && "Unsupported GPU");
-    }
+    const size_t sgs = backend_ctx->subgroup_size;
+    GGML_ASSERT(sgs != 0 && "subgroup size not set for this GPU family");
 
     cl_kernel kernel = backend_ctx->kernel_l2_norm_f32;
 
@@ -10995,7 +10982,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 GGML_ASSERT(ne11 == ne1);
                 GGML_ASSERT(ne01 == ne0);
 
-                if (backend_ctx->gpu_family == INTEL) {
+                if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                     nth0 = 16;
                     nth1 = 1;
 
@@ -11034,7 +11021,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             size_t global_work_size[] = {(size_t)(ne01 + 7)/8*nth0, (size_t)ne11*nth1, (size_t)ne12*ne13};
             size_t local_work_size[] = {(size_t)nth0, (size_t)nth1, 1};
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 // Set global size for Intel. It uses 16x output values.
                 global_work_size[0] = (size_t)(ne01 + 15)/16*nth0;
                 global_work_size[1] = (size_t)ne11*nth1;
@@ -11057,7 +11044,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             kernel = backend_ctx->kernel_mul_mat_f32_f32;
             nrows = 4;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 nth0 = 32;
                 nth1 = 1;
             } else if (backend_ctx->gpu_family == ADRENO) {
@@ -11094,7 +11081,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             break;
         case GGML_TYPE_F16:
             //GGML_ASSERT(ne02 == ne12);
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 nth0 = 32;
                 nth1 = 1;
             } else if (backend_ctx->gpu_family == ADRENO) {
@@ -11150,7 +11137,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             GGML_ASSERT(ne01 == ne0);
 
 #ifdef GGML_OPENCL_SOA_Q
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 nth0 = 16;
                 nth1 = 1;
 
@@ -11182,7 +11169,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
 #else // GGML_OPENCL_SOA_Q
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 // Use 1D local size. Each workgroup is a SIMD group. Each SIMD
                 // group produces N_DST (4 for Q4_0 kernel) values in the result.
                 // The number of workgroups on dim 0 (the leading dimension) is
@@ -11221,7 +11208,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             break;
         case GGML_TYPE_Q4_1: {
 #ifdef GGML_OPENCL_SOA_Q
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
@@ -11252,7 +11239,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &r3));
 #else
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
@@ -11291,7 +11278,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // nth0 - subgroup size
             // nth1 - number of subgroups per workgroup
             // ndst - number of output values per workgroup = output per subgroup * number of subgroups
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*4;
@@ -11328,7 +11315,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // nth0 - subgroup size
             // nth1 - number of subgroups per workgroup
             // ndst - number of output values per workgroup = output per subgroup * number of subgroups
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*4;
@@ -11368,7 +11355,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #ifdef GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_q4_K_f32_flat;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
@@ -11404,7 +11391,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #else
             kernel = backend_ctx->kernel_mul_mv_q4_K_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
@@ -11443,7 +11430,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #ifdef GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_q6_K_f32_flat;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = 4;
@@ -11475,7 +11462,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #else
             kernel = backend_ctx->kernel_mul_mv_q6_K_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = 1;
@@ -11509,7 +11496,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             kernel = backend_ctx->kernel_mul_mv_mxfp4_f32_flat;
 
             cl_mem q;
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*2;
@@ -11546,7 +11533,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #else
             kernel = backend_ctx->kernel_mul_mv_mxfp4_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*2;
@@ -11702,7 +11689,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
         case GGML_TYPE_Q4_0: {
             kernel = backend_ctx->kernel_mul_mv_id_q4_0_f32_8x_flat;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 sgs  = 16;
                 nsg  = 1;
                 ndst = 8;
@@ -11746,7 +11733,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 #ifdef GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_id_q8_0_f32_flat;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 sgs  = 16;
                 nsg  = 2;
                 ndst = 4;
@@ -11782,7 +11769,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 #else
             kernel = backend_ctx->kernel_mul_mv_id_q8_0_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 sgs  = 16;
                 nsg  = 2;
                 ndst = 4;
@@ -11922,7 +11909,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
             kernel = backend_ctx->kernel_mul_mv_id_mxfp4_f32_flat;
 
             cl_mem q;
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 sgs  = 16;
                 nsg  = 2;
                 ndst = 2;
@@ -11965,7 +11952,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 #else // GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_id_mxfp4_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
                 sgs  = 16;
                 nsg  = 2;
                 ndst = 2;
@@ -12427,7 +12414,7 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
     // where a row corresponds to leading dimension.
     int nth = MIN(32, ne00);
 
-    if (backend_ctx->gpu_family == INTEL) {
+    if ((backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI)) {
         // This is the same as the initial value.
         nth = MIN(32, ne00);
     }
