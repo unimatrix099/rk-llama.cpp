@@ -666,6 +666,84 @@ magnitudes, so the quantization grid becomes identical to having no sign
 vector at all, i.e. exactly the shared-signs configuration measured
 above.
 
+### 3i. Multimodal: where the time actually goes, and the GPU verdict (2026-08-22)
+
+First measurement of E4B's vision path on this board (mmproj-F16, 990 MB;
+768x768 test image; `llama-mtmd-cli --jinja`). One image plus a 48-token
+answer takes ~32 s, split as:
+
+| Phase | Time | Backend |
+|---|---|---|
+| **Vision encode** | **12.5 s** | CPU only |
+| 252 image tokens through the LLM | 8.2 s | NPU |
+| Text generation (47 tokens) | 7.9 s | NPU + CPU |
+
+**Vision encoding is the dominant cost and had no acceleration at all**
+(`clip_ctx: CLIP using CPU backend`). The tower is a plain ViT — 224px,
+patch 16, 768-dim, 16 blocks, 12 heads, 478 M — so at 768x768 it is
+~440 GFLOP of matmul, which at the ~30 GFLOPS four A76 cores deliver
+predicts ~14 s. The measurement matches: it is compute-bound, not a
+pathology. For any multimodal use, this dwarfs text t/s.
+
+**Bug fixed on the way (shipped).** `set_tensor` packed tensors on dtype
+alone, never checking the alignment `pack_native` asserts on, so CLIP
+aborted at load the moment the NPU was offered the vision tower. Dense
+LLM dims happen to be aligned, which is why it had never fired. All four
+buffer paths now share one `resolve_packable_pipeline` predicate.
+Deliberately not folded into `resolve_op_support`, which assigns the
+sequence numbers driving cyclic hybrid patterns. Verified: E4B text
+reproduces PPL 35.0480 exactly, 269 kernel checks green.
+
+**CLIP on the NPU: measured, not worth it.** With the fix plus
+`RKNPU_CPU_DECODE=32` (the RKNPU buffer only advertises `is_host` under
+dual residency, without which the CPU cannot read NPU-resident vision
+tensors and the scheduler aborts), it runs — and delivers 11923 ms
+against 12539 ms, **5%**. The reason is in the split counts:
+
+```
+CLIP on NPU:  graph splits = 227,  nodes = 940
+CLIP on CPU:  graph splits =   1,  nodes = 940
+```
+
+The backend takes only 2D `MUL_MAT`, so every layernorm, GELU, softmax
+and reshape bounces back to the CPU, fragmenting a 940-node graph into
+227 pieces. Whatever the matmuls gain, the handoffs return. Same lesson
+as the text path: fragmentation dominates. Not recommended.
+
+**The GPU: hardware ready, blocked in llama.cpp.** The full stack was
+brought up and verified:
+
+- The vendor BSP binds the Mali to ARM's proprietary driver
+  (`/dev/mali0`); `panfrost` is loaded but never binds, and the DRM
+  nodes belong to `rockchip-drm` and `RKNPU`. So **Vulkan/panvk is not
+  available** — mesa enumerates only `llvmpipe`. Changing that means
+  replacing the kernel, which would also take the NPU driver with it.
+- The OpenCL route works. Rockchip's libmali blob
+  (`libmali-valhall-g610-g13p0-gbm.so`, 164 CL symbols) plus an ICD gives
+  a working **Mali-G610 r0p0, OpenCL 3.0**, 4 compute units, with
+  `cl_khr_fp16`, full subgroup support (shuffle/ballot/clustered reduce)
+  and `cl_arm_integer_dot_product_int8`. llama.cpp builds cleanly with
+  `-DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF`.
+- **And then ggml's OpenCL backend rejects it by name:**
+  `Unsupported GPU: Mali-G610 r0p0 / drop unsupported device`. The
+  allowlist covers Adreno, Qualcomm and Intel only.
+
+Enabling Mali is a **backend port, not a flag flip**. `gpu_family` gates
+~10 sites, and critically the subgroup size it selects (Adreno 64,
+Intel 32) sizes *local memory allocations* —
+`clSetKernelArg(..., sizeof(float)*nth/sgs, NULL)`. Mali Valhall is
+16-wide, so borrowing the Intel path would under-allocate that scratch
+buffer and silently corrupt results. A real port needs a `MALI` family
+with the correct subgroup size (or a queried one), every branch handled,
+and per-kernel numerical validation. Scoped but not small, and it lives
+in upstream ggml rather than this backend.
+
+**Recommendation:** if multimodal matters, the Mali OpenCL port is the
+highest-value work available on this board — the GPU is capable, fully
+accessible, and would take the whole 940-node ViT in one split instead
+of 227. Everything up to the allowlist is already done and documented
+here. If it does not, run vision on the CPU and ignore the NPU for CLIP.
+
 ### 4. Read fewer bytes
 
 - **Hybrid per-layer patterns** (`RKNPU_HYBRID="W8A8_STANDARD,W4A4_HADAMARD"`):
