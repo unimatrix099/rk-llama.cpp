@@ -141,6 +141,28 @@ tg 5.50. The backend code fix below made `OMP_NUM_THREADS=4` unnecessary
 for the recommended routed config; it remains an optional micro-tune for
 NPU-decode-only setups.
 
+## ✅ Shipped: per-channel INT8 scales — W8A8 quality stops depending on the model
+
+**Hypothesis (decode research #3e):** the +38% PPL that W8A8 costs on
+Qwen (but not on E4B) is the same per-segment scale coarseness fixed for
+INT4 in #3c, and the same zero-NPU-cost mechanism applies to the INT32
+output path.
+
+**Result (2026-08-22):** Qwen W8A8 PPL **12.24 -> 9.08** against a CPU
+reference of 8.88; E4B 27.29 -> 27.61 (inside its ±1.15 bar). W8A8's
+premium over CPU is now ~2% on both models instead of 1%/38% — the
+variance across models collapsed, which is what makes pipeline guidance
+trustworthy. Speed unchanged (Qwen pp 215.1/tg 9.53 vs 215.8/9.58).
+Bonus: E4B's *W4A4* default also improved (26.95 -> 26.88) because a
+Q4_0 GGUF's non-Q4_0 tensors run W8A8. Same `RKNPU_PER_CHANNEL=0`
+opt-out; legacy paths byte-for-byte intact. 263 kernel checks.
+
+**Closed with a reason:** INT8 scale clipping (the #3d trick) is
+catastrophic — `RKNPU_B_CLIP_INT8=0.95` gave PPL 10106, because
+`quantize_fp32_to_int8` has no clamp and relies on `scale = amax/127`.
+The knob was removed, not shipped. Second time this property has bitten;
+audit any new scale factor against the quantizer's clamping.
+
 ## ✅ Shipped: clipped INT4 scales — W4A4 reaches the 8-bit quality tier
 
 **Hypothesis (decode research #3d):** the per-channel change (below)
@@ -324,5 +346,6 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | W4A4 K-padding (block-diagonal FWHT) | ✅ shipped | tg 4.31→5.51, pp 34.4→38.0, NPU mem −29% — decode research #3b |
 | W4A4 per-channel weight scales | ✅ shipped | PPL 228.9→45.35 (5x, W8A8=37.8) at equal speed; load minutes→seconds; confirmed at 32 chunks + on Qwen — decode research #3c |
 | Clipped INT4 scales (A/B clip) | ✅ shipped | E4B W4A4 PPL 34.36→26.95 = level with W8A8 (27.29) and CPU (27.01), free — decode research #3d |
-| W8A8 per-channel scales (INT8) | ⏭ data-justified | Qwen W8A8 is +38% PPL vs CPU (E4B is not); same zero-NPU-cost mechanism — decode research #3c |
+| W8A8 per-channel scales (INT8) | ✅ shipped | Qwen W8A8 PPL 12.24→9.08 (CPU 8.88); W8A8 premium now ~2% on both models — decode research #3e |
+| INT8 scale clipping | ❌ removed | wraps without a clamp: PPL 12.2→10106 — decode research #3e |
 | Calib cache | ⏸ load-time QoL | unchanged |

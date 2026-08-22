@@ -117,4 +117,14 @@ bool per_channel_b_scales();
 float a_clip_factor();
 float b_clip_factor();
 
+// NOTE: there is deliberately no INT8 clip knob. Clipping was measured
+// (RKNPU_B_CLIP_INT8=0.95) and is catastrophic — PPL 12.2 -> 10106 —
+// because quantize_fp32_to_int8 has no clamp: it is only ever called with
+// scale = amax/127, so |v/scale| <= 127 by construction and the NEON
+// narrowing was allowed to wrap (pinned by a prep-kernel test). A clip < 1
+// pushes the extremes to ~134, which wraps to about -122 and sign-flips the
+// largest weights. Re-enabling would require clamping that kernel first,
+// and int8's 255 levels make the payoff unlikely. See
+// RKNPU2-decode-research.md #3e.
+
 } // namespace rknpu2_calibration
