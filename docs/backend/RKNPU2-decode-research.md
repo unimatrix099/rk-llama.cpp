@@ -31,6 +31,7 @@ pure-NPU W4A4 pp 7.7-33/tg 3.4/PPL ~5x-over-CPU → **pp 37.0/tg 5.49/PPL
 26.95, level with the CPU (27.01) and W8A8 (27.29) references, at −29%
 NPU memory**. Companion documents:
 `RKNPU2-optimization-notes.md` (shipped work + dead ends),
+`RKNPU2-w4a4-story.md` (narrative account for readers new to the thread),
 `RKNPU2-int4-research.md` (INT4 fundamentals), `RKNPU2-neon-prep-plan.md`
 (prefill prep). Numbers: Orange Pi 5 Ultra (RK3588, 16 GB), pinned clocks,
 `llama-bench -p 128 -n 64` unless noted.
@@ -458,6 +459,12 @@ same `RKNPU_PER_CHANNEL`; the legacy path is left byte-for-byte intact.
 | Qwen2.5-1.5B W8A8 | 12.24 (+38% vs CPU) | **9.08 (+2.3%)** | 8.88 |
 | E4B W8A8 | 27.29 (+1.0%) | 27.61 (+2.2%) | 27.01 |
 | E4B W4A4 default (mixed: its non-Q4_0 tensors run W8A8) | 26.95 | **26.88** | 27.01 |
+
+For the same-scale before/after: E4B W4A4 in its **original**
+configuration (per-segment entropy scales + padded FWHT + no clipping)
+measures **163.01 ± 9.19** at 32 chunks, against 26.88 for the current
+defaults and 27.01 for the CPU reference — a 6.1x improvement to CPU
+parity, all from #3b/#3c/#3d/#3e.
 
 - **The point is the collapse in variance:** W8A8 went from "+1% on one
   model, +38% on another" to "+2.2%/+2.3% on both". Quality is now
