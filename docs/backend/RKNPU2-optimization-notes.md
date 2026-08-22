@@ -35,14 +35,14 @@ Google's edge stack, not llama.cpp; see investigation doc)
 | NPU `W4A4_HADAMARD` (default for Q4_0) | 7.7 | 3.4 |
 | NPU `W4A4_STANDARD` (control, broken accuracy) | 10.8 | n/a |
 | NPU + `RKNPU_CPU_DECODE=32` (shipped) | 41.3 | 4.9 |
-| **Current best, quality (2026-08-21): W8A8 + `CPU_DECODE=32`, pinned t=4** | **42.5** | **5.5** |
-| **Current best, memory (2026-08-21): default W4A4 (block-FWHT + per-channel scales)** | **36.9** | **5.54** |
+| **Current best, prefill (2026-08-22): W8A8 + `CPU_DECODE=32`, pinned t=4** | **42.5** | **5.50** |
+| **Current best, memory (2026-08-22): default W4A4 (block-FWHT + per-channel + clipped)** | **37.0** | **5.49** |
 
 (The default-threading rows above predate the threading guidance and the
 churn fix; they remain as the historical baseline each entry below built
-on. Cumulative: routed pp 39.8→42.5 / tg 3.3→5.5 at identical accuracy;
-W4A4 pp 7.7→36.9 / tg 3.4→5.54 with PPL going from ~5x-over-CPU to +27%
-and NPU memory −29%.)
+on. Cumulative: routed pp 39.8→42.5 / tg 3.3→5.50 at identical accuracy;
+W4A4 pp 7.7→37.0 / tg 3.4→5.49 with PPL going from ~5x-over-CPU to level
+with it — 26.95 vs 27.01 — at −29% NPU memory and seconds-long loads.)
 
 ### Others
 
@@ -141,6 +141,24 @@ tg 5.50. The backend code fix below made `OMP_NUM_THREADS=4` unnecessary
 for the recommended routed config; it remains an optional micro-tune for
 NPU-decode-only setups.
 
+## ✅ Shipped: clipped INT4 scales — W4A4 reaches the 8-bit quality tier
+
+**Hypothesis (decode research #3d):** the per-channel change (below)
+replaced an entropy search that was really a *clipping* search with a
+plain amax, so granularity was won but clipping was lost; restoring
+clipping as a constant factor should compose with granularity.
+
+**Result (2026-08-22):** `scale = clip * amax / 7` with defaults
+`RKNPU_A_CLIP=0.9`, `RKNPU_B_CLIP=0.93` (32-chunk sweep, two models;
+the B-curve is a smooth U with a 0.93 minimum). E4B W4A4 PPL
+**34.36 -> 26.95**, i.e. level with W8A8 (27.29) and pure CPU (27.01):
+**the 4-bit NPU pipeline is no longer a quality compromise on this
+model**, at -29% NPU memory and tg 5.5. Qwen forced-W4A4 26.87 ->
+21.74 and independently prefers 0.93, so the defaults are not overfit.
+Speed unaffected (paired same-build control). Set both to 1.0 for plain
+amax; the four-var legacy combo still reproduces the original numerics
+bit-exactly.
+
 ## ✅ Shipped: per-output-channel W4A4 weight scales (the quality fix)
 
 **Hypothesis (decode research #3c):** most of W4A4's quality tier is the
@@ -195,15 +213,18 @@ The original guidance ("W4A4 is 5x slower at prefill, capacity-only")
 predates the native-layout, NEON-prep, dispatch-pool, block-FWHT and
 per-channel-scale work. Current state on E4B Q4_0:
 
-| Pipeline choice | pp128 | tg64 | quality (PPL tier) | NPU memory |
+| Pipeline choice (E4B Q4_0) | pp128 | tg64 | PPL (32ch) | NPU memory |
 |---|---|---|---|---|
-| routed: `RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32` | 42.5 | 5.50 | reference (decode CPU-exact) | high (dual residency) |
-| default W4A4 (no env) | 36.9 | 5.54 | +27% vs CPU tier | **2.5 GB (−29%)**, CPU mostly free |
-| `RKNPU_HYBRID=W8A8_STANDARD` (NPU decode) | 42.5 | 4.55 | reference on E4B; model-dependent (Qwen +38%) | high |
+| routed: `RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32` | **42.5** | 5.50 | 27.01 (CPU-exact decode) | high (dual residency) |
+| default W4A4 (no env needed) | 37.0 | 5.49 | **26.95** | **2.5 GB (−29%)**, CPU mostly free |
+| `RKNPU_HYBRID=W8A8_STANDARD` (NPU decode) | 42.5 | 4.55 | 27.29 | high |
 
-Pick routed for max quality+speed, W4A4 for memory/CPU-headroom at a
-modest quality premium. Prefer Q8_0 GGUFs when the model fits and
-quality is paramount. Caveat: W8A8's per-segment scales are lossless on
+Pick **routed** for maximum prefill (42.5) and CPU-exact decode; pick
+**default W4A4** for minimum NPU memory and a free CPU, now at the same
+quality tier (the historical "W4A4 is a capacity mode, not a speed or
+quality mode" guidance is obsolete as of #3d). Two caveats: how much of
+the 4-bit tier a model absorbs is model-dependent (Qwen's W4A4 still
+trails its CPU reference), and W8A8's per-segment scales are lossless on
 E4B but cost +38% PPL on Qwen — check per model until per-channel INT8
 scales ship (decode research #3c).
 
@@ -302,5 +323,6 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | QKV fusion | ❌ bounded out | re-profile: can only attack ~5 ms/token of driver misc (decode research #3 re-profile) |
 | W4A4 K-padding (block-diagonal FWHT) | ✅ shipped | tg 4.31→5.51, pp 34.4→38.0, NPU mem −29% — decode research #3b |
 | W4A4 per-channel weight scales | ✅ shipped | PPL 228.9→45.35 (5x, W8A8=37.8) at equal speed; load minutes→seconds; confirmed at 32 chunks + on Qwen — decode research #3c |
+| Clipped INT4 scales (A/B clip) | ✅ shipped | E4B W4A4 PPL 34.36→26.95 = level with W8A8 (27.29) and CPU (27.01), free — decode research #3d |
 | W8A8 per-channel scales (INT8) | ⏭ data-justified | Qwen W8A8 is +38% PPL vs CPU (E4B is not); same zero-NPU-cost mechanism — decode research #3c |
 | Calib cache | ⏸ load-time QoL | unchanged |

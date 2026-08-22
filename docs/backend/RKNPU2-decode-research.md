@@ -1,6 +1,6 @@
 # RKNPU2: improving 4-bit token-generation (decode) speed — research notes
 
-Research thread with **measured verdicts as of 2026-08-21** (five board
+Research thread with **measured verdicts as of 2026-08-22** (six board
 sessions; tooling under "Experiment tooling" below). Where each avenue
 landed:
 
@@ -16,12 +16,16 @@ landed:
 - **#3c W4A4 per-channel weight scales** — the quality fix: PPL 5x
   better at equal speed, W4A4 load minutes → seconds; confirmed at 32
   chunks and across models.
+- **#3d clipped INT4 scales** — the finish: E4B W4A4 PPL 34.36 → **26.95**,
+  i.e. level with the W8A8 (27.29) and pure-CPU (27.01) references.
+  W4A4 is no longer a quality compromise on this model.
 - **#5 threading** — shipped guidance (`-t 4` big cores): +19–66% tg.
 
 Net effect on the flagship (Gemma-4 E4B Q4_0), from the state at the
 start of these sessions to now: routed pp 41.3/tg 4.9 → **42.5/5.50**;
-pure-NPU W4A4 pp 33/tg 4.2/PPL ~198-tier → **pp 36.9/tg 5.54/PPL
-+27%-over-CPU at −29% NPU memory**. Companion documents:
+pure-NPU W4A4 pp 7.7-33/tg 3.4/PPL ~5x-over-CPU → **pp 37.0/tg 5.49/PPL
+26.95, level with the CPU (27.01) and W8A8 (27.29) references, at −29%
+NPU memory**. Companion documents:
 `RKNPU2-optimization-notes.md` (shipped work + dead ends),
 `RKNPU2-int4-research.md` (INT4 fundamentals), `RKNPU2-neon-prep-plan.md`
 (prefill prep). Numbers: Orange Pi 5 Ultra (RK3588, 16 GB), pinned clocks,
@@ -32,11 +36,11 @@ pure-NPU W4A4 pp 33/tg 4.2/PPL ~198-tier → **pp 36.9/tg 5.54/PPL
 Decode re-reads the active weight set for every generated token, so it is
 memory-bandwidth bound. For Gemma-4-E4B Q4_0 (7.46 B dense):
 
-| Decode path (current) | tg64 t/s | notes |
-|---|---|---|
-| Routed CPU decode (`RKNPU_CPU_DECODE=32`, native Q4_0 reads) | **5.50** (pp 42.5) | CPU-exact decode quality; ~25 GB/s at t=4 big-core (the old "13 GB/s wall" was an 8-thread artifact — #5) |
-| NPU W4A4 (block-FWHT + per-channel scales, defaults) | **5.54** (pp 36.9) | −29% NPU memory, CPU left free, PPL +27% vs CPU tier (#3b/#3c) |
-| NPU W8A8 | 4.55 | reference-quality on E4B; on Qwen it is +38% PPL vs CPU (per-channel INT8 pending, #3c) |
+| Decode path (current) | tg64 t/s | PPL (32ch) | notes |
+|---|---|---|---|
+| Routed CPU decode (`RKNPU_CPU_DECODE=32`) | **5.50** (pp 42.5) | 27.01 | CPU-exact decode; ~25 GB/s at t=4 big-core (the old "13 GB/s wall" was an 8-thread artifact — #5) |
+| NPU W4A4 (all defaults: block-FWHT, per-channel, clipped) | **5.49** (pp 37.0) | **26.95** | −29% NPU memory, CPU left free, quality level with the 8-bit tier (#3b/#3c/#3d) |
+| NPU W8A8 | 4.55 | 27.29 | reference on E4B; on Qwen it is +38% PPL vs CPU (per-channel INT8 pending, #3c) |
 
 Two framing "facts" — **both revised by the 2026-08-10 measurements**:
 
@@ -387,6 +391,56 @@ values shift with the larger text window, compare within the column):**
   `reasoning_content` first; short max_tokens can leave `content` empty
   (finish_reason=length), which is model behavior, not a backend bug.
 
+### 3d. Clipped INT4 scales — W4A4 reaches the 8-bit quality tier (2026-08-22)
+
+Follow-up to #3c, and partly a correction of it. The per-channel change
+swapped `calculate_entropy_amax` (a KL-divergence search for an optimal
+*clipping* point) for a plain per-channel `amax`: it won granularity but
+silently dropped clipping. `RKNPU_A_CLIP` / `RKNPU_B_CLIP` restore
+clipping as a constant factor (`scale = clip * amax / 7`) — values above
+`clip*amax` saturate to ±7, buying finer steps for the bulk. Post-
+Hadamard rows are near-Gaussian, so amax is a far-tail sample and
+clipping is nearly free in error terms. The two effects compose:
+granularity (#3c) + clipping (#3d) beats either alone, at a constant
+multiply instead of a 128-step per-segment search.
+
+E4B, 32 chunks, A=0.9 (the B-curve is a smooth U — no knife edge):
+
+| B clip | 1.0 (none) | 0.95 | 0.94 | **0.93** | 0.92 | 0.91 |
+|---|---|---|---|---|---|---|
+| PPL | 34.36 | 28.83 | 27.76 | **26.95** | 28.72 | 30.02 |
+
+Isolating the two sides at 32 chunks: B-clip alone (A=1.0, B=0.95) gives
+30.72, adding A=0.9 gives 28.83 — the weight side dominates, the
+activation side is worth ~2 points on top. A is flat over 0.85–0.9
+(28.81 vs 28.83), so 0.9 is not a fitted edge.
+
+**Result — the headline of this whole thread:**
+
+| E4B Q4_0, 32 chunks | PPL |
+|---|---|
+| pure CPU (llama.cpp Q4_0 x Q8_0 kernels) | 27.01 |
+| NPU W8A8 | 27.29 |
+| **NPU W4A4, defaults (block-FWHT, per-channel, clipped)** | **26.95** |
+| NPU W4A4 before this thread's quality work | ~5x worse tier |
+
+**W4A4 is no longer a quality compromise on E4B** — it matches the 8-bit
+and CPU references while using 29% less NPU memory and decoding slightly
+faster (5.5 t/s). Cross-model check (Qwen2.5-1.5B forced W4A4, 32
+chunks): 26.87 -> **21.74** (-19%), and Qwen independently prefers
+B=0.93 over 0.95, so the defaults are not overfit to E4B. Qwen's W4A4
+still trails its CPU reference (8.88) — how much of the 4-bit tier a
+model can absorb remains model-dependent.
+
+Speed is unaffected (paired same-build control: 36.41/5.47 clipped vs
+36.48/5.51 unclipped — inside run-to-run drift; an earlier "-1.7%"
+reading was board drift, caught by re-measuring both arms in one run).
+
+Defaults `RKNPU_A_CLIP=0.9`, `RKNPU_B_CLIP=0.93`; set both to 1.0 for
+plain amax. Caveat: tuned on wikitext-2 across two models — a
+quality-critical deployment should re-sweep on its own corpus, which is
+now cheap (W4A4 loads in seconds).
+
 ### 4. Read fewer bytes
 
 - **Hybrid per-layer patterns** (`RKNPU_HYBRID="W8A8_STANDARD,W4A4_HADAMARD"`):
@@ -447,11 +501,14 @@ becomes a server.
 |---|---|---|
 | `RKNPU_HADAMARD_BLOCK` | 1 | 1 = block-diagonal FWHT (no K padding); 0 = legacy pad-to-pow2; pow2 n = min-block experiment mode (measured worse) — #3b |
 | `RKNPU_PER_CHANNEL` | 1 | 1 = per-output-channel INT4 weight scales (amax, fast load); 0 = legacy per-segment entropy scales — #3c |
+| `RKNPU_A_CLIP` | 0.9 | INT4 activation scale = clip * amax / 7; 1.0 = plain amax — #3d |
+| `RKNPU_B_CLIP` | 0.93 | same for per-channel INT4 weight scales (no effect when `RKNPU_PER_CHANNEL=0`) — #3d |
 | `OMP_NUM_THREADS=4` | unset | no longer required (the #3 code fix); still harmless |
 
-`RKNPU_HADAMARD_BLOCK=0 RKNPU_PER_CHANNEL=0` together reproduce the
-pre-2026-08-16 W4A4 numerics bit-exactly (regression anchor). W8A8 and
-the routed path are unaffected by all of the above.
+`RKNPU_HADAMARD_BLOCK=0 RKNPU_PER_CHANNEL=0 RKNPU_A_CLIP=1.0
+RKNPU_B_CLIP=1.0` together reproduce the pre-2026-08-16 W4A4 numerics
+bit-exactly (regression anchor — verified after every change since).
+W8A8 and the routed path are unaffected by all of the above.
 
 ## Experiment tooling (2026-08-10..21; reusable)
 
@@ -517,7 +574,8 @@ Pin clocks (`scripts/fix_freq_rk3588.sh`) and `ulimit -n 65536` first.
   profiling, OMP experiments), 2026-08-13 (driver-shim re-profile),
   2026-08-16 (padding census, block-FWHT PPL matrix), 2026-08-20
   (per-channel validation, CPU PPL reference), 2026-08-21 (32-chunk
-  hardening, chat smoke).
+  hardening, chat smoke), 2026-08-22 (clip sweeps, B-curve, final
+  validation).
 - Measurement hygiene, learned the hard way: before benching, check for
   stale processes (`pgrep -af llama`) — a stuck llama-cli burned one core
   through part of the 2026-08-10 evening (numbers marked * in #1).

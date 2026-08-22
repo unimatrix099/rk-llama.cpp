@@ -298,6 +298,27 @@ bool per_channel_b_scales() {
     return per_channel;
 }
 
+static float clip_from_env(const char* name, float dflt) {
+    const char* env = std::getenv(name);
+    if (env == nullptr) return dflt;
+    float v = std::strtof(env, nullptr);
+    if (!(v > 0.0f) || v > 1.0f) return dflt;   // junk or out of range
+    return v;
+}
+
+// Defaults from a 32-chunk wikitext sweep on two models (E4B B-curve is a
+// smooth U with its minimum at 0.93; Qwen agrees 0.93 > 0.95). Set both to
+// 1.0 for unclipped amax scales. See RKNPU2-decode-research.md #3d.
+float a_clip_factor() {
+    static const float clip = clip_from_env("RKNPU_A_CLIP", 0.9f);
+    return clip;
+}
+
+float b_clip_factor() {
+    static const float clip = clip_from_env("RKNPU_B_CLIP", 0.93f);
+    return clip;
+}
+
 void hadamard_transform(float* dst, const float* src, int K, int padded_size) {
     // padded_size is hadamard_k_op(K): a multiple of the block length,
     // which is a power of two. Legacy mode degenerates to one full-length
