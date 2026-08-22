@@ -163,6 +163,22 @@ void dequant_acc_int16_to_fp32_perchan(float * dst, const int16_t * src, size_t 
     }
 }
 
+void dequant_acc_int32_to_fp32_perchan(float * dst, const int32_t * src, size_t n_elements,
+                                       float common, const float * chan_scales) {
+    size_t i = 0;
+#ifdef __ARM_NEON
+    const float32x4_t vc = vdupq_n_f32(common);
+    for (; i + 4 <= n_elements; i += 4) {
+        float32x4_t f = vcvtq_f32_s32(vld1q_s32(src + i));
+        float32x4_t sc = vmulq_f32(vld1q_f32(chan_scales + i), vc);
+        vst1q_f32(dst + i, vfmaq_f32(vld1q_f32(dst + i), f, sc));
+    }
+#endif
+    for (; i < n_elements; ++i) {
+        dst[i] = fmaf((float)src[i], chan_scales[i] * common, dst[i]);
+    }
+}
+
 void dequant_acc_int16_tiled_perchan(float * dst, const int16_t * src_native,
                                      int32_t m, int32_t m_stride, int32_t outer, int32_t sub,
                                      int32_t n_limit, float common, const float * chan_scales) {

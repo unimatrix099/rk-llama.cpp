@@ -241,6 +241,24 @@ static void test_dequant_acc_perchan(void) {
     }
 }
 
+static void test_dequant_acc_int32_perchan(void) {
+    const float common = 0.0173f;
+    for (size_t si = 0; si < N_SIZES; ++si) {
+        size_t n = SIZES[si];
+        std::vector<int32_t> src(n);
+        for (auto& v : src) v = (int32_t)(prng() % 2000001) - 1000000;   // int8 dots reach ~1e6
+        std::vector<float> chan(n);
+        for (auto& v : chan) v = 0.001f + std::fabs(frand());
+        std::vector<float> a(n), b(n);
+        for (size_t i = 0; i < n; ++i) a[i] = b[i] = frand();
+        for (size_t i = 0; i < n; ++i) {
+            a[i] = fmaf((float)src[i], chan[i] * common, a[i]);
+        }
+        rknpu2_quantization::dequant_acc_int32_to_fp32_perchan(b.data(), src.data(), n, common, chan.data());
+        CHECK(memcmp(a.data(), b.data(), n * 4) == 0, "dq32acc-pc n=%zu", n);
+    }
+}
+
 static void test_dequant_acc_tiled_perchan(void) {
     const float common = 0.0173f;
     struct { int outer, m_stride, sub, n_limit; } cases[] = {
@@ -375,6 +393,7 @@ int main(void) {
     test_dequant_acc_int16();
     test_dequant_acc_tiled();
     test_dequant_acc_perchan();
+    test_dequant_acc_int32_perchan();
     test_dequant_acc_tiled_perchan();
     test_existing_conversions();
     test_hadamard();

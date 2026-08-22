@@ -319,6 +319,7 @@ float b_clip_factor() {
     return clip;
 }
 
+
 void hadamard_transform(float* dst, const float* src, int K, int padded_size) {
     // padded_size is hadamard_k_op(K): a multiple of the block length,
     // which is a power of two. Legacy mode degenerates to one full-length

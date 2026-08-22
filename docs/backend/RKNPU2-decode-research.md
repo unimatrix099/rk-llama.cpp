@@ -19,6 +19,10 @@ landed:
 - **#3d clipped INT4 scales** — the finish: E4B W4A4 PPL 34.36 → **26.95**,
   i.e. level with the W8A8 (27.29) and pure-CPU (27.01) references.
   W4A4 is no longer a quality compromise on this model.
+- **#3e per-channel INT8 scales** — the same fix for W8A8: Qwen 12.24 →
+  **9.08** (its CPU ref is 8.88), E4B unchanged within noise. W8A8's
+  quality premium is now ~2% on both models instead of 1% on one and
+  38% on the other. Also closed INT8 clipping with a reason (it wraps).
 - **#5 threading** — shipped guidance (`-t 4` big cores): +19–66% tg.
 
 Net effect on the flagship (Gemma-4 E4B Q4_0), from the state at the
@@ -39,8 +43,8 @@ memory-bandwidth bound. For Gemma-4-E4B Q4_0 (7.46 B dense):
 | Decode path (current) | tg64 t/s | PPL (32ch) | notes |
 |---|---|---|---|
 | Routed CPU decode (`RKNPU_CPU_DECODE=32`) | **5.50** (pp 42.5) | 27.01 | CPU-exact decode; ~25 GB/s at t=4 big-core (the old "13 GB/s wall" was an 8-thread artifact — #5) |
-| NPU W4A4 (all defaults: block-FWHT, per-channel, clipped) | **5.49** (pp 37.0) | **26.95** | −29% NPU memory, CPU left free, quality level with the 8-bit tier (#3b/#3c/#3d) |
-| NPU W8A8 | 4.55 | 27.29 | reference on E4B; on Qwen it is +38% PPL vs CPU (per-channel INT8 pending, #3c) |
+| NPU W4A4 (all defaults: block-FWHT, per-channel, clipped) | **5.49** (pp 37.0) | **26.88** | −29% NPU memory, CPU left free, quality level with the 8-bit tier (#3b/#3c/#3d) |
+| NPU W8A8 (per-channel scales) | 4.55 | 27.61 | ~+2% over CPU on both models tested since #3e (was +38% on Qwen) |
 
 Two framing "facts" — **both revised by the 2026-08-10 measurements**:
 
@@ -441,6 +445,45 @@ plain amax. Caveat: tuned on wikitext-2 across two models — a
 quality-critical deployment should re-sweep on its own corpus, which is
 now cheap (W4A4 loads in seconds).
 
+### 3e. Per-channel INT8 scales — W8A8 quality becomes model-independent (2026-08-22)
+
+The #3c 32-chunk run exposed that W8A8's per-segment scales are lossless
+on E4B but cost +38% PPL on Qwen. Same mechanism as #3c (channel scales
+factor out of the K sum, applied in the C dequant pass), now for the
+INT32 output path via `dequant_acc_int32_to_fp32_perchan`. Gated by the
+same `RKNPU_PER_CHANNEL`; the legacy path is left byte-for-byte intact.
+
+| Config, 32 chunks | per-segment (legacy) | **per-channel (new default)** | CPU ref |
+|---|---|---|---|
+| Qwen2.5-1.5B W8A8 | 12.24 (+38% vs CPU) | **9.08 (+2.3%)** | 8.88 |
+| E4B W8A8 | 27.29 (+1.0%) | 27.61 (+2.2%) | 27.01 |
+| E4B W4A4 default (mixed: its non-Q4_0 tensors run W8A8) | 26.95 | **26.88** | 27.01 |
+
+- **The point is the collapse in variance:** W8A8 went from "+1% on one
+  model, +38% on another" to "+2.2%/+2.3% on both". Quality is now
+  predictable per pipeline instead of per model, which is what makes the
+  pairing guidance trustworthy.
+- E4B W8A8 is nominally 0.32 worse, inside its ±1.15 error bar; the
+  large Qwen win and the consistency argument carry the default.
+- Free: Qwen pp 215.1/tg 9.53 per-channel vs 215.8/9.58 legacy (noise).
+- Bonus: the E4B *W4A4* default improved 26.95 -> 26.88, because a Q4_0
+  GGUF is not all-Q4_0 — its Q8_0/Q6_K tensors map to W8A8 and inherited
+  the fix. Worth remembering when reading any "W4A4" number here.
+
+**Closed with a reason: INT8 scale clipping.** The #3d clip trick does
+NOT transfer to int8. Measured `RKNPU_B_CLIP_INT8=0.95`: Qwen PPL
+12.2 -> **10106**. Cause: `quantize_fp32_to_int8` has no clamp — it is
+only ever called with `scale = amax/127`, so `|v/scale| <= 127` holds by
+construction, and the NEON narrowing was deliberately allowed to wrap
+(pinned by a prep-kernel test, and flagged as "unreachable in the
+backend" in `RKNPU2-neon-prep-plan.md`). A clip < 1 makes it reachable:
+the extremes land near 134, wrap to about -122, and sign-flip the
+largest weights. The knob was removed rather than shipped; re-enabling
+would require clamping that kernel first, and int8's 255 levels make the
+payoff unlikely. This is the second time the "no clamp" property has
+bitten (see the int4 clamp bug in `RKNPU2-neon-prep-plan.md`) — treat
+any new scale factor on a quantizer as requiring a clamp audit.
+
 ### 4. Read fewer bytes
 
 - **Hybrid per-layer patterns** (`RKNPU_HYBRID="W8A8_STANDARD,W4A4_HADAMARD"`):
@@ -500,9 +543,10 @@ becomes a server.
 | Variable | Default | Meaning |
 |---|---|---|
 | `RKNPU_HADAMARD_BLOCK` | 1 | 1 = block-diagonal FWHT (no K padding); 0 = legacy pad-to-pow2; pow2 n = min-block experiment mode (measured worse) — #3b |
-| `RKNPU_PER_CHANNEL` | 1 | 1 = per-output-channel INT4 weight scales (amax, fast load); 0 = legacy per-segment entropy scales — #3c |
+| `RKNPU_PER_CHANNEL` | 1 | 1 = per-output-channel weight scales for INT4 (#3c) and INT8 (#3e); 0 = legacy per-segment scales (entropy search for INT4, segment amax for INT8) |
 | `RKNPU_A_CLIP` | 0.9 | INT4 activation scale = clip * amax / 7; 1.0 = plain amax — #3d |
 | `RKNPU_B_CLIP` | 0.93 | same for per-channel INT4 weight scales (no effect when `RKNPU_PER_CHANNEL=0`) — #3d |
+| (no INT8 clip knob) | — | measured and removed: int8's packer has no clamp, so any clip < 1 wraps and sign-flips extremes (PPL 10106) — #3e |
 | `OMP_NUM_THREADS=4` | unset | no longer required (the #3 code fix); still harmless |
 
 `RKNPU_HADAMARD_BLOCK=0 RKNPU_PER_CHANNEL=0 RKNPU_A_CLIP=1.0
