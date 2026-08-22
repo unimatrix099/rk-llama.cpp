@@ -351,6 +351,14 @@ static void test_hadamard_blocked(void) {
         {1536, 512, 1536}, {256, 256, 256}, {96, 32, 96},
         {12, 4, 12}, {5, 1, 5}, {2048, 2048, 2048},
     };
+    // The env-selected explicit-block mode is exercised by the backend, not
+    // here (the factor is frozen at first use); this pins the natural mode's
+    // invariant that the block always divides K, so no padding is emitted.
+    for (int K : {2560, 10240, 10752, 1536, 256, 96}) {
+        const int b = rknpu2_calibration::hadamard_block_len(K);
+        CHECK(K % b == 0 && rknpu2_calibration::hadamard_k_op(K) == K,
+              "natural block divides K=%d (block=%d)", K, b);
+    }
     for (auto& c : cases) {
         CHECK(rknpu2_calibration::hadamard_block_len(c.K) == c.block,
               "block_len K=%d", c.K);

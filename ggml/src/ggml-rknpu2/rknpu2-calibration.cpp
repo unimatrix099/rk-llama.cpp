@@ -277,10 +277,16 @@ static int hadamard_min_block() {
 int hadamard_block_len(int K) {
     const int mb = hadamard_min_block();
     if (mb == 0) return next_power_of_two(K);   // legacy
-    // at least the min block for outlier spreading, but never beyond the
-    // next power of two (a K=256 row must not inflate to a 1024 block)
+    // 1 = natural: the largest power of two dividing K, so the transform
+    // covers as many lanes as possible with no padding.
     const int divisor = K & (-K);
-    return std::min(std::max(divisor, mb), next_power_of_two(K));
+    if (mb == 1) return divisor;
+    // explicit block size. Smaller than the natural divisor still divides
+    // K exactly (any smaller power of two does), so it costs fewer FWHT
+    // passes with no padding — the speed/quality dial. Larger pads K up to
+    // a block multiple. Never exceed next_pow2(K): a K=256 row must not
+    // inflate to a 1024 block.
+    return std::min(mb, next_power_of_two(K));
 }
 
 int hadamard_k_op(int K) {

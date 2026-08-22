@@ -571,6 +571,61 @@ the NPU and always has.**
   optimize. LFM2 was in every speed table for weeks; one perplexity run
   would have caught it at any point.
 
+### 3g. The Hadamard transform: mandatory, priced, and already optimally sized (2026-08-22)
+
+The transform was the last unexamined cost in the W4A4 text path. Three
+questions, all now answered on E4B (8 chunks; refs W8A8 38.99, CPU 37.66).
+
+**Is it still needed?** The "numerically broken" verdict on
+`W4A4_STANDARD` predated the int4 clamp fix, per-channel scales and
+clipping, so it was worth re-testing. It is emphatically still needed:
+
+| E4B | pp128 | tg64 | PPL |
+|---|---|---|---|
+| W4A4_HADAMARD (production) | 37.80 | 5.50 | **35.05** |
+| W4A4_STANDARD (no transform) | 41.42 | 6.17 | **26872** |
+
+Per-channel weight scales do nothing for the activation side, and a 0.9
+activation clip is nowhere near enough to tame outliers at 15 levels.
+
+**What does it cost?** Exactly the numbers above: **8.7% of prefill and
+10.9% of decode**. That is also a hard upper bound on any future
+transform optimization. Two useful corollaries:
+
+- The int4 matmul path itself now runs at **41.42 vs W8A8's 42.5** —
+  parity. The entire remaining W4A4-vs-W8A8 prefill gap is the transform
+  and nothing else. The original "INT4 is 5x slower than INT8" finding
+  is fully closed out.
+- Transform-free W4A4 would be the fastest decode on the board (6.17),
+  which is a tidy statement of what outlier spreading costs.
+
+**Can it be made cheaper by shrinking the blocks?** No — measured. Any
+smaller power of two also divides K, so it needs no padding and costs
+fewer passes (log2(128)=7 vs log2(512)=9). The trade is bad:
+
+| FWHT block (K=2560) | PPL | pp128 | tg64 |
+|---|---|---|---|
+| **512 (natural, default)** | **35.05** | 36.98 | 5.48 |
+| 256 | 42.32 (+21%) | 38.34 | 5.51 |
+| 128 | 55.43 (+58%) | 38.54 | 5.52 |
+| 64 | 54.83 (+56%) | 38.75 | 5.55 |
+
+Speed saturates at +4.8% while quality degrades without limit. The
+reason speed barely moves: at 512 floats the block is 2 KB and already
+L1-resident, so dropping passes saves ALU only — and it also removes the
+motivation for the "FWHT stage-fusion" follow-up noted in
+`RKNPU2-neon-prep-plan.md`, which was justified by memory traffic that
+the block-diagonal change (#3b) had already eliminated. The natural
+block (largest power of two dividing K) is the right default, confirmed
+rather than assumed.
+
+`RKNPU_HADAMARD_BLOCK` now accepts explicit sizes below the natural
+divisor (previously ignored) so this dial stays open for other models;
+the default is unchanged and reproduces PPL 35.0480 exactly.
+
+**Verdict: the W4A4 text-speed thread closes here.** The remaining 8.7%
+buys the difference between PPL 35 and PPL 26872. It is well spent.
+
 ### 4. Read fewer bytes
 
 - **Hybrid per-layer patterns** (`RKNPU_HYBRID="W8A8_STANDARD,W4A4_HADAMARD"`):
@@ -629,7 +684,7 @@ becomes a server.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `RKNPU_HADAMARD_BLOCK` | 1 | 1 = block-diagonal FWHT (no K padding); 0 = legacy pad-to-pow2; pow2 n = min-block experiment mode (measured worse) — #3b |
+| `RKNPU_HADAMARD_BLOCK` | 1 | 1 = natural block-diagonal FWHT, largest pow2 dividing K, no padding (measured optimal, #3g); 0 = legacy pad-to-pow2; pow2 n = explicit block — below the natural divisor it costs no padding but degrades quality fast, above it pads (both measured worse, #3b/#3g) |
 | `RKNPU_PER_CHANNEL` | 1 | 1 = per-output-channel weight scales for INT4 (#3c) and INT8 (#3e); 0 = legacy per-segment scales (entropy search for INT4, segment amax for INT8) |
 | `RKNPU_A_CLIP` | 0.9 | INT4 activation scale = clip * amax / 7; 1.0 = plain amax — #3d |
 | `RKNPU_B_CLIP` | 0.93 | same for per-channel INT4 weight scales (no effect when `RKNPU_PER_CHANNEL=0`) — #3d |

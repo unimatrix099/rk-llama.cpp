@@ -355,4 +355,7 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | INT8 scale clipping | ❌ removed | wraps without a clamp: PPL 12.2→10106 — decode research #3e |
 | **MoE models on the NPU** | 🐛 **broken, pre-existing** | LFM2 PPL ~17400 vs 15.86 CPU; two fix attempts reverted — decode research #4b |
 | W4A4 quality generalization | ⚠ model-dependent | free on 7.5B dense, ~2x on 1.8B; source precision a minor factor — decode research #3f |
+| Dropping the Hadamard transform | ❌ mandatory | without it PPL 35→26872; it costs 8.7% pp / 10.9% tg, the whole remaining gap to W8A8 — decode research #3g |
+| Smaller FWHT blocks | ❌ bad trade | +4.8% speed for +58% PPL; natural block confirmed optimal — decode research #3g |
+| FWHT stage-fusion | ❌ no longer motivated | blocks are L1-resident since #3b; the memory-traffic premise is gone — decode research #3g |
 | Calib cache | ⏸ load-time QoL | unchanged |
