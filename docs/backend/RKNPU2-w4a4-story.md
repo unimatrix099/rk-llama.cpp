@@ -259,6 +259,76 @@ now carry a standing rule: **any new scale factor requires a clamp audit
 of the quantizer it feeds.** This was the second time that property bit
 this project.
 
+## Act 7: How far does "4-bit is free" actually go?
+
+E4B reaching parity invited the obvious question: does it generalize? It
+does not, and the shape of the answer matters more than the answer.
+
+| Model / file | CPU | W8A8 | W4A4 | W4A4 penalty |
+|---|---|---|---|---|
+| Gemma-4 E4B (7.5B), Q4_0 source | 27.01 | 27.61 | **26.88** | **−0.5%** |
+| Qwen2.5-1.5B (1.8B), Q4_0 source | 9.36 | 9.56 | 18.73 | +100% |
+| Qwen2.5-1.5B (1.8B), Q8_0 source | 8.88 | 9.08 | 21.74 | +145% |
+
+The hypothesis going in was **source precision**: requantizing an
+already-4-bit file to int4 should cost less than crushing an 8-bit one.
+That is true — the same model improves from +145% to +100% purely by
+starting from a Q4_0 file — but it explains perhaps a third of Qwen's
+gap and none of E4B's parity. A backup hypothesis, that E4B might be one
+of Google's quantization-aware-trained checkpoints, was ruled out by the
+GGUF metadata: it is the plain instruct model.
+
+That leaves **model capacity** (7.5 B against 1.8 B) as the leading
+explanation, consistent with the standard finding that larger models
+absorb aggressive quantization better. The clean within-family control —
+Gemma-4 E2B, same architecture and recipe at half the size — could not
+be run, because that GGUF does not load in this fork.
+
+Meanwhile W8A8's penalty is now +2.2%, +2.3%, +2.2% across all three.
+That constancy is the real payoff of the per-channel work: quality you
+can predict from the pipeline, rather than discover per model.
+
+So the honest claim is narrower than the headline. On a ~7 B dense model
+from a 4-bit source, W4A4 is quality-free here; on a ~2 B model it still
+costs roughly double. Which suits the capacity mode fine — large models
+are exactly what it exists for.
+
+## Act 8: The bug hiding in the speed tables
+
+Hunting for a third data point, I ran a perplexity measurement on
+LFM2-8B-A1B — something nobody had ever done. It came back at
+**17,402, against 15.86 on the CPU.**
+
+Not a regression: the pre-existing per-segment path produces the same
+garbage, so this predates every change described above. It had gone
+unnoticed for a simple reason — **LFM2 was only ever speed-benchmarked.**
+It appears in table after table at 9.47, 13.25, 13.66 tokens per second,
+and every one of those runs was producing nonsense at speed.
+
+The mechanism is partly established. LFM2 is a mixture-of-experts model
+whose expert weights are three-dimensional — `[1792, 2048, 32]`, one
+slice per expert. The backend reads `ne[0]` and `ne[1]` everywhere it
+inspects a tensor, so it sizes such a tensor as though it held a single
+expert; and `supports_op` never checks the higher dimensions, while
+`graph_compute` takes `M` from `src1->ne[1]` and clears only `M×N` of the
+destination. Batched or multi-expert work is accepted and only its first
+slice computed. Dense models emit two-dimensional matmuls, which is
+exactly why six sessions on Gemma and Qwen never tripped over it.
+
+I attempted two fixes and shipped neither. Rejecting three-dimensional
+weights changed nothing — perplexity came back identical to the digit,
+so those tensors never reach that path. Additionally rejecting non-2D
+operands did change what gets offloaded, and turned the wrong numbers
+into NaN. At that point I had guessed twice at a bug I did not
+understand, so I reverted, verified the restore against the dense
+models' bit-identity anchors, and wrote the defect down instead.
+Swapping one broken behaviour for another is not a fix.
+
+The uncomfortable lesson is the transferable one: **we validated only
+what we optimized.** Every quality gate in this project pointed at the
+thing being changed. LFM2 sat in the speed tables for weeks, and one
+perplexity run at any point would have caught it.
+
 ## Where it ended up
 
 Gemma-4 E4B Q4_0, RK3588, `-t 4` on the big cores:
@@ -282,8 +352,14 @@ verified against bit-identity anchors: setting four environment
 variables still reproduces the original numerics exactly, so every
 change remains auditable and reversible.
 
-Cross-model: Qwen2.5-1.5B W4A4 44.31 → 21.74 and W8A8 12.24 → 9.08;
-LFM2-8B-A1B decode 9.47 → 13.66 t/s.
+Cross-model: Qwen2.5-1.5B W4A4 44.31 → 21.74 and W8A8 12.24 → 9.08.
+(LFM2's decode numbers, 9.47 → 13.66 t/s, are withdrawn as
+quality-invalid — see Act 8.)
+
+Two caveats belong next to those numbers rather than in a footnote: the
+4-bit parity is demonstrated on one 7.5 B model and does not hold at
+~2 B, and mixture-of-experts models are currently broken on this backend
+regardless of pipeline.
 
 ## What did not work, so nobody repeats it
 
@@ -297,6 +373,9 @@ LFM2-8B-A1B decode 9.47 → 13.66 t/s.
 - **int8 scale clipping** — wraps without a clamp (PPL 10106).
 - **Minimum-block Hadamard** — dominated by pure block-diagonal.
 - **Spinning/pre-waking the dispatch pool** — steals cores from prep.
+- **Two MoE fix attempts** — rejecting 3D weights had no effect at all;
+  additionally rejecting non-2D operands turned wrong output into NaN.
+  Both reverted; the defect is documented rather than half-fixed.
 
 ## Method notes that mattered more than any single fix
 
