@@ -566,12 +566,15 @@ static void ggml_backend_rknpu_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// Defined with the buffer code below; every path that decides whether a
+// tensor is stored NPU-packed must use this same predicate.
+static const rknpu2_configuration::Rknpu2HardwarePipeline * resolve_packable_pipeline(const struct ggml_tensor * tensor);
+
 // Function for acquiring a pointer for tensor data
 static void* get_tensor_real_ptr(const struct ggml_tensor* tensor) {
     if (!tensor || !tensor->data) return nullptr;
 
-    const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
-    const auto* pipeline = config.resolve_op_support(tensor);
+    const auto* pipeline = resolve_packable_pipeline(tensor);
 
     if (pipeline) {
         auto* ctx = (ggml_backend_rknpu_buffer_context*)tensor->buffer->context;
@@ -1026,10 +1029,29 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 // Buffer
 //
 
+// A tensor may only be stored in NPU-packed form if pack_native can
+// actually tile it: it asserts when a segment is not a multiple of the
+// pipeline's alignment. supports_op enforces the same constraints before
+// running an op, but the buffer paths did not — a tensor accepted purely
+// on its dtype was packed anyway, and aborted at load. Dense LLM
+// dimensions happen to be aligned, which is why only the CLIP vision
+// tower ever tripped it (its K is not a multiple of k_align).
+// Deliberately does NOT filter inside resolve_op_support: that assigns
+// the sequence numbers driving cyclic hybrid patterns, and skipping
+// tensors there would shift pipeline assignment for every later tensor.
+static const rknpu2_configuration::Rknpu2HardwarePipeline * resolve_packable_pipeline(const struct ggml_tensor * tensor) {
+    const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
+    const auto* pipeline = config.resolve_op_support(tensor);
+    if (!pipeline) return nullptr;
+    if (tensor->ne[0] % pipeline->k_align != 0) return nullptr;
+    if (tensor->ne[1] % pipeline->n_align != 0) return nullptr;
+    return pipeline;
+}
+
 // Function for calculating a real tensor size for the NPU
 static size_t get_tensor_packed_size(const struct ggml_tensor * tensor) {
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
-    const auto* pipeline = config.resolve_op_support(tensor);
+    const auto* pipeline = resolve_packable_pipeline(tensor);
 
     if (pipeline) {
         const int K = (int)tensor->ne[0];
@@ -1090,8 +1112,7 @@ static void * ggml_backend_rknpu_buffer_get_base(ggml_backend_buffer_t buffer) {
 static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
     auto * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
 
-    const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
-    const auto* pipeline = config.resolve_op_support(tensor);
+    const auto* pipeline = resolve_packable_pipeline(tensor);
 
     // Initialize tensor only if it is supported by the pipeline
     if (pipeline) {
@@ -1289,7 +1310,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     auto * ctx = (ggml_backend_rknpu_buffer_context *) buffer->context;
 
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
-    const auto* pipeline = config.resolve_op_support(tensor);
+    const auto* pipeline = resolve_packable_pipeline(tensor);
 
     size_t tensor_offset_in_virtual = (uintptr_t)tensor->data - (uintptr_t)ctx->virtual_base;
 

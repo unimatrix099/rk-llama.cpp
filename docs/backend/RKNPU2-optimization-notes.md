@@ -361,4 +361,8 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | Transform reuse via shared sign vectors | ❌ blocked on E4B | +43% PPL for ~4% speed; per-tensor signs are load-bearing there — decode research #3h |
 | `RKNPU_SHARED_SIGNS` as a quality knob | ⚠ model-dependent | −8% PPL on Qwen, +43% on E4B; default off — decode research #3h |
 | Hadamard transform on the GPU | ❌ not viable | ~600 dispatches/token at ~50us each exceeds the ~20ms of work it would replace; marginal at prefill only, needs a GPU backend plus cross-device plumbing |
+| set_tensor packing unalignable tensors | ✅ fixed | crashed at load whenever the NPU was offered CLIP; dense dims happen to be aligned so it never fired — decode research #3i |
+| CLIP vision encoder on the NPU | ❌ 5% only | 227 graph splits vs 1: the backend takes only 2D MUL_MAT, so the ViT fragments — decode research #3i |
+| Mali GPU via Vulkan/panvk | ❌ unavailable | vendor BSP binds the GPU to the proprietary driver; no panfrost DRM node, mesa sees only llvmpipe — decode research #3i |
+| Mali GPU via OpenCL | ⏭ blocked by an allowlist | stack verified working (OpenCL 3.0, fp16, subgroups); ggml-opencl supports Adreno/Intel only, and its subgroup size sizes local memory — needs a real port — decode research #3i |
 | Calib cache | ⏸ load-time QoL | unchanged |
