@@ -1306,7 +1306,21 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
             // unreproducible across runs and builds. Fall back to the
             // address only for unnamed tensors.
             uint64_t seed = 1469598103934665603ull;
-            if (tensor->name[0] != '\0') {
+            // RKNPU_SHARED_SIGNS=1: seed from K instead, so every weight
+            // with the same K shares one sign vector. The rotation only has
+            // to be consistent between a matmul's A and B, not unique per
+            // tensor — and sharing makes the A-side transform reusable
+            // across nodes that consume the same activations (Q/K/V, and
+            // gate/up, all have K=2560 on E4B). This flag exists to measure
+            // whether correlating those tensors' quantization error costs
+            // anything before the reuse cache is built. See #3h.
+            static const bool shared_signs = []() {
+                const char* e = std::getenv("RKNPU_SHARED_SIGNS");
+                return e != nullptr && std::atoi(e) == 1;
+            }();
+            if (shared_signs) {
+                seed = (seed ^ (uint64_t)K_op) * 1099511628211ull;
+            } else if (tensor->name[0] != '\0') {
                 for (const char* c = tensor->name; *c; ++c) {
                     seed = (seed ^ (uint8_t)*c) * 1099511628211ull;
                 }
