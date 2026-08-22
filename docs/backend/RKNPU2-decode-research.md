@@ -491,6 +491,86 @@ payoff unlikely. This is the second time the "no clamp" property has
 bitten (see the int4 clamp bug in `RKNPU2-neon-prep-plan.md`) — treat
 any new scale factor on a quantizer as requiring a clamp audit.
 
+### 3f. What limits W4A4 quality is the MODEL, not the pipeline (2026-08-22)
+
+After #3d put E4B's W4A4 at CPU parity, the obvious question was whether
+that generalizes. It does not, and the reason is worth knowing before
+promising anything about 4-bit.
+
+| Model / file | CPU | W8A8 | W4A4 | W4A4 penalty |
+|---|---|---|---|---|
+| Gemma-4 E4B (7.5B), Q4_0 | 27.01 | 27.61 | **26.88** | **−0.5%** |
+| Qwen2.5-1.5B (1.8B), Q4_0 | 9.36 | 9.56 | 18.73 | +100% |
+| Qwen2.5-1.5B (1.8B), Q8_0 | 8.88 | 9.08 | 21.74 | +145% |
+
+- **Source precision is a real but minor factor.** Requantizing an
+  already-4-bit file to int4 costs less than crushing an 8-bit file:
+  the same model goes from +145% to +100% purely by starting from Q4_0.
+  Worth preferring Q4_0 sources for W4A4, but it explains maybe a third
+  of Qwen's gap and none of E4B's parity.
+- **QAT was ruled out**: E4B's GGUF metadata gives
+  `general.base_model.0.name = Gemma 4 E4B It` — the plain instruct
+  model, not Google's `-qat-` variant. E4B's robustness is not trained in.
+- **The leading explanation is model capacity** (7.5B vs 1.8B), which
+  matches the standard finding that larger models absorb aggressive
+  quantization better. A within-family control (Gemma-4 E2B, same
+  architecture and recipe, half the size) would settle it, but the
+  available E2B GGUF does not load in this fork (`wrong number of
+  tensors; expected 601, got 561`).
+- **W8A8's penalty, by contrast, is now nearly constant** at +2.2%,
+  +2.3%, +2.2% across all three — the payoff of #3e.
+
+**Honest claim to make:** on a ~7B dense model with a Q4_0 source, W4A4
+is now quality-free on this backend. On a ~2B model it still costs
+roughly 2x perplexity. "4-bit is free" is not a general statement, and
+the capacity mode is best suited to exactly the large models it was
+built for.
+
+### 4b. MoE models produce wrong output on this backend — PRE-EXISTING BUG
+
+Discovered while looking for a third data point above, and the most
+consequential finding of the session: **LFM2-8B-A1B produces garbage on
+the NPU and always has.**
+
+| LFM2-8B-A1B Q8_0, 32 chunks | PPL |
+|---|---|
+| Pure CPU | 15.86 |
+| NPU W8A8 | **17402** |
+| NPU W4A4 | **20983** |
+
+- **Not a regression.** Legacy per-segment scales give the same garbage
+  (20168 vs 19314 at 8 chunks), so this predates every change in this
+  thread. It was never noticed because **LFM2 had only ever been
+  speed-benchmarked** — every LFM2 number in these documents (9.47 ->
+  13.66 t/s and friends) was measured on a model producing nonsense.
+  Treat those rows as throughput-only and quality-invalid.
+- **Mechanism, partly established.** LFM2 carries 66 three-dimensional
+  expert tensors (e.g. `blk.2.ffn_down_exps.weight [1792, 2048, 32]`).
+  Every path in the backend reads `ne[0]`/`ne[1]` only:
+  `get_tensor_packed_size` sizes a 3D tensor as if it held one expert,
+  and `supports_op` never checks `ne[2]`/`ne[3]` while `graph_compute`
+  takes `M = src1->ne[1]` and clears just `M*N` of dst. So batched or
+  multi-expert work is accepted and only its first slice computed.
+- **Two attempted fixes, both reverted.** Rejecting 3D weights in
+  `resolve_op_support` changed nothing (identical PPL to the digit — the
+  expert tensors evidently never reach it). Additionally rejecting
+  non-2D operands in `supports_op` changed which tensors are offloaded
+  (LFM2 tg 13.25 -> 12.08, RKNPU buffer 8.3 GB -> 560 MB) and turned the
+  wrong numbers into **NaN**. Neither was shipped: a half-understood
+  change that swaps one broken behaviour for another is worse than a
+  documented defect, and dense models were bit-identical throughout, so
+  nothing else was at risk.
+- **Scoped follow-up.** Making MoE correct here is its own project:
+  establish which ops actually reach the NPU for this architecture
+  (instrument `supports_op`), decide whether to implement `MUL_MAT_ID`
+  or to cleanly exclude MoE tensors from the RKNPU buffer type
+  altogether, and validate against the CPU reference. Until then, run
+  MoE models with `RKNPU_CPU_DECODE=999999` (all matmuls on CPU, verified
+  correct at 15.86) or on the CPU backend.
+- **Method note:** this is what comes of validating only what you
+  optimize. LFM2 was in every speed table for weeks; one perplexity run
+  would have caught it at any point.
+
 ### 4. Read fewer bytes
 
 - **Hybrid per-layer patterns** (`RKNPU_HYBRID="W8A8_STANDARD,W4A4_HADAMARD"`):
