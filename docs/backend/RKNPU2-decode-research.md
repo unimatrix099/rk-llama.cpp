@@ -626,6 +626,46 @@ the default is unchanged and reproduces PPL 35.0480 exactly.
 **Verdict: the W4A4 text-speed thread closes here.** The remaining 8.7%
 buys the difference between PPL 35 and PPL 26872. It is well spent.
 
+### 3h. Sharing Hadamard sign vectors — reuse blocked, but a quality knob found (2026-08-22)
+
+Follow-up to #3g, chasing the last idea for making the transform cheaper.
+Observation from the code: each weight tensor gets its **own** random sign
+vector (seeded from its name), and the prepared-A buffer is cached by
+geometry only — so its contents are recomputed per node. Q, K and V all
+consume the same activations, as do gate and up, yet each runs a full
+sign-multiply + FWHT + quantize over that identical input, differing only
+because the signs differ. Nothing in the maths requires per-tensor signs:
+the rotation only has to be consistent between a matmul's A and B. If
+tensors sharing an input shared a sign vector, the transform could be
+computed once and reused — roughly 43% fewer transforms, worth ~4%
+prefill and ~5% decode.
+
+Tested with `RKNPU_SHARED_SIGNS=1` (seed from K, so all K=2560 tensors —
+Q, K, V, gate, up on E4B — share one vector), 32 chunks:
+
+| Model | per-name signs (default) | shared-by-K |
+|---|---|---|
+| Gemma-4 E4B | **26.88** | 38.36 (+43%) |
+| Qwen2.5-1.5B forced W4A4 | 21.74 | **19.94 (−8%)** |
+
+**The reuse optimization is blocked on E4B** — a 43% quality loss for a
+4% speed gain is not a trade worth making, so the "redundant"
+recomputation stays. On E4B the differing signs are doing real work.
+
+**But the effect is model-dependent and reverses on Qwen**, where sharing
+is an 8% quality *improvement* at zero cost. A single mechanism does not
+explain both directions, and with two models there is no basis for a
+theory; recorded as measured, not explained. The flag is kept as a
+per-model quality knob (default 0 = per-name, which is what E4B needs).
+
+Escape route also closed: one could reorder the maths to apply the
+Hadamard first and the cheap per-tensor sign flip afterwards (0.8 us vs
+10 us), keeping decorrelation while sharing the expensive part. It is a
+valid rotation, but useless — sign flips after the transform change no
+magnitudes, so the quantization grid becomes identical to having no sign
+vector at all, i.e. exactly the shared-signs configuration measured
+above.
+
 ### 4. Read fewer bytes
 
 - **Hybrid per-layer patterns** (`RKNPU_HYBRID="W8A8_STANDARD,W4A4_HADAMARD"`):
@@ -689,6 +729,7 @@ becomes a server.
 | `RKNPU_A_CLIP` | 0.9 | INT4 activation scale = clip * amax / 7; 1.0 = plain amax — #3d |
 | `RKNPU_B_CLIP` | 0.93 | same for per-channel INT4 weight scales (no effect when `RKNPU_PER_CHANNEL=0`) — #3d |
 | (no INT8 clip knob) | — | measured and removed: int8's packer has no clamp, so any clip < 1 wraps and sign-flips extremes (PPL 10106) — #3e |
+| `RKNPU_SHARED_SIGNS` | 0 | 1 = one Hadamard sign vector per K instead of per tensor. Model-dependent: E4B +43% PPL (bad), Qwen −8% (good). Blocks/enables transform reuse — #3h |
 | `OMP_NUM_THREADS=4` | unset | no longer required (the #3 code fix); still harmless |
 
 `RKNPU_HADAMARD_BLOCK=0 RKNPU_PER_CHANNEL=0 RKNPU_A_CLIP=1.0

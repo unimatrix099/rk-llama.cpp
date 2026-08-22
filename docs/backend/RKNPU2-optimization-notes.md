@@ -358,4 +358,7 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | Dropping the Hadamard transform | ❌ mandatory | without it PPL 35→26872; it costs 8.7% pp / 10.9% tg, the whole remaining gap to W8A8 — decode research #3g |
 | Smaller FWHT blocks | ❌ bad trade | +4.8% speed for +58% PPL; natural block confirmed optimal — decode research #3g |
 | FWHT stage-fusion | ❌ no longer motivated | blocks are L1-resident since #3b; the memory-traffic premise is gone — decode research #3g |
+| Transform reuse via shared sign vectors | ❌ blocked on E4B | +43% PPL for ~4% speed; per-tensor signs are load-bearing there — decode research #3h |
+| `RKNPU_SHARED_SIGNS` as a quality knob | ⚠ model-dependent | −8% PPL on Qwen, +43% on E4B; default off — decode research #3h |
+| Hadamard transform on the GPU | ❌ not viable | ~600 dispatches/token at ~50us each exceeds the ~20ms of work it would replace; marginal at prefill only, needs a GPU backend plus cross-device plumbing |
 | Calib cache | ⏸ load-time QoL | unchanged |
