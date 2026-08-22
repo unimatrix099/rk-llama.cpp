@@ -807,6 +807,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     rknpu2_native_geom_from_dims(matmul_ctx_0->io_attr.A.dims,
                                                  matmul_ctx_0->io_attr.A.n_dims, &a_geom) == 0;
 
+                // hoisted: the getter guards a function-local static, and
+                // the loop below runs per row per node
+                const float a_clip = rknpu2_calibration::a_clip_factor();
+
                 // if(M > 1): at decode a single row costs a few us of NEON;
                 // forming a team per node is what libgomp punishes (#3)
                 #pragma omp parallel for if(M > 1)
@@ -840,7 +844,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         rknpu2_quantization::quantize_fp32_to_int8(ready_row.data(), dst_row, K_seg_op, scales_A[m]);
                     }
                     else if (pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
-                        scales_A[m] = rknpu2_quantization::amax_fp32(ready_row.data(), K_seg_op) / 7.0f;
+                        // clip < 1 saturates the far tail for finer steps
+                        // on the mass (RKNPU_A_CLIP, decode research #3d)
+                        scales_A[m] = a_clip *
+                                      rknpu2_quantization::amax_fp32(ready_row.data(), K_seg_op) / 7.0f;
 
                         uint8_t* dst_ptr = (uint8_t*)dst_base;
                         if (a_native) {
@@ -1355,11 +1362,12 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 if (per_channel) {
                     const size_t row_bytes = (size_t)k_seg.size_k / 2;
                     seg_npu.resize((size_t)n_seg.size_n * row_bytes);
+                    const float b_clip = rknpu2_calibration::b_clip_factor();
                     #pragma omp parallel for
                     for (int i = 0; i < n_seg.size_n; ++i) {
                         const float* row = seg_fp32.data() + (size_t)i * k_seg.size_k;
                         const float amax = rknpu2_quantization::amax_fp32(row, k_seg.size_k);
-                        const float row_scale = (amax == 0.0f) ? 1.0f : amax / 7.0f;
+                        const float row_scale = (amax == 0.0f) ? 1.0f : b_clip * amax / 7.0f;
                         rknpu2_quantization::quantize_fp32_to_int4_packed(
                             row, seg_npu.data() + (size_t)i * row_bytes, k_seg.size_k, row_scale);
                         const int global_n = n_seg.offset_n + i;

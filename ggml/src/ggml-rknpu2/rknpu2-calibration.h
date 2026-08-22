@@ -102,4 +102,19 @@ int hadamard_block_len(int K);
  */
 bool per_channel_b_scales();
 
+/**
+ * @brief Clip factors for the INT4 quantization scales (decode research
+ * #3c follow-up). scale = clip * amax / 7: values above clip*amax
+ * saturate to +-7 (the packer clamps in int32), buying finer steps for
+ * everything below. Post-Hadamard rows are near-Gaussian, so amax is a
+ * far-tail sample and a clip < 1 can lower total quantization error.
+ * RKNPU_A_CLIP applies to the per-row activation scales (per token, hot
+ * path), RKNPU_B_CLIP to the per-channel weight scales (load time).
+ * Defaults 0.9 / 0.93 from a 32-chunk two-model sweep; set to 1.0 for
+ * plain amax. Out-of-range values fall back to the default.
+ * Read once — frozen for the process lifetime.
+ */
+float a_clip_factor();
+float b_clip_factor();
+
 } // namespace rknpu2_calibration
