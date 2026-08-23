@@ -35,12 +35,12 @@ Google's edge stack, not llama.cpp; see investigation doc)
 | NPU `W4A4_HADAMARD` (default for Q4_0) | 7.7 | 3.4 |
 | NPU `W4A4_STANDARD` (control, broken accuracy) | 10.8 | n/a |
 | NPU + `RKNPU_CPU_DECODE=32` (shipped) | 41.3 | 4.9 |
-| **Current best, prefill (2026-08-22): W8A8 + `CPU_DECODE=32`, pinned t=4** | **42.5** | **5.50** |
+| **Current best, prefill (2026-08-23): W8A8 + `CPU_DECODE=32`, pinned t=4** | **41.4** | **5.50** |
 | **Current best, memory (2026-08-22): default W4A4 (block-FWHT + per-channel + clipped)** | **37.0** | **5.49** |
 
 (The default-threading rows above predate the threading guidance and the
 churn fix; they remain as the historical baseline each entry below built
-on. Cumulative: routed pp 39.8→42.5 / tg 3.3→5.50 at identical accuracy;
+on. Cumulative: routed pp 39.8→41.4 / tg 3.3→5.50 at identical accuracy;
 W4A4 pp 7.7→37.0 / tg 3.4→5.49 with PPL going from ~5x-over-CPU to level
 with it — 26.95 vs 27.01 — at −29% NPU memory and seconds-long loads.)
 
@@ -141,7 +141,7 @@ E4B NPU decode). `OMP_NUM_THREADS=4` stops the churn (+42% on NPU decode
 by itself) and fixes the strict-taskset pathology the sweep had flagged.
 
 **Recommended:** `taskset -c 4-7 ... -t 4` (servers:
-`--threads 4 --threads-batch 8`). E4B best measured: routed pp 42.52 /
+`--threads 4 --threads-batch 8`). E4B best measured: routed pp 41.4 /
 tg 5.50. The backend code fix below made `OMP_NUM_THREADS=4` unnecessary
 for the recommended routed config; it remains an optional micro-tune for
 NPU-decode-only setups.
@@ -157,7 +157,12 @@ output path.
 reference of 8.88; E4B 27.29 -> 27.61 (inside its ±1.15 bar). W8A8's
 premium over CPU is now ~2% on both models instead of 1%/38% — the
 variance across models collapsed, which is what makes pipeline guidance
-trustworthy. Speed unchanged (Qwen pp 215.1/tg 9.53 vs 215.8/9.58).
+trustworthy. **Costs 2.5% of E4B prefill** (routed pp 42.47 -> 41.39,
+A/B'd on one build via `RKNPU_PER_CHANNEL=0`): the per-channel dequant
+loads and multiplies per output element where the segment path used one
+scalar. The original "speed unchanged" claim was measured on Qwen only,
+where it genuinely is noise (pp 215.1 vs 215.8) — corrected 2026-08-23.
+Still a clear win (Qwen W8A8 PPL 12.24 -> 9.08), but a trade, not free.
 Bonus: E4B's *W4A4* default also improved (26.95 -> 26.88) because a
 Q4_0 GGUF's non-Q4_0 tensors run W8A8. Same `RKNPU_PER_CHANNEL=0`
 opt-out; legacy paths byte-for-byte intact. 263 kernel checks.
@@ -242,11 +247,11 @@ per-channel-scale work. Current state on E4B Q4_0:
 
 | Pipeline choice (E4B Q4_0) | pp128 | tg64 | PPL (32ch) | NPU memory |
 |---|---|---|---|---|
-| routed: `RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32` | **42.5** | 5.50 | 27.01 (CPU-exact decode) | high (dual residency) |
+| routed: `RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32` | **41.4** | 5.50 | 27.01 (CPU-exact decode) | high (dual residency) |
 | default W4A4 (no env needed) | 37.0 | 5.49 | **26.95** | **2.5 GB (−29%)**, CPU mostly free |
-| `RKNPU_HYBRID=W8A8_STANDARD` (NPU decode) | 42.5 | 4.55 | 27.29 | high |
+| `RKNPU_HYBRID=W8A8_STANDARD` (NPU decode) | 41.4 | 4.55 | 27.61 | high |
 
-Pick **routed** for maximum prefill (42.5) and CPU-exact decode; pick
+Pick **routed** for maximum prefill (41.4) and CPU-exact decode; pick
 **default W4A4** for minimum NPU memory and a free CPU, now at the same
 quality tier (the historical "W4A4 is a capacity mode, not a speed or
 quality mode" guidance is obsolete as of #3d). Two caveats: how much of

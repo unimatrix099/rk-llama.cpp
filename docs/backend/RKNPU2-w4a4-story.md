@@ -335,9 +335,9 @@ Gemma-4 E4B Q4_0, RK3588, `-t 4` on the big cores:
 
 | Config | pp128 | tg64 | PPL (32ch) | NPU memory |
 |---|---|---|---|---|
-| Routed (NPU prefill + CPU decode) | **42.5** | 5.50 | 27.01 | high |
+| Routed (NPU prefill + CPU decode) | **41.4** | 5.50 | 27.01 | high |
 | **Pure NPU W4A4 (all defaults)** | 37.0 | **5.49** | **26.88** | **2.5 GB** |
-| Pure NPU W8A8 | 42.5 | 4.55 | 27.61 | high |
+| Pure NPU W8A8 | 41.4 | 4.55 | 27.61 | high |
 | Pure CPU | 25.2 | 4.9 | 27.01 | — |
 
 And the W4A4 arc across the whole fork's history:
