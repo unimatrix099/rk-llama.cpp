@@ -16,9 +16,9 @@ Gemma-4 E4B Q4_0, four A76 threads, pinned clocks:
 
 | Configuration | prefill | decode | quality (wikitext PPL) | NPU memory |
 |---|---|---|---|---|
-| Routed — NPU prefill, CPU decode | **42.5** | 5.50 | 27.01 (CPU-exact) | high |
+| Routed — NPU prefill, CPU decode | **41.4** | 5.50 | 27.01 (CPU-exact) | high |
 | Pure NPU W4A4 (all defaults) | 37.0 | **5.49** | 26.88 | **2.5 GB** |
-| Pure NPU W8A8 | 42.5 | 4.55 | 27.61 | high |
+| Pure NPU W8A8 | 41.4 | 4.55 | 27.61 | high |
 | Pure CPU (no NPU) | 25.2 | 4.9 | 27.01 | — |
 
 Both NPU paths now sit at CPU-parity quality; W4A4 additionally uses 29%
@@ -167,7 +167,7 @@ ulimit -n 65536
 # routed (best prefill, CPU-exact decode)
 RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32 taskset -c 4-7 \
   build/bin/llama-bench -m ~/models/gemma-4-E4B-it-Q4_0.gguf -p 128 -n 64 -r 3 -t 4
-# expect ~pp 42.5 / tg 5.50
+# expect ~pp 41.4 / tg 5.50
 
 # pure NPU 4-bit (lowest memory)
 build/bin/llama-bench -m ~/models/gemma-4-E4B-it-Q4_0.gguf -p 128 -n 64 -r 3 -t 4

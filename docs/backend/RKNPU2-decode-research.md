@@ -26,7 +26,7 @@ landed:
 - **#5 threading** — shipped guidance (`-t 4` big cores): +19–66% tg.
 
 Net effect on the flagship (Gemma-4 E4B Q4_0), from the state at the
-start of these sessions to now: routed pp 41.3/tg 4.9 → **42.5/5.50**;
+start of these sessions to now: routed pp 41.3/tg 4.9 → **41.4/5.50**;
 pure-NPU W4A4 pp 7.7-33/tg 3.4/PPL ~5x-over-CPU → **pp 37.0/tg 5.49/PPL
 26.95, level with the CPU (27.01) and W8A8 (27.29) references, at −29%
 NPU memory**. Companion documents:
@@ -43,7 +43,7 @@ memory-bandwidth bound. For Gemma-4-E4B Q4_0 (7.46 B dense):
 
 | Decode path (current) | tg64 t/s | PPL (32ch) | notes |
 |---|---|---|---|
-| Routed CPU decode (`RKNPU_CPU_DECODE=32`) | **5.50** (pp 42.5) | 27.01 | CPU-exact decode; ~25 GB/s at t=4 big-core (the old "13 GB/s wall" was an 8-thread artifact — #5) |
+| Routed CPU decode (`RKNPU_CPU_DECODE=32`) | **5.50** (pp 41.4) | 27.01 | CPU-exact decode; ~25 GB/s at t=4 big-core (the old "13 GB/s wall" was an 8-thread artifact — #5) |
 | NPU W4A4 (all defaults: block-FWHT, per-channel, clipped) | **5.49** (pp 37.0) | **26.88** | −29% NPU memory, CPU left free, quality level with the 8-bit tier (#3b/#3c/#3d) |
 | NPU W8A8 (per-channel scales) | 4.55 | 27.61 | ~+2% over CPU on both models tested since #3e (was +38% on Qwen) |
 
@@ -472,7 +472,15 @@ parity, all from #3b/#3c/#3d/#3e.
   pairing guidance trustworthy.
 - E4B W8A8 is nominally 0.32 worse, inside its ±1.15 error bar; the
   large Qwen win and the consistency argument carry the default.
-- Free: Qwen pp 215.1/tg 9.53 per-channel vs 215.8/9.58 legacy (noise).
+- **Not free, corrected 2026-08-23**: on Qwen it is noise (pp 215.1/tg
+  9.53 per-channel vs 215.8/9.58 legacy), but on E4B it costs **2.5% of
+  prefill** — routed pp 42.47 -> 41.39, A/B'd on a single build with
+  `RKNPU_PER_CHANNEL=0`. The per-channel dequant loads and multiplies per
+  output element where the segment path used one scalar. Only Qwen was
+  measured at the time, which is how "free" got into the docs. The trade
+  still clearly favours per-channel (Qwen W8A8 PPL 12.24 -> 9.08), and it
+  is why the routed prefill figure across these documents is 41.4 rather
+  than the 42.5 measured before #3e.
 - Bonus: the E4B *W4A4* default improved 26.95 -> 26.88, because a Q4_0
   GGUF is not all-Q4_0 — its Q8_0/Q6_K tensors map to W8A8 and inherited
   the fix. Worth remembering when reading any "W4A4" number here.
