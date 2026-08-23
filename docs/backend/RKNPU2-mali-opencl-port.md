@@ -2,7 +2,7 @@
 
 Branch: `feat/opencl-mali`, stacked on `feat/w4a4-neon-prep`.
 **Status: abandoned deliberately — the port compiles and runs, but is
-numerically incorrect AND ~14x slower than the CPU. Fixing correctness
+numerically incorrect AND ~15x slower than the CPU. Fixing correctness
 would not make it useful.** Kept as a record so nobody re-walks it, and
 as working groundwork if a future Mali-tuned kernel set appears.
 
@@ -30,7 +30,7 @@ structural argument for trying.
 | Device enumeration | **works** after this port — `GPUOpenCL: Mali-G610 r0p0` |
 | All 47 kernels compile | **yes**, after the fixes below |
 | Numerical correctness | **NO** — PPL 104.4 vs 22.7 on CPU |
-| Speed | **NO** — 14x slower than CPU at prefill |
+| Speed | **NO** — 15x slower than CPU at prefill |
 
 **Vulkan is not an option** on this board: the vendor BSP binds the GPU
 to ARM's proprietary driver, so `panfrost` never binds and there is no
@@ -74,9 +74,19 @@ Kernel side (37 `.cl` files, one uniform preamble):
 
 | Config | PPL |
 |---|---|
-| CPU reference | **22.68** |
+| CPU reference (`RKNPU_CPU_DECODE=999999`) | **11.38** |
+| NPU W4A4, the default path for this file | 22.68 |
 | Mali OpenCL, subgroup width unpinned | 107.75 |
 | Mali OpenCL, width pinned to 16 | 104.37 |
+
+> Corrected 2026-08-23. The first version of this table labelled 22.68 as
+> the CPU reference. It is not: `--device none -ngl 0` does **not**
+> disable the RKNPU backend (llama-bench still prints `RKNPU` in the
+> backend column), so that run was the NPU's own 4-bit path. The only
+> reliable way to get a CPU-only baseline on this fork is
+> `RKNPU_CPU_DECODE=999999`, which routes every matmul to the CPU. The
+> conclusion is unaffected and in fact stronger — Mali is ~9x worse than
+> CPU, not ~4.6x.
 
 Pinning the width was necessary but nowhere near sufficient — it moved
 PPL by 3%. Something deeper in the Adreno/Intel-tuned kernels does not
@@ -88,10 +98,15 @@ correct next step for anyone resuming this.
 
 | Backend | pp128 | tg64 |
 |---|---|---|
-| CPU, 4 threads | **101.50** | **6.38** |
+| CPU, 4 threads (`RKNPU_CPU_DECODE=999999`) | **107.85** | **22.25** |
+| NPU W4A4, the default path | 101.50 | 6.38 |
 | Mali OpenCL, all layers | 7.14 | 3.36 |
 
-**14x slower at prefill, ~2x slower at decode.** A 4-core Mali-G610 at
+**15x slower at prefill and 6.6x slower at decode than the CPU** — and
+still 14x/1.9x slower than the NPU path it would have to beat. (These
+ratios were understated in the first version of this document, which
+compared against a baseline mislabelled as CPU; see the note above.)
+A 4-core Mali-G610 at
 1 GHz is simply not competitive with four Cortex-A76 cores running
 llama.cpp's NEON kernels — at least not through kernels written and
 tuned for Adreno. Since the whole motivation was accelerating a
