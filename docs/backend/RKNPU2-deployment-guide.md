@@ -122,9 +122,61 @@ wget https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/mmproj-F16.
      -O mmproj-E4B-F16.gguf
 ```
 
-Pairing guidance: **prefer Q4_0 files for W4A4** and Q8_0 files for
-W8A8. Requantizing a Q8_0 file down to 4 bits costs measurably more
-quality than starting from a file that is already 4-bit.
+### Picking a pipeline for your model — read this before running
+
+Two rules, and the second one is a trap if you skip it.
+
+**Rule 1: match the file to the pipeline.** Use Q4_0 files with W4A4 and
+Q8_0 files with W8A8. Squeezing an 8-bit file down to 4 bits at load time
+costs noticeably more quality than starting from a file that is already
+4-bit.
+
+**Rule 2: only use 4-bit on big models.** Roughly 7 B and up. Below that,
+use 8-bit.
+
+The reason is simple. Quantizing to 4 bits throws away detail, and a big
+model has enough redundancy to absorb the loss — a small one does not.
+Same backend, same settings, measured on the same text:
+
+| Model | quality on CPU | on 8-bit NPU | on 4-bit NPU |
+|---|---|---|---|
+| Gemma-4 E4B (7.5 B) | 27.01 | 27.61 | **26.88 — as good as CPU** |
+| Qwen2.5-1.5B (1.8 B) | 9.36 | 9.56 | **18.73 — twice as bad** |
+
+(Lower is better. These are perplexity scores; only compare down a
+column, never across, since different models score on different scales.)
+
+So on E4B, 4-bit is free — same quality, 29% less NPU memory. On a 1.5 B
+model it roughly doubles the error, which you would notice.
+
+**Where the trap is:** the backend picks the pipeline from the file type,
+and **a Q4_0 file defaults to 4-bit**. That default is right for E4B and
+wrong for a small model. If you run a small Q4_0 model with no
+environment variables, you silently get the bad path — it will not warn
+you, and it will still be fast.
+
+```sh
+# Small model (~2 B) in a Q4_0 file: force 8-bit, or quality halves
+RKNPU_HYBRID=W8A8_STANDARD build/bin/llama-cli -m qwen2.5-1.5b-instruct-q4_0.gguf ...
+
+# Small model in a Q8_0 file: the default is already 8-bit, nothing to do
+build/bin/llama-cli -m qwen2.5-1.5b-instruct-q8_0.gguf ...
+
+# Big model (7 B+) in a Q4_0 file: the default is already right
+build/bin/llama-cli -m gemma-4-E4B-it-Q4_0.gguf ...
+```
+
+If you must run 4-bit on a small model anyway — to fit it in NPU memory —
+`RKNPU_SHARED_SIGNS=1` recovers about 8% of the loss on Qwen-class
+models. It makes E4B considerably worse, so only use it on small models,
+and measure.
+
+**When in doubt, measure your own model** with step 6c below: run
+perplexity once with your settings and once with
+`RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=999999` (everything on the
+CPU, which is the quality reference). If the two are close, your
+configuration is fine. The threshold is not exactly 7 B — it depends on
+the model — so the measurement beats the rule of thumb.
 
 ## 5. System tuning (per boot)
 
@@ -248,9 +300,12 @@ regression.
 - **`--no-mmap` breaks the NPU path** — it bypasses `set_tensor` for
   host-visible buffers, so the packed NPU copy is never built. Use the
   default mmap loading.
-- **W4A4 quality is model-dependent.** It reaches CPU parity on a 7.5 B
-  dense model; on a ~2 B model it still costs roughly 2x perplexity.
-  Verify per model rather than assuming.
+- **W4A4 quality depends on model size, and the default can pick it for
+  you.** It reaches CPU parity on a 7.5 B dense model and roughly doubles
+  perplexity on a ~2 B one — and since Q4_0 files default to W4A4, a
+  small Q4_0 model silently takes the bad path. See "Picking a pipeline
+  for your model" in step 4; force `RKNPU_HYBRID=W8A8_STANDARD` below
+  ~7 B.
 
 ## 9. Troubleshooting
 
