@@ -1,7 +1,7 @@
 # Making 4-bit NPU inference actually work on the RK3588
 
-A narrative account of six board sessions spent on llama.cpp's RKNPU2
-backend, written for readers who did not live through it. The two
+A narrative account of a run of board sessions spent on llama.cpp's
+RKNPU2 backend, written for readers who did not live through it. The two
 companion documents are the technical record — `RKNPU2-decode-research.md`
 (every avenue, ranked, with verdicts) and `RKNPU2-optimization-notes.md`
 (the ledger of what shipped and what died). This one tells the story,
@@ -329,6 +329,140 @@ what we optimized.** Every quality gate in this project pointed at the
 thing being changed. LFM2 sat in the speed tables for weeks, and one
 perplexity run at any point would have caught it.
 
+## Act 9: Pricing the transform that makes 4-bit possible
+
+With quality solved, the last unexamined cost was the Hadamard transform
+itself — the reversible shuffle that spreads activation outliers so 15
+quantization levels are enough. It is expensive: about 72% of all
+per-row preparation work. And the project had written off the
+transform-free pipeline as "numerically broken" *before* the clamp fix,
+per-channel scales and clipping all landed, so the verdict was worth
+re-testing.
+
+It survived, emphatically. Without the transform, E4B goes to **PPL
+26,872** against 35.05 with it. Per-channel weight scales do nothing for
+the activation side, and a 0.9 activation clip cannot tame outliers
+across 15 levels.
+
+But the failed experiment priced the thing precisely: **8.7% of prefill
+and 10.9% of decode.** Two corollaries fell out. The int4 matmul path
+itself now runs at 41.42 against int8's ~41.4 — parity — so the
+transform is the *entire* remaining gap between the two modes, which
+finally closes out the oldest claim in this project, that "INT4 is 5×
+slower than INT8." And transform-free W4A4 would be the fastest decode
+on the board at 6.17 t/s, which is a tidy statement of what outlier
+spreading costs.
+
+Then two attempts to make it cheaper, both refused by measurement.
+Smaller FWHT blocks divide K just as evenly and need fewer passes — but
+they buy 4.8% speed for 58% worse perplexity, and speed saturates almost
+immediately because a 512-float block is already resident in L1 cache.
+That also retired a *planned* optimization: "FWHT stage-fusion" was
+sitting in the backlog justified by memory traffic that the
+block-diagonal change had already eliminated. Deleting a bad plan before
+someone spends a week on it counts as a result.
+
+The second attempt was subtler and taught me something. Reading the
+code, Q/K/V all consume the same activations yet each runs a full
+transform over them, differing only because each weight tensor carries
+its own random sign vector. Nothing in the maths requires that, so
+sharing the signs would let one transform serve three matmuls — about
+43% less work. Measured: E4B got **43% worse**. The "redundant"
+recomputation is not redundant; the differing signs keep each tensor's
+quantization error independent. What looked like waste was load-bearing.
+
+The consolation prize is real though: the same switch *improves* Qwen by
+8%. It ships as an off-by-default knob, recorded as measured rather than
+explained — one mechanism does not fit both directions, and two models
+are no basis for a theory.
+
+## Act 10: The other 40 seconds — vision, and the GPU
+
+Everything so far was text. Pointing the same rig at an image was
+sobering: one picture plus a 48-token answer takes ~32 seconds, and
+**12.5 of those are the vision encoder running on the CPU with no
+acceleration at all.** All the text work is a rounding error beside it.
+
+The encoder is a plain ViT, so at 768×768 it is ~440 GFLOP of matmul —
+and four A76 cores at ~30 GFLOPS predict ~14 s. The measurement matches;
+this is honest compute, not a pathology.
+
+The NPU barely helps. Getting it to accept the vision tower first
+required fixing a genuine crash (the tensor packer decided what to pack
+from dtype alone, never checking the alignment it would later assert
+on — dense model dimensions happen to be aligned, so it had never
+fired). After that it runs, and gains **5%**. The split counts say why:
+227 graph splits against the CPU's 1, because the backend takes only 2-D
+matmuls and every layernorm, GELU and softmax bounces back. Same lesson
+as the text path — fragmentation dominates.
+
+Which pointed at the GPU, and this is where the argument was structural
+rather than hopeful: a GPU backend supports the *whole* op set, so it
+would take all 940 nodes in one split. So I brought the stack up
+properly. Vulkan turned out to be impossible — the vendor kernel binds
+the Mali to ARM's proprietary driver, `panfrost` never binds, and mesa
+sees only a software rasterizer. OpenCL did work: Rockchip's libmali
+blob gives a genuine Mali-G610, OpenCL 3.0, fp16, subgroups, even an
+int8 dot-product extension.
+
+And then ggml rejected the device by name — its OpenCL backend
+allowlists Adreno and Intel. So I wrote the port: a `MALI` family, a
+single `subgroup_size` field replacing five copies of a per-vendor
+branch, Mali routed through the generic kernel selection at 22 dispatch
+sites, and a fallback added to 37 kernel preambles that self-detect the
+vendor through extension macros Mali advertises neither of. Along the
+way it exposed two real upstream portability bugs — two kernels use
+`half` without enabling `cl_khr_fp16`, which Adreno and Intel compilers
+forgive and Mali correctly does not.
+
+All 47 kernels compiled. The device enumerated. And the measurements
+killed it anyway: **PPL 104 against 11 on the CPU**, and **15× slower at
+prefill**. Pinning the subgroup width was necessary but moved quality
+only 3%, so something deeper in these Adreno-shaped kernels does not
+hold on Mali. Fixing that would have bought a correct backend that is an
+order of magnitude slower than doing nothing.
+
+So the GPU is not a useful compute resource for llama.cpp on this chip —
+closed with data rather than speculation, on a branch of its own so the
+groundwork survives if Mali-tuned kernels ever appear.
+
+## Act 11: Deploying it, which promptly caught two of my own errors
+
+Setting the work up on a second board meant writing down what a fresh
+install actually requires, and verifying the instructions rather than
+recalling them. Two things fell out immediately.
+
+Cloning the repo *from the first board* produced code that built fine,
+passed its own tests, and was months out of date — because development
+happened elsewhere and the board had only ever been kept in sync by
+copying files into its working tree. Its git history had never moved.
+The unit-test count now doubles as a version check for exactly this
+reason: 269 means current, 170 means you have the old tree.
+
+Then the verification failed on its own documentation. Routed prefill
+came back at 41.4 where the docs promised 42.5. Not thermal — 36 °C with
+clocks pinned, and it reproduced. An A/B on a single build found it:
+per-channel INT8 scales, which I had documented as costing nothing, cost
+**2.5% of E4B prefill.** I had measured that claim on Qwen alone, where
+it genuinely is noise, and never re-measured E4B afterwards. Still a
+clear trade — Qwen's 8-bit perplexity went 12.24 → 9.08 for it — but a
+trade, not free, and every inherited figure had to be corrected.
+
+A third error surfaced while writing the guidance for other models.
+Checking a "measure your own model" recipe, I noticed a CPU baseline
+number that looked suspiciously familiar. **`--device none -ngl 0` does
+not disable this backend** — llama-bench still prints `RKNPU` in the
+backend column. What I had published as the Mali port's "CPU reference"
+was the NPU's own 4-bit path. The verdict there did not change, and in
+fact got stronger, but the ratios were wrong and are now right.
+
+The guidance itself is worth stating plainly, because it is the one
+thing a new user will get wrong: **Q4_0 files default to the 4-bit
+pipeline.** That is correct for a 7.5 B model and wrong for a small one,
+and it fails silently and at full speed. Run Qwen-1.5B from a Q4_0 file
+with no environment variables and perplexity doubles with nothing to
+warn you.
+
 ## Where it ended up
 
 Gemma-4 E4B Q4_0, RK3588, `-t 4` on the big cores:
@@ -376,6 +510,18 @@ regardless of pipeline.
 - **Two MoE fix attempts** — rejecting 3D weights had no effect at all;
   additionally rejecting non-2D operands turned wrong output into NaN.
   Both reverted; the defect is documented rather than half-fixed.
+- **Removing the Hadamard transform** — mandatory: PPL 35 → 26,872. It
+  costs 8.7% prefill / 10.9% decode and is worth every bit of it.
+- **Smaller FWHT blocks** — +4.8% speed for +58% perplexity; the natural
+  block was already optimal.
+- **FWHT stage-fusion** — a *planned* optimization, retired unbuilt: its
+  memory-traffic premise vanished when blocks became L1-resident.
+- **Sharing Hadamard sign vectors to reuse transforms** — +43% PPL on
+  E4B. The apparent redundancy is what keeps tensor errors independent.
+- **The vision encoder on the NPU** — 5%, because 940 nodes fragment
+  into 227 splits.
+- **The Mali GPU** — Vulkan structurally unavailable; the OpenCL port
+  compiles and runs but is numerically wrong *and* 15× slower than CPU.
 
 ## Method notes that mattered more than any single fix
 
@@ -399,6 +545,16 @@ regardless of pipeline.
    burned one core through an entire evening of measurements.
 6. **Read your own documentation.** Both the int4 clamp bug and the int8
    wrap were described in the project's notes before they bit.
-7. **Write down the failures with their numbers.** Half of this document
-   is dead ends, and that half is what stops the next person from
-   spending a week on them.
+7. **Verify the baseline you are claiming, not the one you assume.**
+   Two published numbers were wrong in the same way: a "CPU reference"
+   that was actually the NPU (`--device none -ngl 0` does not disable
+   this backend), and a "costs nothing" measured on one model and never
+   rechecked on the other. Both were caught by writing a deployment
+   guide and then following it.
+8. **A claim measured on one model is a claim about one model.**
+   Per-channel INT8 is free on Qwen and costs 2.5% on E4B; sign-sharing
+   helps Qwen and ruins E4B; 4-bit is free at 7.5 B and doubles error at
+   1.8 B. Nothing here generalized as reliably as it first appeared.
+9. **Write down the failures with their numbers.** Well over half of
+   this document is dead ends, and that half is what stops the next
+   person from spending a week on them.
