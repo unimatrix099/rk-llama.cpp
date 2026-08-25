@@ -171,6 +171,30 @@ If you must run 4-bit on a small model anyway — to fit it in NPU memory —
 models. It makes E4B considerably worse, so only use it on small models,
 and measure.
 
+**It is not really about model size — it is about tensor size.** Three
+models now show the same trap, and the third breaks the "small model"
+framing:
+
+| Model | W4A4 (the default) | W8A8 | CPU |
+|---|---|---|---|
+| Qwen2.5-1.5B Q4_0 | 21.74 | 9.08 | 8.88 |
+| Gemma-4 E2B Q4_0 (QAT) | 74.75 | 60.26 | 59.35 |
+| LFM2-8B-A1B Q4_0 (MoE, 8 B total) | 25.30 | 20.30 | 18.62 |
+| Gemma-4 E4B Q4_0 (7.5 B dense) | 26.88 | 27.61 | 27.01 |
+
+LFM2 is an 8-billion-parameter model and still loses 25% to W4A4,
+because in a mixture-of-experts almost all the parameters sit in the
+experts — which run on the CPU — while the dense tensors the NPU
+actually quantizes stay small. **So use total parameter count to guess,
+then measure.** For any MoE in a Q4_0 file, start with
+`RKNPU_HYBRID=W8A8_STANDARD`.
+
+**Prefer Q4_0 files for MoE models.** On LFM2, moving from the Q8_0 to
+the Q4_0 release gained 74% decode, 39% prefill, half the disk, *and*
+better perplexity (14.77 vs 15.86 at 32 chunks — likely because the Q4_0
+is imatrix-calibrated). The 4-bit *file* and the 4-bit *NPU pipeline* are
+independent choices: take the small file, then force W8A8.
+
 **When in doubt, measure your own model** with step 6c below: run
 perplexity once with your settings and once with
 `RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=999999` (everything on the

@@ -540,6 +540,63 @@ exchange rate for future work: on this path, a millisecond saved per
 node is worth about two and a half, and a millisecond lost costs the
 same.
 
+## Act 13: The 4-bit file that beat the 8-bit file
+
+With MoE working, the obvious question was whether the mixture-of-experts
+models should be quantized harder. The reasoning is simple enough to
+state in one line: MoE decode is bound by the bytes of the *active*
+experts, so halving the weight precision should halve those bytes.
+
+LFM2-8B-A1B had only ever been run from its Q8_0 file. Running the same
+model from LiquidAI's Q4_0 instead moved decode from 13.44 to **23.44
+tokens per second**, prefill from 44.8 to 62.1, and halved the file to
+4.41 GB. The 74% is short of the 2x that pure bandwidth scaling
+predicts, and the shortfall is informative: it is the routing and
+attention work that does not shrink when the weights do, which sets a
+rough floor on what further quantization can buy.
+
+Then the perplexity came back at **14.77 against the Q8_0's 15.86**. The
+4-bit file was not merely as good as the 8-bit one, it was measurably
+better, and that is not something quantization can do. A number that
+good is a bug report about your own methodology until proven otherwise,
+so I went looking for the mistake rather than writing it up.
+
+There wasn't one. Both files are the official LiquidAI releases and the
+Q8_0's sha256 matches Hugging Face exactly, so it is not a publisher
+mismatch. The Q8_0 references I was comparing against came from earlier
+sessions, so I re-ran them in the same session, and they reproduced the
+recorded figures to four significant figures — 20.7758 at eight chunks,
+15.8591 at thirty-two against a recorded 15.86. The effect survived
+going from 8 chunks to 32.
+
+The likely explanation is that LiquidAI's Q4_0 is imatrix-calibrated
+while the Q8_0 is plain round-to-nearest, and importance-matrix
+quantization genuinely can beat naive higher precision. I have written
+that down as inference rather than fact, with the caveat that matters:
+if their calibration corpus resembles wikitext, some of that advantage
+is the model being measured against its own calibration set. Believing
+it in general needs a second eval on something that isn't wikitext.
+
+The practical finding underneath is sharper than the curiosity. W4A4 cost
+25% perplexity on this model — and LFM2 has eight billion parameters. The
+rule I had been carrying, "4-bit is free on big models and expensive on
+small ones", was the wrong rule. It is not about the model, it is about
+the *tensors*: in a mixture-of-experts nearly all the parameters live in
+the experts, which run on the CPU, and the dense tensors the NPU actually
+quantizes stay small no matter how large the model gets. An 8 B MoE
+behaves, for this purpose, like a 2 B dense model.
+
+So the two 4-bit decisions are independent, and worth separating
+explicitly: take the small *file*, then force the 8-bit *pipeline*.
+
+The same week's Gemma-4 E2B run made the point from the other direction.
+Its prefill is 3.7x E4B's and the NPU clearly earns its place there — 135
+against 71 on the CPU. Its decode is 4.87 on the NPU against 13.48 on the
+CPU, slower even than the model twice its size. Less compute per byte
+moved, and the accelerator becomes a liability. On this board the NPU is
+a prefill engine, and the smaller the model the more sharply that is
+true.
+
 ## Where it ended up
 
 Gemma-4 E4B Q4_0, RK3588, `-t 4` on the big cores:
@@ -566,7 +623,9 @@ change remains auditable and reversible.
 Cross-model: Qwen2.5-1.5B W4A4 44.31 → 21.74 and W8A8 12.24 → 9.08.
 LFM2's decode numbers, 9.47 → 13.66 t/s, were withdrawn as
 quality-invalid in Act 8 and are reinstated by the Act 12 fix: the
-speeds always stood, and the outputs behind them are now correct.
+speeds always stood, and the outputs behind them are now correct. Act 13
+then takes LFM2 to **23.44 t/s** by switching to its Q4_0 file, at
+better perplexity than the Q8_0 it replaces.
 
 One caveat belongs next to those numbers rather than in a footnote: the
 4-bit parity is demonstrated on one 7.5 B model and does not hold at

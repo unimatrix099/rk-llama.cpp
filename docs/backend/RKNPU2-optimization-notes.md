@@ -55,8 +55,17 @@ unchanged accuracy.)
 > research #4c. The historical speed numbers stand and are now also valid
 > outputs.
 
+> 📌 **Q4_0 supersedes Q8_0 for LFM2 on every axis** (2026-08-25): decode
+> 13.44 → **23.44** t/s, prefill 44.8 → 62.1, file 8.26 → 4.41 GB, *and*
+> better quality (PPL 32ch 14.77 vs 15.86). Use `RKNPU_HYBRID=W8A8_STANDARD`
+> with it — the Q4_0 default picks W4A4, which costs +25% PPL. Pure CPU is
+> LFM2's best config outright. See decode research #4d.
+
 | Model | Config | pp128 | tg64 |
 |---|---|---|---|
+| **LFM2-8B-A1B Q4_0** (MoE) | **pure CPU** | 55.1 | **23.44** |
+| LFM2-8B-A1B Q4_0 | routed | 62.1 | 21.18 |
+| LFM2-8B-A1B Q4_0 | NPU `W8A8` | 62.2 | 17.95 |
 | LFM2-8B-A1B Q8_0 (MoE, ~1.5B active) | NPU `W8A8` | 48.3 | 9.1 |
 | LFM2-8B-A1B Q8_0 | CPU only | 46.2 | 7.6 |
 | LFM2-8B-A1B Q8_0 | NPU + `CPU_DECODE=32` | 47.8 | 7.7 ← regression at default threads; **13.66 at t=4 pinned** |
@@ -363,6 +372,10 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | W8A8 per-channel scales (INT8) | ✅ shipped | Qwen W8A8 PPL 12.24→9.08 (CPU 8.88); W8A8 premium now ~2% on both models — decode research #3e |
 | INT8 scale clipping | ❌ removed | wraps without a clamp: PPL 12.2→10106 — decode research #3e |
 | MoE models on the NPU | ✅ fixed | batched mul_mats were computing one slice of four: LFM2 PPL 17402→16.90 (CPU 15.86), dense bit-identical — decode research #4c |
+| Q4_0 for MoE models | ✅ measured, clean sweep | LFM2 decode 13.44→23.44 (+74%), prefill 44.8→62.1, size −47%, PPL 15.86→14.77. Q4_0 beating Q8_0 on quality is verified (both official, refs reproduce to 4 s.f.); likely imatrix, caveat on calibration-set overlap — decode research #4d |
+| W4A4 on MoE dense tensors | ❌ wrong default | +25% PPL on LFM2 Q4_0 (25.30 vs 20.30); MoE dense tensors are small even in a large model, so parameter count does not predict W4A4 safety — decode research #4d |
+| Gemma-4 E2B | ⚠ NPU loses at decode | prefill 3.7x E4B and NPU-worth-it (135 vs 71 CPU), but decode 4.87 NPU vs 13.48 CPU; W4A4 +26% PPL while W8A8 is free and faster. Use `W8A8_STANDARD` + `CPU_DECODE=32` — decode research #4e |
+| unsloth `gemma-4-E2B-it-Q4_0.gguf` | ❌ unusable | malformed export (601 tensors, 40 unclaimed K/V vs its own `shared_kv_layers`), sha256 matches HF so it is a publisher bug, not a bad download; use Google's QAT build — decode research #4e |
 | Spin-wait amplification on the per-node path | ✅ measured, explained | the #4c restructuring also gave E4B W4A4 decode 5.47→6.89 (+26%) with provably identical arithmetic (E4B has zero batched mul_mats); ~4% less real work amplified ~2.5x by libgomp + dispatch-pool spin burn stealing cores. Per-node CPU savings are worth ~2.5x their face value here, and regressions cost the same — decode research #4c |
 | W4A4 quality generalization | ⚠ model-dependent | free on 7.5B dense, ~2x on 1.8B; source precision a minor factor — decode research #3f |
 | Dropping the Hadamard transform | ❌ mandatory | without it PPL 35→26872; it costs 8.7% pp / 10.9% tg, the whole remaining gap to W8A8 — decode research #3g |
