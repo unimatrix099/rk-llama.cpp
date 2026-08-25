@@ -963,6 +963,52 @@ on both axes. Recommended: `RKNPU_HYBRID=W8A8_STANDARD
 RKNPU_CPU_DECODE=32`. Do not compare E2B's PPL to E4B's 26.88 — different
 model scale and tuning; only the CPU column is a valid reference.
 
+#### 4f. ERNIE-4.5-21B-A3B — an MoE that *does* reach CPU parity (2026-08-25)
+
+The open question after #4d was whether E4B's CPU parity was reachable on
+a mixture-of-experts at all, or whether LFM2's +36% was what MoE always
+costs. Tested on unsloth's ERNIE-4.5-21B-A3B Q4_0 (11.64 GB, imatrix,
+sha256-verified), `-t 4`, wikitext-2.
+
+**What the NPU can even see.** Computed from the GGUF tensor table
+before downloading: the expert FFNs (`ffn_{gate,up,down}_exps`, 27 layers
+x 64 experts) are 3-D, so `MUL_MAT_ID` sends them to the CPU
+permanently. Eligible are attention q/k/v/o (28 layers, ~440 M), the two
+shared experts per layer (`ffn_*_shexp`, 2560x3072, ~637 M),
+`token_embd` (~264 M), the single leading dense block (~94 M) and the
+routers (~4 M) — **1.44 B of 21.83 B parameters, 6.6%**, with no
+alignment exclusions. 1260 accepted mul_mats per eval. Low parameter
+share but high error leverage: the output projection sits on the logits
+path and the shared experts fire on every token through all 28 layers.
+
+| Config | PPL 8ch | PPL 32ch | vs CPU (32ch) | pp128 | tg64 |
+|---|---|---|---|---|---|
+| pure CPU (reference) | 8.2411 | 6.0876 | — | 21.61 | **9.50** |
+| **NPU W8A8** | **8.2153** | **6.0793** | **−0.14%** | **25.58** | 7.40 |
+| NPU W4A4 (file default) | 9.1317 | 6.7843 | +11.4% | 25.37 | 8.60 |
+| routed W8A8 | — | — | — | 25.46 | 9.06 |
+
+**W8A8 reaches parity**, and it holds at the larger sample: −0.3% at 8
+chunks, −0.14% at 32. Both are inside noise, so the honest reading is
+"indistinguishable from CPU", not "better". That buys **+18% prefill**
+(25.58 vs 21.61) at no quality cost, which is a real win on a model where
+93% of the weights are untouchable until `MUL_MAT_ID` exists. Decode
+still loses (7.40 vs 9.50; routed recovers only to 9.06), the same
+pattern as every MoE measured. W4A4's penalty also reproduces across
+sample sizes (+10.8% at 8 chunks, +11.4% at 32).
+
+**The W4A4 result independently confirms the tensor-size rule from #4d.**
+Ranked by W4A4 damage against CPU: E4B (2560x10240) ~parity, ERNIE
+(2560x3072) +10.8%, E2B (1536x~2048) +26%, LFM2 (narrower) +36%,
+Qwen-1.5B +145%. That ordering tracks tensor width, not parameter count
+— ERNIE is 2.6x LFM2's total size and takes a third of the damage. The
+rule was written from four models on 2026-08-25 and ERNIE, measured
+afterwards, landed where it predicted.
+
+Recommended: `RKNPU_HYBRID=W8A8_STANDARD` for prefill-heavy work, pure
+CPU if decode dominates. The Q4_0 default (W4A4) is strictly worse on
+both axes here — 11% quality for slightly *less* prefill.
+
 ### 5. Micro-tuning — MEASURED: far bigger than expected (sweep, 2026-08-10)
 
 `rknpu2-affinity-sweep.sh` (trimmed variant), pinned clocks, llama-bench

@@ -171,23 +171,38 @@ If you must run 4-bit on a small model anyway — to fit it in NPU memory —
 models. It makes E4B considerably worse, so only use it on small models,
 and measure.
 
-**It is not really about model size — it is about tensor size.** Three
-models now show the same trap, and the third breaks the "small model"
-framing:
+**It is not really about model size — it is about tensor size.** Five
+models now show the same trap, and sorting them by W4A4 damage sorts
+them by the *width of the tensors the NPU quantizes*, not by parameter
+count:
 
-| Model | W4A4 (the default) | W8A8 | CPU |
-|---|---|---|---|
-| Qwen2.5-1.5B Q4_0 | 21.74 | 9.08 | 8.88 |
-| Gemma-4 E2B Q4_0 (QAT) | 74.75 | 60.26 | 59.35 |
-| LFM2-8B-A1B Q4_0 (MoE, 8 B total) | 25.30 | 20.30 | 18.62 |
-| Gemma-4 E4B Q4_0 (7.5 B dense) | 26.88 | 27.61 | 27.01 |
+| Model | NPU-quantized shapes | W4A4 | W8A8 | CPU | W4A4 vs CPU |
+|---|---|---|---|---|---|
+| Gemma-4 E4B Q4_0 (7.5 B dense) | 2560 × 10240 | 26.88 | 27.61 | 27.01 | ~parity |
+| ERNIE-4.5-21B-A3B Q4_0 (MoE) | 2560 × 3072 | 6.78 | 6.08 | 6.09 | +11% |
+| Gemma-4 E2B Q4_0 (QAT, ~2 B) | 1536 × ~2048 | 74.75 | 60.26 | 59.35 | +26% |
+| LFM2-8B-A1B Q4_0 (MoE, 8 B) | narrower still | 25.30 | 20.30 | 18.62 | +36% |
+| Qwen2.5-1.5B Q4_0 | small | 21.74 | 9.08 | 8.88 | +145% |
 
-LFM2 is an 8-billion-parameter model and still loses 25% to W4A4,
-because in a mixture-of-experts almost all the parameters sit in the
-experts — which run on the CPU — while the dense tensors the NPU
-actually quantizes stay small. **So use total parameter count to guess,
-then measure.** For any MoE in a Q4_0 file, start with
-`RKNPU_HYBRID=W8A8_STANDARD`.
+(Compare only across a row, never down a column — different models score
+on different scales.)
+
+ERNIE is 2.6x LFM2's total size yet takes a third of the W4A4 damage,
+because its shared-expert tensors are 2560×3072 while LFM2's dense
+tensors are narrower. In a mixture-of-experts almost all the parameters
+sit in the experts — which run on the CPU — so the model's headline size
+tells you nothing about the tensors the NPU actually sees. On ERNIE that
+is 1.44 B of 21.83 B parameters, 6.6%.
+
+**So parameter count is a guess; measure.** For any MoE in a Q4_0 file,
+start with `RKNPU_HYBRID=W8A8_STANDARD`. On ERNIE that is free in both
+directions — W8A8 reaches CPU parity (6.0793 vs 6.0876 at 32 chunks)
+*and* prefills slightly faster than W4A4 (25.58 vs 25.37), so the Q4_0
+default is strictly worse on both axes.
+
+(ERNIE's row is 32-chunk; the others are the sample size each was
+originally measured at. Compare the W4A4-vs-CPU ratio, not the raw
+numbers.)
 
 **Prefer Q4_0 files for MoE models.** On LFM2, moving from the Q8_0 to
 the Q4_0 release gained 74% decode, 39% prefill, half the disk, *and*

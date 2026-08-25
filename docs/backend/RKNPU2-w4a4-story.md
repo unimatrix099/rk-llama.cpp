@@ -589,6 +589,39 @@ behaves, for this purpose, like a 2 B dense model.
 So the two 4-bit decisions are independent, and worth separating
 explicitly: take the small *file*, then force the 8-bit *pipeline*.
 
+The rule earned its keep almost immediately. The next model tried was
+ERNIE-4.5-21B-A3B, a 21-billion-parameter mixture of 64 experts, and the
+question was whether the CPU parity E4B had reached was available to an
+MoE at all or whether LFM2's 36% was simply what these models cost.
+
+Reading the tensor table before downloading said the NPU would barely
+participate: the expert FFNs are three-dimensional, so they belong to
+`MUL_MAT_ID` and stay on the CPU forever, leaving attention, the two
+shared experts per layer, the output projection and a single dense block
+— 1.44 billion parameters out of 21.83, **6.6% of the model**. A small
+share, but not a harmless one: the output projection sits directly on the
+logits path and the shared experts fire on every token through all
+twenty-eight layers.
+
+It reached parity. W8A8 scored **8.2153 against the CPU's 8.2411**, and
+because a third of a percent at eight chunks is well inside noise, I ran
+it again at thirty-two: **6.0793 against 6.0876**. Both say the same
+thing, which is not that the NPU is better but that it is
+indistinguishable — the right claim to make and the right one to stop at.
+That came with 18% more prefill throughput, a genuine win on a model
+where 93% of the weights cannot be touched at all until someone
+implements `MUL_MAT_ID`.
+
+The satisfying part was the four-bit number. W4A4 cost 10.8% here,
+against LFM2's 36% — and ERNIE is 2.6 times LFM2's size. Under the old
+"big models are safe" rule that is backwards. Under the tensor-width
+rule it is exactly right: ERNIE's shared experts are 2560×3072 where
+LFM2's dense tensors are narrower, and sorting every model measured by
+W4A4 damage sorts them by tensor width, from E4B's 2560×10240 at parity
+down to Qwen-1.5B at +145%. The rule had been written that morning from
+four models. ERNIE was measured afterwards and landed where it predicted,
+which is the only kind of confirmation worth much.
+
 The same week's Gemma-4 E2B run made the point from the other direction.
 Its prefill is 3.7x E4B's and the NPU clearly earns its place there — 135
 against 71 on the CPU. Its decode is 4.87 on the NPU against 13.48 on the
