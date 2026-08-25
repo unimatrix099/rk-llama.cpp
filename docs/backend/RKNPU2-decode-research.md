@@ -879,6 +879,90 @@ longer a documented no-go; the earlier warning in
 - **MoE architecture beats all of this**: LFM2-8B-A1B reads ~1.5 GB/token
   → 13.66 t/s measured (routed, t=4). Model choice > engineering.
 
+#### 4d. Quantizing the MoE itself — MEASURED, a clean sweep (2026-08-25)
+
+If MoE decode is bound by the bytes of the *active* experts, halving the
+weight precision should halve those bytes. Tested by running the same
+model, LFM2-8B-A1B, from LiquidAI's Q4_0 (4.41 GB) instead of the Q8_0
+(8.26 GB) the tables above used. Both files SHA-verified against HF.
+
+| Config | pp128 | tg64 | PPL 8ch | PPL 32ch |
+|---|---|---|---|---|
+| **Q4_0** pure CPU | 55.09 | **23.44** | 18.62 | **14.77** |
+| **Q4_0** routed | **62.14** | 21.18 | — | — |
+| **Q4_0** NPU W8A8 | 62.15 | 17.95 | 20.30 | 16.01 |
+| **Q4_0** NPU W4A4 (file default) | 62.08 | 18.87 | 25.30 | — |
+| Q8_0 pure CPU | 37.56 | 13.44 | 20.78 | 15.86 |
+| Q8_0 NPU W8A8 | 44.80 | 12.43 | 22.12 | 16.90 |
+
+Decode 13.44 → **23.44 t/s (+74%)**, prefill 44.8 → 62.1 (+39%), file
+size −47%. The +74% falls short of the 2x that pure bandwidth scaling
+predicts; the shortfall is the routing and attention work that does not
+shrink with weight precision, which puts a rough floor on what further
+quantization can buy.
+
+**Q4_0 also scores better than Q8_0** — 14.77 vs 15.86 at 32 chunks.
+A 4-bit quant cannot beat 8-bit through quantization alone, so this was
+checked rather than reported: both files are the identical official
+LiquidAI releases (Q8_0 sha256 matches HF), and the in-session Q8_0
+references reproduce the previously recorded figures to four significant
+figures (20.7758 at 8 chunks, 15.8591 at 32 against the recorded 15.86).
+The measurement chain is sound and the effect holds at both sample
+sizes. The likely cause is that LiquidAI's Q4_0 is imatrix-calibrated
+while the Q8_0 is plain round-to-nearest — recorded as inference, not
+established. **Caveat before quoting it:** if the calibration corpus
+resembles wikitext, part of the advantage is measuring against the
+calibration set, so a non-wikitext eval is needed before claiming Q4_0
+is better in general rather than better on this benchmark.
+
+Two operational conclusions:
+
+- **Q4_0 MoE files need `RKNPU_HYBRID=W8A8_STANDARD`.** The file type
+  selects W4A4, which costs +25% PPL here (25.30 vs 20.30 at 8 chunks) —
+  the same small-dense-tensor trap E2B shows (#4e). MoE dense tensors are
+  small even when the model is large, so total parameter count does not
+  predict whether W4A4 is safe.
+- **Pure CPU is now LFM2's best config outright**: fastest decode (23.44)
+  *and* best quality (14.77). The NPU buys +13% prefill (62.1 vs 55.1)
+  and costs 10% decode and 8% quality — a direct consequence of
+  `MUL_MAT_ID` being unimplemented, so experts never reach the NPU.
+
+#### 4e. Gemma-4 E2B — the small-model trap, and a broken GGUF (2026-08-25)
+
+E2B was benchmarked for the first time. Two findings.
+
+**The unsloth E2B GGUF does not load, and is not corrupt.** It fails with
+`done_getting_tensors: wrong number of tensors; expected 601, got 561`,
+but its sha256 matches HF exactly — re-downloading cannot fix it. The
+export is malformed: it ships `attn_k`/`attn_v` for all 35 layers while
+its own metadata says `shared_kv_layers = 20`, so the loader creates K/V
+for 35−20 = 15 layers and leaves exactly 20×2 = 40 unclaimed. E4B is
+self-consistent (42 blocks, 18 shared, 24 present and expected), which is
+why it loads. Google's official QAT build is consistent (541 tensors,
+`attn_k` on layers 0–14) and works. Diagnosis cost one range-request of
+the file header; the general lesson is that a tensor-count mismatch is a
+*publisher* bug far more often than a transfer bug, and the sha256 tells
+you which in one command.
+
+Google `gemma-4-E2B_q4_0-it.gguf` (QAT, 3.35 GB), `-t 4`:
+
+| Config | pp128 | tg64 | PPL 8ch |
+|---|---|---|---|
+| NPU W4A4 (file default) | 113.6 | 4.87 | 74.75 |
+| NPU W8A8 | 129.9 | 4.26 | 60.26 |
+| **W8A8 + routed** | **135.0** | **10.97** | **60.26** |
+| pure CPU | 71.1 | 13.48 | 59.35 |
+| *E4B NPU W4A4, same settings* | *36.8* | *6.84* | *—* |
+
+E2B prefills 3.7x faster than E4B and the NPU earns it (135 vs 71 on
+CPU). But **decode inverts**: 4.87 on the NPU against 13.48 on CPU, and
+slower even than E4B's 6.84 — less compute per byte moved, so the NPU's
+advantage disappears. W4A4 costs +26% PPL (74.75 vs 59.35) while W8A8 is
+nearly free (60.26) *and* prefills faster, so the Q4_0 default is wrong
+on both axes. Recommended: `RKNPU_HYBRID=W8A8_STANDARD
+RKNPU_CPU_DECODE=32`. Do not compare E2B's PPL to E4B's 26.88 — different
+model scale and tuning; only the CPU column is a valid reference.
+
 ### 5. Micro-tuning — MEASURED: far bigger than expected (sweep, 2026-08-10)
 
 `rknpu2-affinity-sweep.sh` (trimmed variant), pinned clocks, llama-bench
