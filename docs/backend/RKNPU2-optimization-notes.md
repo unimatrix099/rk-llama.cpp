@@ -46,10 +46,12 @@ with it — 26.95 vs 27.01 — at −29% NPU memory and seconds-long loads.)
 
 ### Others
 
-> ⚠ **All LFM2 rows below are throughput-only and quality-INVALID.** As of
-> 2026-08-22, MoE models produce garbage on the NPU (LFM2 PPL ~17400 vs
-> 15.86 on CPU) — a pre-existing bug, see decode research #4b. The speed
-> numbers are real; the outputs were not. Run MoE on CPU until fixed.
+> ✅ **Fixed 2026-08-24.** LFM2 rows below were throughput-only and
+> quality-invalid for a long time: MoE models produced garbage on the NPU
+> (PPL ~17400 vs 15.86 on CPU) because the backend computed only the first
+> slice of a batched mul_mat. Now PPL 16.90 at the same speed — see decode
+> research #4c. The historical speed numbers stand and are now also valid
+> outputs.
 
 | Model | Config | pp128 | tg64 |
 |---|---|---|---|
@@ -358,7 +360,7 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | Clipped INT4 scales (A/B clip) | ✅ shipped | E4B W4A4 PPL 34.36→26.95 = level with W8A8 (27.29) and CPU (27.01), free — decode research #3d |
 | W8A8 per-channel scales (INT8) | ✅ shipped | Qwen W8A8 PPL 12.24→9.08 (CPU 8.88); W8A8 premium now ~2% on both models — decode research #3e |
 | INT8 scale clipping | ❌ removed | wraps without a clamp: PPL 12.2→10106 — decode research #3e |
-| **MoE models on the NPU** | 🐛 **broken, pre-existing** | LFM2 PPL ~17400 vs 15.86 CPU; two fix attempts reverted — decode research #4b |
+| MoE models on the NPU | ✅ fixed | batched mul_mats were computing one slice of four: LFM2 PPL 17402→16.90 (CPU 15.86), dense bit-identical — decode research #4c |
 | W4A4 quality generalization | ⚠ model-dependent | free on 7.5B dense, ~2x on 1.8B; source precision a minor factor — decode research #3f |
 | Dropping the Hadamard transform | ❌ mandatory | without it PPL 35→26872; it costs 8.7% pp / 10.9% tg, the whole remaining gap to W8A8 — decode research #3g |
 | Smaller FWHT blocks | ❌ bad trade | +4.8% speed for +58% PPL; natural block confirmed optimal — decode research #3g |

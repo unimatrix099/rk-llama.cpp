@@ -280,6 +280,8 @@ deviate or to debug.
 | `RKNPU_PER_CHANNEL` | 1 | Per-output-channel weight scales (INT4 and INT8). |
 | `RKNPU_A_CLIP` | 0.9 | INT4 activation scale clip. |
 | `RKNPU_B_CLIP` | 0.93 | INT4 weight scale clip. |
+| `RKNPU_EXCLUDE` | unset | Diagnostic. Comma-separated name substrings kept off the NPU, e.g. `RKNPU_EXCLUDE=shortconv`. Use it to bisect a wrong-output bug to a tensor class. |
+| `RKNPU_DEBUG_OPS` | unset | Diagnostic. Logs the shape of every mul_mat the NPU accepts. |
 | `RKNPU_SHARED_SIGNS` | 0 | Share Hadamard signs across tensors with equal K. Model-dependent: helps Qwen (−8% PPL), hurts E4B (+43%). |
 
 Regression anchor: `RKNPU_HADAMARD_BLOCK=0 RKNPU_PER_CHANNEL=0
@@ -289,10 +291,12 @@ regression.
 
 ## 8. Known limitations
 
-- **MoE models produce wrong output on the NPU.** LFM2-8B-A1B measures
-  PPL ~17400 against 15.9 on CPU. Pre-existing, not fixed. Run MoE
-  models with `RKNPU_CPU_DECODE=999999` (all matmuls on CPU, verified
-  correct) or on the CPU backend. See decode research #4b.
+- ~~MoE models produce wrong output on the NPU.~~ **Fixed 2026-08-24**
+  (decode research #4c): the backend computed only the first slice of a
+  batched mul_mat, which is how LFM2's short-convolution projections are
+  shaped. LFM2-8B-A1B now measures PPL 16.90 against 15.86 on CPU, at
+  unchanged speed. If you are on an older commit, run MoE models with
+  `RKNPU_CPU_DECODE=999999`.
 - **Multimodal vision runs on the CPU**, ~12.5 s per image for E4B, and
   that dominates any image interaction. Pointing the NPU at it gains
   only 5%. The GPU cannot help either — see

@@ -890,6 +890,8 @@ becomes a server.
 | `RKNPU_A_CLIP` | 0.9 | INT4 activation scale = clip * amax / 7; 1.0 = plain amax — #3d |
 | `RKNPU_B_CLIP` | 0.93 | same for per-channel INT4 weight scales (no effect when `RKNPU_PER_CHANNEL=0`) — #3d |
 | (no INT8 clip knob) | — | measured and removed: int8's packer has no clamp, so any clip < 1 wraps and sign-flips extremes (PPL 10106) — #3e |
+| `RKNPU_EXCLUDE` | unset | Diagnostic: comma-separated name substrings; matching weights are never offloaded and keep their original bytes. Bisects which tensor class causes a wrong-output bug — `--override-tensor` cannot do this, it leaves the RKNPU allocation untouched (#4c) |
+| `RKNPU_DEBUG_OPS` | unset | Diagnostic: log the geometry of every accepted mul_mat (dims, dst contiguity, row stride) (#4c) |
 | `RKNPU_SHARED_SIGNS` | 0 | 1 = one Hadamard sign vector per K instead of per tensor. Model-dependent: E4B +43% PPL (bad), Qwen −8% (good). Blocks/enables transform reuse — #3h |
 | `OMP_NUM_THREADS=4` | unset | no longer required (the #3 code fix); still harmless |
 
