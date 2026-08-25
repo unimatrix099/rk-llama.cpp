@@ -329,6 +329,12 @@ what we optimized.** Every quality gate in this project pointed at the
 thing being changed. LFM2 sat in the speed tables for weeks, and one
 perplexity run at any point would have caught it.
 
+(The mechanism sketched above is the one I believed at the time, and it
+is wrong in its particulars — the 3-D expert weights are a red herring.
+Act 12 has the real cause, which is batched *activations*. I have left
+the mistaken reasoning here rather than quietly correcting it, because
+the two failed fixes only make sense against it.)
+
 ## Act 9: Pricing the transform that makes 4-bit possible
 
 With quality solved, the last unexamined cost was the Hadamard transform
@@ -463,6 +469,77 @@ and it fails silently and at full speed. Run Qwen-1.5B from a Q4_0 file
 with no environment variables and perplexity doubles with nothing to
 warn you.
 
+## Act 12: Finishing Act 8's bug, and a 26% surprise I did not order
+
+The MoE defect had been written down rather than fixed, which is a
+tolerable place to leave something for a week and a bad place to leave
+it permanently. Coming back to it with the diagnostic tooling built in
+the meantime, the actual mechanism turned out to be neither of the
+things I had guessed.
+
+The two failed attempts had both tried to *reject* the offending
+tensors. The reason that made things worse is now obvious: rejecting an
+op sends it to the CPU backend, but the CPU can only compute it if a
+host copy of the weights exists — and under W4A4 it does not, because
+dropping the host copy is exactly where the −29% memory win comes from.
+The first attempt was inert, the second produced NaN, and both were
+me steering around a bug I had not located.
+
+Locating it needed a tool. `--override-tensor` looked like the obvious
+way to bisect which tensor class was responsible, and it silently does
+nothing here — the RKNPU allocation is unchanged by `-ot ".*=CPU"`. I
+only noticed because every variant returned perplexity identical to
+seven figures, which is not a result, it is an instrument reading zero.
+So I added `RKNPU_EXCLUDE`, which genuinely keeps a weight out of the
+backend, and `RKNPU_DEBUG_OPS`, which logs the geometry of every matmul
+the backend accepts.
+
+With those, the answer was immediate and it was not the experts at all.
+LFM2's *short-convolution projections* arrive as `src1[2048,128,4]` —
+batched activations against ordinary 2-D weights. The backend computed
+the first slice of four and left the rest as the zeros the memset had
+written. The fix is what the bug description implies once you can see
+it: loop over `ne[2] × ne[3]`, advancing the activation and destination
+pointers by the real `nb[]` strides, and make `supports_op` enforce what
+the loop assumes. LFM2 perplexity went from 17,402 to **16.90**, against
+15.86 on the CPU, at unchanged speed. The dense models stayed
+bit-identical, as a loop that runs once at zero offset must.
+
+Then the odd part. The same change lifted E4B decode from 5.47 to
+**6.89 t/s, a 26% gain**, on a model that has no batched matmuls
+whatsoever — 3,087 accepted matmuls in a perplexity chunk, every one of
+them `ne[2] == 1`. Identical perplexity, identical 603 graph splits,
+byte-identical greedy output over 48 tokens. A provable no-op was worth
+a quarter of decode throughput, which is the kind of result you should
+refuse to publish until you can explain it.
+
+Chasing it produced the most interesting systems finding of the project.
+Neither micro-edit inside the change reproduces it alone. `perf stat`
+showed the old build retiring 71 billion more instructions at identical
+IPC — more code executed, not more waiting on memory. But disabling
+every spin-wait in the system collapsed that gap from 71 G to 8 G and
+the speed gap from +26% to +11%. Nearly 90% of those "extra
+instructions" were threads spinning.
+
+So the mechanism is a feedback loop rather than a hot spot. The
+restructuring removes a few percent of real work from the per-node
+critical path. On eight cores already hosting a libgomp team and two
+dispatch-pool workers that spin before they sleep, a longer critical
+path means more spin burn; spin burn steals precisely the cores that the
+activation prep and dequantization need; and that lengthens the critical
+path again. The measured amplification is about 2.5×. Two independent
+observations confirm it: the old build spends 60% of decode samples in
+libgomp spin against 46% for the new one, and widening the spin window
+collapses the old build (5.52 → 2.87 t/s) while barely moving the new
+one (6.87 → 6.57 across a 256× range).
+
+That last asymmetry is the part worth keeping. The fixed build is nearly
+insensitive to a tuning parameter the old one was violently sensitive
+to, which is a much better place for a system to sit. It also sets the
+exchange rate for future work: on this path, a millisecond saved per
+node is worth about two and a half, and a millisecond lost costs the
+same.
+
 ## Where it ended up
 
 Gemma-4 E4B Q4_0, RK3588, `-t 4` on the big cores:
@@ -470,7 +547,7 @@ Gemma-4 E4B Q4_0, RK3588, `-t 4` on the big cores:
 | Config | pp128 | tg64 | PPL (32ch) | NPU memory |
 |---|---|---|---|---|
 | Routed (NPU prefill + CPU decode) | **41.4** | 5.50 | 27.01 | high |
-| **Pure NPU W4A4 (all defaults)** | 37.0 | **5.49** | **26.88** | **2.5 GB** |
+| **Pure NPU W4A4 (all defaults)** | 37.0 | **6.89** | **26.88** | **2.5 GB** |
 | Pure NPU W8A8 | 41.4 | 4.55 | 27.61 | high |
 | Pure CPU | 25.2 | 4.9 | 27.01 | — |
 
@@ -479,21 +556,21 @@ And the W4A4 arc across the whole fork's history:
 | | prefill | decode | PPL | load |
 |---|---|---|---|---|
 | Originally | 7.7 | 3.4 | 163.01 | minutes |
-| **Now** | **37.0** | **5.49** | **26.88** | **seconds** |
+| **Now** | **37.0** | **6.89** | **26.88** | **seconds** |
 
-Nearly 5× prefill, 1.6× decode, 6× quality, −29% memory. Every step
+Nearly 5× prefill, 2× decode, 6× quality, −29% memory. Every step
 verified against bit-identity anchors: setting four environment
 variables still reproduces the original numerics exactly, so every
 change remains auditable and reversible.
 
 Cross-model: Qwen2.5-1.5B W4A4 44.31 → 21.74 and W8A8 12.24 → 9.08.
-(LFM2's decode numbers, 9.47 → 13.66 t/s, are withdrawn as
-quality-invalid — see Act 8.)
+LFM2's decode numbers, 9.47 → 13.66 t/s, were withdrawn as
+quality-invalid in Act 8 and are reinstated by the Act 12 fix: the
+speeds always stood, and the outputs behind them are now correct.
 
-Two caveats belong next to those numbers rather than in a footnote: the
+One caveat belongs next to those numbers rather than in a footnote: the
 4-bit parity is demonstrated on one 7.5 B model and does not hold at
-~2 B, and mixture-of-experts models are currently broken on this backend
-regardless of pipeline.
+~2 B.
 
 ## What did not work, so nobody repeats it
 
@@ -509,7 +586,14 @@ regardless of pipeline.
 - **Spinning/pre-waking the dispatch pool** — steals cores from prep.
 - **Two MoE fix attempts** — rejecting 3D weights had no effect at all;
   additionally rejecting non-2D operands turned wrong output into NaN.
-  Both reverted; the defect is documented rather than half-fixed.
+  Both reverted, and both were guesses at an unlocated bug. Fixed
+  properly in Act 12 once `RKNPU_EXCLUDE` and `RKNPU_DEBUG_OPS` existed
+  to locate it — it was batched activations, not the experts.
+- **`--override-tensor` as a bisection tool** — inert for this backend;
+  it leaves the RKNPU allocation untouched. Cost a round of experiments
+  that all returned the same number, which is how it was caught.
+- **Widening the dispatch-pool spin window** — still loses, and now
+  quantified: it collapses the pre-#4c build 5.52 → 2.87 t/s.
 - **Removing the Hadamard transform** — mandatory: PPL 35 → 26,872. It
   costs 8.7% prefill / 10.9% decode and is worth every bit of it.
 - **Smaller FWHT blocks** — +4.8% speed for +58% perplexity; the natural

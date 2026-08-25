@@ -42,7 +42,9 @@ Google's edge stack, not llama.cpp; see investigation doc)
 churn fix; they remain as the historical baseline each entry below built
 on. Cumulative: routed pp 39.8→41.4 / tg 3.3→5.50 at identical accuracy;
 W4A4 pp 7.7→37.0 / tg 3.4→5.49 with PPL going from ~5x-over-CPU to level
-with it — 26.95 vs 27.01 — at −29% NPU memory and seconds-long loads.)
+with it — 26.95 vs 27.01 — at −29% NPU memory and seconds-long loads.
+W4A4 decode later reached **6.89** via the #4c restructuring, at
+unchanged accuracy.)
 
 ### Others
 
@@ -361,6 +363,7 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | W8A8 per-channel scales (INT8) | ✅ shipped | Qwen W8A8 PPL 12.24→9.08 (CPU 8.88); W8A8 premium now ~2% on both models — decode research #3e |
 | INT8 scale clipping | ❌ removed | wraps without a clamp: PPL 12.2→10106 — decode research #3e |
 | MoE models on the NPU | ✅ fixed | batched mul_mats were computing one slice of four: LFM2 PPL 17402→16.90 (CPU 15.86), dense bit-identical — decode research #4c |
+| Spin-wait amplification on the per-node path | ✅ measured, explained | the #4c restructuring also gave E4B W4A4 decode 5.47→6.89 (+26%) with provably identical arithmetic (E4B has zero batched mul_mats); ~4% less real work amplified ~2.5x by libgomp + dispatch-pool spin burn stealing cores. Per-node CPU savings are worth ~2.5x their face value here, and regressions cost the same — decode research #4c |
 | W4A4 quality generalization | ⚠ model-dependent | free on 7.5B dense, ~2x on 1.8B; source precision a minor factor — decode research #3f |
 | Dropping the Hadamard transform | ❌ mandatory | without it PPL 35→26872; it costs 8.7% pp / 10.9% tg, the whole remaining gap to W8A8 — decode research #3g |
 | Smaller FWHT blocks | ❌ bad trade | +4.8% speed for +58% PPL; natural block confirmed optimal — decode research #3g |

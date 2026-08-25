@@ -814,13 +814,52 @@ bit-identical — and are (E4B 35.0480, Qwen 22.6774, exact).
 | PPL, 32 chunks | 17402 | **16.90** | 15.86 |
 | pp128 / tg64 | 43.23 / 12.08 (garbage) | 43.21 / 12.13 (correct) | — |
 
-**An unexplained bonus, recorded as measured.** The same change lifts E4B
-decode from 5.47 to **6.89 t/s (+26%)**, reproducibly, with prefill
-unchanged and perplexity bit-identical (26.8771) and the same 603 graph
-splits — so no op changed backend and no arithmetic changed. Something
-in restructuring the per-node body is worth a quarter of decode
-throughput at M=1 and the mechanism is not yet identified; it is written
-down here as an observation, not a claim about why.
+**A bonus that turned out to be spin-wait amplification (chased
+2026-08-25).** The same change lifts E4B decode from 5.47 to **6.89 t/s
+(+26%)**, reproducibly, with prefill unchanged, perplexity bit-identical
+(26.8771), the same 603 graph splits, and byte-identical greedy decode
+output over 48 tokens — so no op changed backend and no arithmetic
+changed. E4B has no batched matmuls at all (`RKNPU_DEBUG_OPS` over a
+full chunk: 3087 accepted mul_mats, every one `ne[2] == 1`), so on this
+model the new loop provably runs once at zero offset. The gain is
+therefore pure codegen, and it decomposes as follows.
+
+Neither micro-edit inside the change reproduces it on its own — hoisting
+`get_tensor_real_ptr(src1)` out of the k-segment loop gives 5.49, making
+the destination pointer `const` gives 5.48, against a 5.53 baseline and
+6.89 for the full restructuring. So it is the re-scoping of the ~230-line
+per-node body as a whole, not any single line.
+
+`perf stat` over an identical 64-token decode shows the pre-fix build
+retiring **71.3 G more instructions** (389.7 G vs 318.4 G, +22%) at
+identical IPC (2.00 vs 1.98) and identical page-fault counts — more code
+executed, not more stalling. Re-running with all spin-waiting disabled
+(`GOMP_SPINCOUNT=0 OMP_WAIT_POLICY=passive`, `SPIN_ITERS = 0`) collapses
+that gap to **8.1 G (+4.3%)** and the throughput gap from +24.5% to
++10.7% (4.28 → 4.74 t/s). Roughly 89% of the extra instructions were
+spin burn.
+
+So the mechanism is a **feedback loop, not a hot spot**: the
+restructuring removes a genuine but modest few percent of real work from
+the per-node critical path; on an 8-core part already running a libgomp
+team and two dispatch-pool workers that spin before sleeping, a longer
+critical path means more spin burn, spin burn steals the very cores the
+A-prep, dequant and CPU graph ops need, and that lengthens the critical
+path further. The amplification is about 2.5x. Two independent
+measurements corroborate it: in the decode profile the pre-fix build
+sits at 60% of samples in libgomp spin versus 46% after (with useful
+`ggml_vec_dot_bf16` work rising 9.5% → 15%), and widening `SPIN_ITERS`
+collapses the pre-fix build (5.52 → 2.87 t/s over a 64x range) while
+barely moving the fixed one (6.87 → 6.57 over 256x).
+
+The practical reading: the fixed build sits in a far healthier operating
+regime — it is nearly insensitive to the spin tuning that the old one
+was violently sensitive to. It also means this path amplifies small CPU
+savings on the per-node critical path by roughly 2.5x, which raises the
+value of avenue #3's remaining per-node CPU work. It equally means
+future micro-regressions there will be amplified just as hard, so decode
+numbers should be re-measured after any change to the per-node body even
+when the arithmetic is untouched.
 
 The shortconv projections now run on the NPU and are computed correctly,
 rather than being either wrong or pushed to the CPU. MoE models are no
