@@ -752,6 +752,81 @@ accessible, and would take the whole 940-node ViT in one split instead
 of 227. Everything up to the allowlist is already done and documented
 here. If it does not, run vision on the CPU and ignore the NPU for CLIP.
 
+### 4c. MoE fixed — it was batched matmuls, not the experts (2026-08-24)
+
+#4b recorded LFM2-8B-A1B producing garbage on the NPU (PPL ~17400 vs
+15.86 on CPU) and two failed fix attempts. Diagnosed properly this time
+and fixed. **It was never about the expert tensors.**
+
+**Building the instrument first.** `--override-tensor` turned out to be
+useless here — `-ot ".*=CPU"` leaves the RKNPU allocation at 560 MiB,
+unchanged, and every variant returned PPL identical to seven figures,
+which is what exposed the tool as inert rather than the model as
+insensitive. So the backend gained `RKNPU_EXCLUDE=<substr>[,...]`: a
+diagnostic filter in `resolve_op_support` that keeps matching weights off
+the NPU entirely, with their original bytes. With a working instrument
+the bisection took one run per class:
+
+| Excluded from the NPU | PPL (8 chunks) |
+|---|---|
+| nothing | 19313.86 |
+| everything | 20.78 ✓ |
+| **shortconv only** | **21.90 ✓** |
+| attn only | 15909 |
+| token_embd only | 18239 |
+| dense ffn only | 18726 |
+
+**Root cause.** Instrumenting the accepted ops (`RKNPU_DEBUG_OPS=1`,
+also added) showed the shapes immediately:
+
+```
+shortconv.in_proj  src1[2048,128,4]  dst[6144,128,4]     <- ne[2] = 4
+attn_k             src1[2048,2,1]    dst[512,2,1]        <- ne[2] = 1
+```
+
+LFM2's short-convolution projections are **batched** matmuls, and
+`graph_compute` took `M = src1->ne[1]` and cleared only `M*N`: it
+computed the first of four slices and left the other three as whatever
+was in the buffer. Dense models emit `ne[2]==1` exclusively, which is why
+six sessions on Gemma and Qwen never tripped it. A stride hypothesis was
+checked first and ruled out — every accepted op had a contiguous dst with
+the expected row stride.
+
+**Why the earlier attempt produced NaN**, which is the part that had been
+missing: rejecting those ops sends them to the CPU, but the host copy
+only exists under dual residency — `set_tensor`'s memcpy is conditional
+and `get_alloc_size` does not even reserve room for it otherwise. The CPU
+then read packed NPU bytes. Rejecting was never going to work without
+also making dual residency unconditional, which would have cost every
+model a full-size host copy and given back the −29% W4A4 memory win.
+
+**The fix: compute the batches.** `graph_compute` now loops over
+`src1->ne[2] * ne[3]`, advancing the activation and destination pointers
+by `nb[2]`/`nb[3]` per slice; `supports_op` enforces what the loop
+assumes (src0 2D, dst batch shape equal to src1's, no broadcasting). The
+change is safe by construction for everything measured before it: with
+`nbatch == 1` the loop runs once at zero offset, so dense results must be
+bit-identical — and are (E4B 35.0480, Qwen 22.6774, exact).
+
+| LFM2-8B-A1B | before | after | CPU reference |
+|---|---|---|---|
+| PPL, 8 chunks | 19313.86 | **22.12** | 20.78 |
+| PPL, 32 chunks | 17402 | **16.90** | 15.86 |
+| pp128 / tg64 | 43.23 / 12.08 (garbage) | 43.21 / 12.13 (correct) | — |
+
+**An unexplained bonus, recorded as measured.** The same change lifts E4B
+decode from 5.47 to **6.89 t/s (+26%)**, reproducibly, with prefill
+unchanged and perplexity bit-identical (26.8771) and the same 603 graph
+splits — so no op changed backend and no arithmetic changed. Something
+in restructuring the per-node body is worth a quarter of decode
+throughput at M=1 and the mechanism is not yet identified; it is written
+down here as an observation, not a claim about why.
+
+The shortconv projections now run on the NPU and are computed correctly,
+rather than being either wrong or pushed to the CPU. MoE models are no
+longer a documented no-go; the earlier warning in
+`RKNPU2-optimization-notes.md` is retired.
+
 ### 4. Read fewer bytes
 
 - **Hybrid per-layer patterns** (`RKNPU_HYBRID="W8A8_STANDARD,W4A4_HADAMARD"`):
