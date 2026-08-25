@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <arm_neon.h>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 
 namespace {
@@ -62,8 +63,33 @@ const std::vector<std::string>* Rknpu2DeviceConfig::get_active_pattern(int tenso
     return &it->second;
 }
 
+// RKNPU_EXCLUDE=<substr>[,<substr>...] — diagnostic filter. Any weight
+// whose name contains one of the substrings is never offloaded: it keeps
+// its original bytes (get_tensor_packed_size falls back to ggml_nbytes and
+// set_tensor to a plain memcpy) and its ops are rejected by supports_op, so
+// the CPU computes from valid data. Exists because `--override-tensor` does
+// not move tensors out of this backend's buffers — the RKNPU allocation is
+// unchanged by `-ot ".*=CPU"` — which makes it useless for bisecting which
+// tensor class is responsible for a wrong-output bug.
+static const std::vector<std::string>& excluded_name_substrings() {
+    static const std::vector<std::string> list = []() {
+        std::vector<std::string> v;
+        const char* env = std::getenv("RKNPU_EXCLUDE");
+        if (env != nullptr) v = split_string(env, ',');
+        return v;
+    }();
+    return list;
+}
+
 const Rknpu2HardwarePipeline* Rknpu2DeviceConfig::resolve_op_support(const struct ggml_tensor* w_tensor) const {
     if (!w_tensor) return nullptr;
+
+    const auto& excludes = excluded_name_substrings();
+    if (!excludes.empty() && w_tensor->name[0] != '\0') {
+        for (const auto& sub : excludes) {
+            if (std::strstr(w_tensor->name, sub.c_str()) != nullptr) return nullptr;
+        }
+    }
 
     auto find_pipeline = [this](const std::string& name) -> const Rknpu2HardwarePipeline* {
         for (const auto& pipe : hardware_pipelines) {
