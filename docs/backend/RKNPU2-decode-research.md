@@ -1062,12 +1062,53 @@ becomes a server.
 | `RKNPU_EXCLUDE` | unset | Diagnostic: comma-separated name substrings; matching weights are never offloaded and keep their original bytes. Bisects which tensor class causes a wrong-output bug — `--override-tensor` cannot do this, it leaves the RKNPU allocation untouched (#4c) |
 | `RKNPU_DEBUG_OPS` | unset | Diagnostic: log the geometry of every accepted mul_mat (dims, dst contiguity, row stride) (#4c) |
 | `RKNPU_SHARED_SIGNS` | 0 | 1 = one Hadamard sign vector per K instead of per tensor. Model-dependent: E4B +43% PPL (bad), Qwen −8% (good). Blocks/enables transform reuse — #3h |
+| `RKNPU_DOMAINS` | unset | Restrict NPU allocations to the listed IOMMU domains (`0,2` or `0-3`). Unset = the allocator uses domains 0-15 freely. **Setting it makes concurrent NPU access from multiple processes panic the kernel** — the backend prints a warning saying so. Diagnostic/experimental only; see the domain note below |
 | `OMP_NUM_THREADS=4` | unset | no longer required (the #3 code fix); still harmless |
 
 `RKNPU_HADAMARD_BLOCK=0 RKNPU_PER_CHANNEL=0 RKNPU_A_CLIP=1.0
 RKNPU_B_CLIP=1.0` together reproduce the pre-2026-08-16 W4A4 numerics
 bit-exactly (regression anchor — verified after every change since).
 W8A8 and the routed path are unaffected by all of the above.
+
+### The IOMMU domain limit is ~2 GiB, not 4 GB (measured 2026-08-26)
+
+Two older documents state a "4 GB per-IOMMU-domain limit" and use it to
+argue that W4A4's value is fitting larger models underneath it. The
+number is wrong and the framing is misleading, so both are corrected
+here and in place.
+
+`IOMMUDomainManager::max_domain_size` is
+`std::numeric_limits<int32_t>::max() - 65536` = **2,147,418,111 bytes,
+just under 2 GiB** — the *signed* 32-bit limit, not the 4 GiB a 32-bit
+device address space would allow. (The signed half is the classic
+signature of int32 offset arithmetic inside `librknnrt`; the mechanism is
+inference, the cap is not.) Every NPU allocation goes through
+`assign_domain_memory`, which walks domains **0-15** and takes the first
+with room.
+
+Confirmed by forcing a model that exceeds one domain into one domain —
+E4B's W4A4 footprint is ~2.5 GB:
+
+```sh
+RKNPU_DOMAINS=0 build/bin/llama-bench -m gemma-4-E4B-it-Q4_0.gguf ...
+# RKNPU ERROR: Out of memory in allowed IOMMU domains!
+# GGML_ASSERT(alloc.mem != nullptr ...) failed
+```
+
+The same model loads fine on the default path, which spreads it over two
+domains. So the practical ceilings are:
+
+| Level | Limit | Binding? |
+|---|---|---|
+| one IOMMU domain | ~2 GiB | yes, but routed around automatically |
+| all 16 domains | ~32 GiB | no |
+| board RAM (CPU+NPU shared) | 15 GB | **yes — the real ceiling** |
+
+**There is no practical 4 GB NPU cap.** What limits model size on this
+board is system RAM, and what makes W4A4 valuable is bandwidth and RAM
+footprint — not domain space. This also corrects the reasoning in #4d/#4f
+about MoE experts: 10.2 GB of int4 experts could be spread across six
+domains without trouble; it is the 15 GB of physical RAM that blocks it.
 
 ## Experiment tooling (2026-08-10..21; reusable)
 

@@ -203,6 +203,12 @@ Outcomes and consequences:
   width). Then W4A4 can never win on speed, and its only honest use on
   RK3588 is fitting larger models under the 4 GB/IOMMU-domain limit. Ideas
   1-3 should be dropped.
+  *(Outcome: this branch was not taken. The slowness was the runtime's
+  serial per-run A repack, not the silicon — the native A/C layout took
+  E4B prefill 7.7 → 31.9 t/s, so W4A4 does win on speed. The "4 GB"
+  figure is also wrong: the cap is ~2 GiB per domain and the allocator
+  uses 16 of them, so it was never a model-size ceiling — see decode
+  research "The IOMMU domain limit".)*
 
 Cost: ~15 minutes. Everything else in this document is gated on it.
 *(Done — see the resolved section above.)*
