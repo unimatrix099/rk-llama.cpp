@@ -135,6 +135,15 @@ token), so a practical design would use a block-diagonal transform
 (QuaRot-style) to cut that read ~16x. Given the measured ceiling above,
 this is not worth the complexity on RK3588.
 
+> ⚠️ **Both claims in the next paragraph were later falsified.** The limit
+> is ~2 GiB per IOMMU domain, not 4 GB — and it is not a model-size
+> ceiling at all, because the allocator spreads tensors over domains 0-15
+> (measured 2026-08-26, see decode research "The IOMMU domain limit").
+> W4A4 also stopped being a capacity-only mode once the native A/C layout
+> landed: E4B prefill went 7.7 → 31.9 t/s and W4A4 now beats W8A8 on
+> decode at equal quality. Kept as written because the later work is only
+> legible against it.
+
 **Practical guidance:** treat W4A4 as a capacity mode (halves NPU memory vs
 INT8, fits larger models under the 4 GB per-IOMMU-domain limit), not a speed
 mode. For throughput, use `W8A8_STANDARD` — for Q4_0 GGUFs:
