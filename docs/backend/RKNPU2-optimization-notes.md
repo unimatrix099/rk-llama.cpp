@@ -63,6 +63,8 @@ unchanged accuracy.)
 
 | Model | Config | pp128 | tg64 |
 |---|---|---|---|
+| LFM2-24B-A2B Q4_0 (MoE, 24B/2B) | pure CPU — **needs `-c 4096`** | 32.7 | 15.0 |
+| LFM2-24B-A2B Q4_0 | routed `W8A8` | 39.4 | 14.0 |
 | **ERNIE-4.5-21B-A3B Q4_0** (MoE, 21B/3B) | NPU `W8A8` — CPU-parity quality | **25.6** | 7.4 |
 | ERNIE-4.5-21B-A3B Q4_0 | pure CPU | 21.6 | 9.5 |
 | **LFM2-8B-A1B Q4_0** (MoE) | **pure CPU** | 55.1 | **23.44** |
@@ -374,9 +376,10 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | W8A8 per-channel scales (INT8) | ✅ shipped | Qwen W8A8 PPL 12.24→9.08 (CPU 8.88); W8A8 premium now ~2% on both models — decode research #3e |
 | INT8 scale clipping | ❌ removed | wraps without a clamp: PPL 12.2→10106 — decode research #3e |
 | MoE models on the NPU | ✅ fixed | batched mul_mats were computing one slice of four: LFM2 PPL 17402→16.90 (CPU 15.86), dense bit-identical — decode research #4c |
+| LFM2-24B-A2B (24B/2B) | ⚠ works, not worth it | 15.0 t/s decode at 12.54 GB, W8A8 at CPU parity — but wikitext PPL 94.7 vs the 8B's 19.96 at matched context, while task answers are identical. 8B is faster, smaller and equal on everything tried. **Needs explicit `-c`: its 128K default KV cache is 2500 MiB and OOMs to silent empty output** — decode research #4g |
 | MoE + NPU at CPU parity | ✅ achieved on ERNIE | ERNIE-4.5-21B-A3B W8A8: PPL 6.0793 vs CPU 6.0876 at 32 chunks (−0.14%; −0.3% at 8ch — both inside noise, so indistinguishable rather than better) at +18% prefill (25.58 vs 21.61). Only 6.6% of params are NPU-eligible (experts are MUL_MAT_ID→CPU), but they include attention, shared experts and the output projection — decode research #4f |
 | Tensor width predicts W4A4 damage | ✅ rule confirmed | ranked vs CPU: E4B (2560×10240) parity, ERNIE (2560×3072) +11%, E2B (1536×2048) +26%, LFM2 +36%, Qwen-1.5B +145%. Tracks tensor width, not parameter count — ERNIE is 2.6× LFM2 and takes a third the damage. Rule written from 4 models, ERNIE measured after and landed where predicted — decode research #4f |
-| Q4_0 for MoE models | ✅ measured, clean sweep | LFM2 decode 13.44→23.44 (+74%), prefill 44.8→62.1, size −47%, PPL 15.86→14.77. Q4_0 beating Q8_0 on quality is verified (both official, refs reproduce to 4 s.f.); likely imatrix, caveat on calibration-set overlap — decode research #4d |
+| Q4_0 for MoE models | ✅ measured, clean sweep | LFM2 decode 13.44→23.44 (+74%), prefill 44.8→62.1, size −47%, PPL 15.86→14.77. Q4_0 beating Q8_0 on quality is verified (both official, refs reproduce to 4 s.f.) but **unexplained** — neither file is imatrix-calibrated, both from the same upload batch, recipes differ only in `token_embd` (Q6_K vs Q8_0, which favours the *worse*-scoring file). The earlier imatrix explanation is disproved — decode research #4d |
 | W4A4 on MoE dense tensors | ❌ wrong default | +25% PPL on LFM2 Q4_0 (25.30 vs 20.30); MoE dense tensors are small even in a large model, so parameter count does not predict W4A4 safety — decode research #4d |
 | Gemma-4 E2B | ⚠ NPU loses at decode | prefill 3.7x E4B and NPU-worth-it (135 vs 71 CPU), but decode 4.87 NPU vs 13.48 CPU; W4A4 +26% PPL while W8A8 is free and faster. Use `W8A8_STANDARD` + `CPU_DECODE=32` — decode research #4e |
 | unsloth `gemma-4-E2B-it-Q4_0.gguf` | ❌ unusable | malformed export (601 tensors, 40 unclaimed K/V vs its own `shared_kv_layers`), sha256 matches HF so it is a publisher bug, not a bad download; use Google's QAT build — decode research #4e |

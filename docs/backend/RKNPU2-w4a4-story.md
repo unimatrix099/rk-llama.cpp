@@ -569,13 +569,27 @@ recorded figures to four significant figures — 20.7758 at eight chunks,
 15.8591 at thirty-two against a recorded 15.86. The effect survived
 going from 8 chunks to 32.
 
-The likely explanation is that LiquidAI's Q4_0 is imatrix-calibrated
-while the Q8_0 is plain round-to-nearest, and importance-matrix
-quantization genuinely can beat naive higher precision. I have written
-that down as inference rather than fact, with the caveat that matters:
-if their calibration corpus resembles wikitext, some of that advantage
-is the model being measured against its own calibration set. Believing
-it in general needs a second eval on something that isn't wikitext.
+I reached for the obvious explanation — that LiquidAI's Q4_0 is
+imatrix-calibrated while the Q8_0 is plain round-to-nearest, and that
+importance-matrix quantization can genuinely beat naive higher precision.
+I wrote it down as inference rather than fact, which turned out to be the
+right amount of hedging, because a few days later it was dead.
+
+Neither file carries `quantize.imatrix.*` metadata; ERNIE's does, so the
+absence means something. Both were uploaded in the same batch, so they
+are not built from different checkpoints. And their per-tensor recipes
+are identical except for a single tensor — the token embedding table,
+which is Q6_K in the 4-bit file and Q8_0 in the 8-bit one. That is the
+only asymmetry in the entire model, and it points the wrong way: 8.5 bits
+against 6.56, so the file that scores *worse* is the one with the
+higher-precision embeddings.
+
+So the finding stands and the explanation does not. A 4-bit file beats an
+8-bit file from the same checkpoint with the same recipe and no
+calibration, reproducibly, at two sample sizes, and I cannot say why. It
+is worth being clear that this is the honest state rather than quietly
+leaving the tidy story in place, because the tidy story was wrong and
+someone would have repeated it.
 
 The practical finding underneath is sharper than the curiosity. W4A4 cost
 25% perplexity on this model — and LFM2 has eight billion parameters. The
