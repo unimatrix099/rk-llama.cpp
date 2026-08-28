@@ -55,6 +55,11 @@ unchanged accuracy.)
 > research #4c. The historical speed numbers stand and are now also valid
 > outputs.
 
+> 🧭 **For "which config should I actually run", use the model matrix in
+> `RKNPU2-deployment-guide.md` ("Known-good models")** — that is the
+> maintained, copy-pasteable version. The rows below are the historical
+> measurement record and include superseded configurations.
+
 > 📌 **Q4_0 supersedes Q8_0 for LFM2 on every axis** (2026-08-25): decode
 > 13.44 → **23.44** t/s, prefill 44.8 → 62.1, file 8.26 → 4.41 GB, *and*
 > better quality (PPL 32ch 14.77 vs 15.86). Use `RKNPU_HYBRID=W8A8_STANDARD`
