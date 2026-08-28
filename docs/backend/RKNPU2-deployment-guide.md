@@ -171,21 +171,30 @@ If you must run 4-bit on a small model anyway — to fit it in NPU memory —
 models. It makes E4B considerably worse, so only use it on small models,
 and measure.
 
-**It is not really about model size — it is about tensor size.** Five
-models now show the same trap, and sorting them by W4A4 damage sorts
-them by the *width of the tensors the NPU quantizes*, not by parameter
-count:
+**It is not really about model size — it is about tensor size.** Six
+models now show the same trap, and sorting them by the *area of the
+tensors the NPU quantizes* sorts them by W4A4 damage — parameter count
+does not:
 
-| Model | NPU-quantized shapes | W4A4 | W8A8 | CPU | W4A4 vs CPU |
-|---|---|---|---|---|---|
-| Gemma-4 E4B Q4_0 (7.5 B dense) | 2560 × 10240 | 26.88 | 27.61 | 27.01 | ~parity |
-| ERNIE-4.5-21B-A3B Q4_0 (MoE) | 2560 × 3072 | 6.78 | 6.08 | 6.09 | +11% |
-| Gemma-4 E2B Q4_0 (QAT, ~2 B) | 1536 × ~2048 | 74.75 | 60.26 | 59.35 | +26% |
-| LFM2-8B-A1B Q4_0 (MoE, 8 B) | narrower still | 25.30 | 20.30 | 18.62 | +36% |
-| Qwen2.5-1.5B Q4_0 | small | 21.74 | 9.08 | 8.88 | +145% |
+| Model | NPU-quantized shape | area | W4A4 | W8A8 | CPU | W4A4 vs CPU |
+|---|---|---|---|---|---|---|
+| Gemma-4 E4B Q4_0 (7.5 B dense) | 2560 × 10240 | 26.2 M | 26.88 | 27.61 | 27.01 | **~parity** |
+| ERNIE-4.5-21B-A3B Q4_0 (MoE) | 2560 × 3072 | 7.9 M | 6.78 | 6.08 | 6.09 | +11% |
+| LFM2.5-8B-A1B Q4_0 (MoE) | 2048 × 1792 | 3.7 M | 33.90 | 27.96 | 28.02 | +21% |
+| Gemma-4 E2B Q4_0 (QAT, ~2 B) | 1536 × ~2048 | 3.1 M | 74.75 | 60.26 | 59.35 | +26% |
+| LFM2-8B-A1B Q4_0 (MoE, 8 B) | 2048 × 1792 | 3.7 M | 25.30 | 20.30 | 18.62 | +36% |
+| Qwen2.5-1.5B Q4_0 | small | — | 21.74 | 9.08 | 8.88 | +145% |
 
 (Compare only across a row, never down a column — different models score
-on different scales.)
+on different scales, and several of these use different tokenizers.
+Sample sizes differ too: ERNIE and LFM2.5 are 32/16-chunk, the rest are
+as originally measured.)
+
+The ordering is monotonic in tensor area except for the two LFM2 rows,
+which share a shape but were measured at different chunk counts and
+contexts (LFM2 at 8 chunks/default ctx, LFM2.5 at 16 chunks/`-c 512`) —
+so treat +21% and +36% as "both well off parity at ~3.7 M" rather than
+as a real ordering between them.
 
 ERNIE is 2.6x LFM2's total size yet takes a third of the W4A4 damage,
 because its shared-expert tensors are 2560×3072 while LFM2's dense

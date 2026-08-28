@@ -63,6 +63,8 @@ unchanged accuracy.)
 
 | Model | Config | pp128 | tg64 |
 |---|---|---|---|
+| LFM2.5-8B-A1B Q4_0 (MoE, reasoning) | NPU `W8A8` — CPU-parity quality | **63.7** | 18.0 |
+| LFM2.5-8B-A1B Q4_0 | pure CPU | 55.9 | 20.9 |
 | LFM2-24B-A2B Q4_0 (MoE, 24B/2B) | pure CPU — **needs `-c 4096`** | 32.7 | 15.0 |
 | LFM2-24B-A2B Q4_0 | routed `W8A8` | 39.4 | 14.0 |
 | **ERNIE-4.5-21B-A3B Q4_0** (MoE, 21B/3B) | NPU `W8A8` — CPU-parity quality | **25.6** | 7.4 |
@@ -376,6 +378,8 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | W8A8 per-channel scales (INT8) | ✅ shipped | Qwen W8A8 PPL 12.24→9.08 (CPU 8.88); W8A8 premium now ~2% on both models — decode research #3e |
 | INT8 scale clipping | ❌ removed | wraps without a clamp: PPL 12.2→10106 — decode research #3e |
 | MoE models on the NPU | ✅ fixed | batched mul_mats were computing one slice of four: LFM2 PPL 17402→16.90 (CPU 15.86), dense bit-identical — decode research #4c |
+| LFM2.5-8B-A1B | ✅ works, W8A8 at parity | same arch/shape as the 8B with vocab 128000 vs 65536: prefill +3.6%, decode −10% (20.93 vs 23.17) because the doubled embedding is per-token work. W8A8 PPL 27.96 vs CPU 28.02. **Reasoning model** — emits `<think>`, so usable throughput is below tg64. PPL not comparable to LFM2 (different tokenizer) — decode research #4h |
+| Tensor *area* predicts W4A4 damage | ✅ 4th confirmation | E4B 26.2M→parity, ERNIE 7.9M→+11%, LFM2.5 3.7M→+21%, E2B 3.1M→+26%, Qwen-1.5B→+145%. LFM2.5 predicted before measuring — decode research #4h |
 | LFM2-24B-A2B (24B/2B) | ⚠ works, not worth it | 15.0 t/s decode at 12.54 GB, W8A8 at CPU parity — but wikitext PPL 94.7 vs the 8B's 19.96 at matched context, while task answers are identical. 8B is faster, smaller and equal on everything tried. **Needs explicit `-c`: its 128K default KV cache is 2500 MiB and OOMs to silent empty output** — decode research #4g |
 | MoE + NPU at CPU parity | ✅ achieved on ERNIE | ERNIE-4.5-21B-A3B W8A8: PPL 6.0793 vs CPU 6.0876 at 32 chunks (−0.14%; −0.3% at 8ch — both inside noise, so indistinguishable rather than better) at +18% prefill (25.58 vs 21.61). Only 6.6% of params are NPU-eligible (experts are MUL_MAT_ID→CPU), but they include attention, shared experts and the output projection — decode research #4f |
 | Tensor width predicts W4A4 damage | ✅ rule confirmed | ranked vs CPU: E4B (2560×10240) parity, ERNIE (2560×3072) +11%, E2B (1536×2048) +26%, LFM2 +36%, Qwen-1.5B +145%. Tracks tensor width, not parameter count — ERNIE is 2.6× LFM2 and takes a third the damage. Rule written from 4 models, ERNIE measured after and landed where predicted — decode research #4f |

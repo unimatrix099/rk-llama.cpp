@@ -1082,6 +1082,49 @@ demonstrates the 24 B's extra capacity. Revisit only with a
 task-relevant eval. (LiquidAI's repo now points at a newer
 `LFM2.5-8B-A1B` — an untested follow-up candidate.)
 
+#### 4h. LFM2.5-8B-A1B — same shape, doubled vocab, and it thinks (2026-08-28)
+
+LiquidAI's repo now points at LFM2.5-8B-A1B as the successor to #4d's
+model. Architecturally it is the *same* model: `lfm2moe`, 24 layers, 32
+experts, top-4, hidden 2048, moe_ffn 1792. One parameter changed —
+**vocab 128000 vs 65536**. Q4_0 is 4.51 GB, sha256-verified.
+
+| Config | pp128 | tg64 | PPL (`-c 512`, 16ch) |
+|---|---|---|---|
+| pure CPU | 55.86 | **20.93** | 28.02 |
+| **NPU W8A8** | **63.69** | 18.00 | **27.96** |
+| routed W8A8 | 63.40 | 18.86 | — |
+| NPU W4A4 (file default) | 63.38 | 19.40 | 33.90 |
+| *LFM2-8B-A1B pure CPU (ref)* | *53.90* | *23.17* | *—* |
+
+**W8A8 at CPU parity again** (27.96 vs 28.02) — the third model to reach
+it after E4B and ERNIE, giving +14% prefill for free.
+
+**Prefill up 3.6%, decode down 10%** against LFM2 (20.93 vs 23.17). The
+doubled vocabulary doubles the embedding and output projection, and that
+is per-token work on the decode path — the cost lands exactly where the
+bandwidth model says it should.
+
+**It is a reasoning model.** It emits `<think>` blocks before answering
+(correctly: "Straight multiplication: 17*24 = 408"). Benchmark tg64
+therefore overstates *usable* throughput, because a real request pays for
+reasoning tokens before the answer starts. This is the main practical
+difference from LFM2 and it is a workload question, not a speed one.
+
+**Do not compare its PPL to LFM2's.** 28.02 against 19.96 is a tokenizer
+artifact — 128000 vs 65536 vocab puts perplexity on a different scale.
+Only the within-model NPU-vs-CPU column is meaningful.
+
+**Fourth confirmation of the tensor-area rule.** W4A4 costs +21%, placing
+it between ERNIE (7.9 M area, +11%) and E2B (3.1 M, +26%) — its own area
+is 3.7 M. Predicted before measuring, landed where predicted. The full
+ordering is in the deployment guide.
+
+**Verdict:** for raw speed stay on LFM2-8B-A1B (23.17 vs 20.93, no
+thinking-token overhead). For reasoning quality, LFM2.5 with
+`RKNPU_HYBRID=W8A8_STANDARD` gives 63.7 prefill at parity. Neither should
+run the Q4_0 default.
+
 ### 5. Micro-tuning — MEASURED: far bigger than expected (sweep, 2026-08-10)
 
 `rknpu2-affinity-sweep.sh` (trimmed variant), pinned clocks, llama-bench
