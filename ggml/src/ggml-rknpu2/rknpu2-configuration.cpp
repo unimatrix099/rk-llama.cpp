@@ -84,13 +84,13 @@ static const std::vector<std::string>& excluded_name_substrings() {
 const Rknpu2HardwarePipeline* Rknpu2DeviceConfig::resolve_op_support(const struct ggml_tensor* w_tensor) const {
     if (!w_tensor) return nullptr;
 
-    const auto& excludes = excluded_name_substrings();
-    if (!excludes.empty() && w_tensor->name[0] != '\0') {
-        for (const auto& sub : excludes) {
-            if (std::strstr(w_tensor->name, sub.c_str()) != nullptr) return nullptr;
-        }
-    }
-
+    // NOTE: the RKNPU_EXCLUDE test is applied *after* the sequence number is
+    // assigned, further down. Rejecting here would skip the
+    // tensor_sequence_map insert, shifting the sequence number of every
+    // later tensor and therefore its position in a cyclic pattern (Q6_K maps
+    // to {W8A8_STANDARD, W4A4_HADAMARD}). A bisection tool that silently
+    // re-assigns the pipelines of the tensors it is *not* excluding measures
+    // the wrong thing.
     auto find_pipeline = [this](const std::string& name) -> const Rknpu2HardwarePipeline* {
         for (const auto& pipe : hardware_pipelines) {
             if (pipe.pipeline_name == name) return &pipe;
@@ -120,6 +120,15 @@ const Rknpu2HardwarePipeline* Rknpu2DeviceConfig::resolve_op_support(const struc
     // Assigning the next sequence number if this tensor is seen for the first time
     if (tensor_sequence_map.find(name) == tensor_sequence_map.end()) {
         tensor_sequence_map[name] = global_tensor_counter++;
+    }
+
+    // Diagnostic exclusion, applied only now that the sequence number is
+    // fixed, so excluding a tensor cannot change any other tensor's pipeline
+    const auto& excludes = excluded_name_substrings();
+    if (!excludes.empty() && w_tensor->name[0] != '\0') {
+        for (const auto& sub : excludes) {
+            if (std::strstr(w_tensor->name, sub.c_str()) != nullptr) return nullptr;
+        }
     }
 
     // Selecting the pipeline cyclically based on the defined pattern

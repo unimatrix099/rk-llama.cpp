@@ -6,6 +6,7 @@
 #include "rknpu2-quantization.h"
 #include "rknpu2-calibration.h"
 #include "rknpu2-configuration.h"
+#include "rknpu2-dispatch-pool.h"
 #include "rknpu2-native-layout.h"
 
 #include <rknn_api.h>
@@ -365,6 +366,9 @@ struct rknpu_matmul_context {
         if (ret < 0) ctx = 0;
     }
 
+    // The dispatch pool's segment action; see rknpu2-dispatch-pool.h
+    void run() { rknn_matmul_run(ctx); }
+
     ~rknpu_matmul_context() {
         mem_B.reset();
 
@@ -374,132 +378,7 @@ struct rknpu_matmul_context {
     }
 };
 
-// Persistent dispatch threads for the per-node NPU segment runs.
-//
-// Dispatching the segment runs with an OpenMP team of a different size than
-// the surrounding regions makes libgomp tear down and respawn its workers
-// around every region: measured ~550 pthread_create per generated token at
-// M=1 (one per graph split), costing ~30% of NPU-decode throughput and
-// requiring OMP_NUM_THREADS workarounds (profiling chain in
-// docs/backend/RKNPU2-decode-research.md, avenue #3). This pool keeps the
-// dispatch outside OpenMP entirely: the calling thread runs segment 0
-// itself, persistent workers run the rest. Workers are lazily spawned up to
-// max-segments-1 (= NPU cores - 1) and live until the backend is freed.
-struct rknpu_dispatch_pool {
-    void run_all(const std::vector<std::shared_ptr<rknpu_matmul_context>>& ctxs) {
-        const int n = (int)ctxs.size();
-        if (n <= 1) {
-            if (n == 1) rknn_matmul_run(ctxs[0]->ctx);
-            return;
-        }
-        ensure_workers(n - 1);
-
-        // Publish the job: job_ctxs/done written before the release bump of
-        // generation, read by workers after their acquire load of it
-        job_ctxs = &ctxs;
-        done.store(0, std::memory_order_relaxed);
-        // seq_cst for the same Dekker reason as done/master_sleeping below:
-        // we store generation then load sleepers; a worker entering the
-        // sleep path stores sleepers then loads generation
-        generation.fetch_add(1, std::memory_order_seq_cst);
-        if (sleepers.load(std::memory_order_seq_cst) > 0) {
-            std::lock_guard<std::mutex> lock(mutex);
-            cv_start.notify_all();
-        }
-
-        rknn_matmul_run(ctxs[0]->ctx);   // the caller takes segment 0
-
-        // Segments finish together (equal-size N split), so the workers are
-        // usually done by the time our own run returns: spin briefly, then
-        // sleep — the same latency/burn trade the workers make below
-        for (int s = 0; s < SPIN_ITERS; ++s) {
-            if (done.load(std::memory_order_acquire) == n - 1) { job_ctxs = nullptr; return; }
-            __asm__ volatile("yield");
-        }
-        std::unique_lock<std::mutex> lock(mutex);
-        // seq_cst pairing with the worker's done/master_sleeping accesses:
-        // both sides store one variable then load the other (Dekker), so at
-        // least one side must observe the other's store
-        master_sleeping.store(true, std::memory_order_seq_cst);
-        cv_done.wait(lock, [&] { return done.load(std::memory_order_seq_cst) == n - 1; });
-        master_sleeping.store(false, std::memory_order_relaxed);
-        job_ctxs = nullptr;
-    }
-
-    ~rknpu_dispatch_pool() {
-        quit.store(true, std::memory_order_relaxed);
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            cv_start.notify_all();
-        }
-        for (auto& w : workers) w.join();
-    }
-
-  private:
-    // ~0.1 ms of `yield` on an A76, then sleep. Measured trade-off: longer
-    // spins and pre-waking the workers before the job is ready both LOSE
-    // throughput on this 8-core part — the spinning steals exactly the
-    // cores the A-prep/dequant OMP regions and the CPU graph ops need
-    // (prewake variant: routed pp 42.5 -> 37.9, pinned NPU tg 3.9 -> 1.9).
-    // The remaining ~0.1 ms/node of wake latency on the NPU-decode path
-    // could be removed structurally (workers doing their own segment's
-    // set_io) rather than by spinning harder — future work, low priority
-    // while routed decode is the recommended mode.
-    static constexpr int SPIN_ITERS = 65536;
-
-    void ensure_workers(int needed) {
-        while ((int)workers.size() < needed) {
-            const int idx = (int)workers.size();
-            workers.emplace_back([this, idx] { worker_loop(idx); });
-        }
-    }
-
-    void worker_loop(int idx) {
-        uint64_t seen = 0;
-        for (;;) {
-            // hot path: spin on the generation counter
-            bool woke = false;
-            for (int s = 0; s < SPIN_ITERS; ++s) {
-                if (generation.load(std::memory_order_acquire) != seen ||
-                    quit.load(std::memory_order_relaxed)) { woke = true; break; }
-                __asm__ volatile("yield");
-            }
-            if (!woke) {
-                std::unique_lock<std::mutex> lock(mutex);
-                sleepers.fetch_add(1, std::memory_order_seq_cst);
-                cv_start.wait(lock, [&] {
-                    return quit.load(std::memory_order_relaxed) ||
-                           generation.load(std::memory_order_seq_cst) != seen;
-                });
-                sleepers.fetch_sub(1, std::memory_order_relaxed);
-            }
-            if (quit.load(std::memory_order_relaxed)) return;
-            seen = generation.load(std::memory_order_acquire);
-
-            // worker idx handles segment idx+1; a pool grown by an earlier
-            // wider node may have more workers than this node has segments
-            const auto* job = job_ctxs;
-            if (job && idx + 1 < (int)job->size()) {
-                rknn_matmul_run((*job)[idx + 1]->ctx);
-                done.fetch_add(1, std::memory_order_seq_cst);
-                if (master_sleeping.load(std::memory_order_seq_cst)) {
-                    std::lock_guard<std::mutex> lock(mutex);
-                    cv_done.notify_one();
-                }
-            }
-        }
-    }
-
-    std::vector<std::thread> workers;
-    std::mutex mutex;
-    std::condition_variable cv_start, cv_done;
-    const std::vector<std::shared_ptr<rknpu_matmul_context>>* job_ctxs = nullptr;
-    std::atomic<uint64_t> generation{0};
-    std::atomic<int> done{0};
-    std::atomic<int> sleepers{0};
-    std::atomic<bool> quit{false};
-    std::atomic<bool> master_sleeping{false};
-};
+using rknpu_dispatch_pool = rknpu_dispatch_pool_t<rknpu_matmul_context>;
 
 // Backend main context
 struct ggml_backend_rknpu_context {
@@ -833,6 +712,12 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     const bool a_native = pipeline->ac_layout == RKNN_MM_LAYOUT_NATIVE &&
                         rknpu2_native_geom_from_dims(matmul_ctx_0->io_attr.A.dims,
                                                      matmul_ctx_0->io_attr.A.n_dims, &a_geom) == 0;
+                    // Not a fallback: the context was created with
+                    // AC_layout = NATIVE, so if the geometry does not parse we
+                    // would fill a row-major buffer the NPU reads as
+                    // [K/sub, M, sub] tiles — silently wrong output, no error.
+                    GGML_ASSERT((pipeline->ac_layout != RKNN_MM_LAYOUT_NATIVE || a_native) &&
+                                "RKNPU2: native A layout requested but io_attr.A geometry did not parse");
 
                     // hoisted: the getter guards a function-local static, and
                     // the loop below runs per row per node
@@ -946,6 +831,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                             c_native[idx] = rknpu2_native_geom_from_dims(
                                 matmul_ctxs[idx]->io_attr.C.dims,
                                 matmul_ctxs[idx]->io_attr.C.n_dims, &c_geoms[idx]) == 0;
+                            // As for A above: reading a NATIVE-layout C as
+                            // row-major is silent corruption, not a fallback.
+                            GGML_ASSERT(c_native[idx] &&
+                                "RKNPU2: native C layout requested but io_attr.C geometry did not parse");
                         }
                     }
 
@@ -1692,8 +1581,13 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
                  return false;
             }
 
-            // Checking contiguous memory
-            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
+            // Checking contiguous memory. dst is included: graph_compute
+            // addresses it as `dst_batch + m*N + N_offset` with only nb[2]/
+            // nb[3] honoured for the batch stride, so a permuted or
+            // row-strided dst would be memset and written outside its rows.
+            // RKNPU_DEBUG_OPS used to only *print* "STRIDE MISMATCH" here.
+            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) ||
+                !ggml_is_contiguous(op)) {
                 return false;
             }
 

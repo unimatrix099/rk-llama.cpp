@@ -52,6 +52,15 @@ test-rknpu2-prep-kernels: test-rknpu2-prep-kernels.cpp ../../ggml/src/ggml-rknpu
 check-prep: test-rknpu2-prep-kernels
 	./test-rknpu2-prep-kernels
 
+# Dispatch-pool protocol tests. Header-only + pthreads: no librknnrt needed,
+# so this runs anywhere, not just on the board. -fsanitize=thread is worth a
+# manual run when touching the pool (the defects it pins are races).
+test-rknpu2-dispatch-pool: test-rknpu2-dispatch-pool.cpp ../../ggml/src/ggml-rknpu2/rknpu2-dispatch-pool.h
+	$(CXX) -O2 -std=c++17 $(GGML_INC) -pthread test-rknpu2-dispatch-pool.cpp -o $@
+
+check-dispatch: test-rknpu2-dispatch-pool
+	./test-rknpu2-dispatch-pool
+
 # Run the CPU unit tests
 check: test-rknpu2-native-layout
 	./test-rknpu2-native-layout
@@ -69,7 +78,7 @@ check-hw: test-rknpu2-native-equivalence
 	LD_LIBRARY_PATH=$(LIBS_DIR) ./test-rknpu2-native-equivalence
 
 clean:
-	rm -f $(TOOLS) rknpu2-coop-decode-probe test-rknpu2-native-layout test-rknpu2-native-equivalence
+	rm -f $(TOOLS) rknpu2-coop-decode-probe test-rknpu2-native-layout test-rknpu2-native-equivalence test-rknpu2-dispatch-pool
 	rm -rf .cov
 
-.PHONY: all clean check check-prep check-hw coverage
+.PHONY: all clean check check-prep check-dispatch check-hw coverage
