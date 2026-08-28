@@ -636,6 +636,33 @@ down to Qwen-1.5B at +145%. The rule had been written that morning from
 four models. ERNIE was measured afterwards and landed where it predicted,
 which is the only kind of confirmation worth much.
 
+Two more models tested the rule rather than illustrating it. LFM2-24B-A2B
+— three times the capacity for a third more active parameters — ran at 15
+tokens per second and taught a lesson that had nothing to do with
+quantization: its default context of 128,000 tokens asks for a 2.5 GB KV
+cache, which on top of 12.5 GB of weights exhausts the board and makes
+llama.cpp return **completely empty output, no error, exit code zero**.
+The only symptom is missing text. Capping the context fixes it entirely.
+Its perplexity also came in nearly five times worse than the 8B's while
+its answers to actual questions were indistinguishable, which is a useful
+reminder that perplexity is a proxy and proxies fail.
+
+LFM2.5-8B-A1B was the more interesting one. Same architecture, same
+shape, one changed number — the vocabulary doubled from 65,536 to
+128,000 — and the effects were exactly what the bandwidth model predicts:
+prefill up slightly, decode down 10%, because a doubled embedding table
+is per-token work on the decode path. Its W4A4 penalty came in at 21%,
+which placed it between ERNIE's 11% and E2B's 26%, matching its tensor
+area of 3.7 M against their 7.9 M and 3.1 M. Four models predicted
+correctly now.
+
+It is also a reasoning model, which the benchmark cannot see: it emits
+`<think>` blocks before answering, so its 20.9 tokens per second buys
+fewer *useful* tokens than LFM2's 23.2. And its perplexity of 28.02
+against LFM2's 19.96 means nothing at all, because the tokenizers differ
+— the same trap that makes every cross-model perplexity in these
+documents a comparison you must not make.
+
 The same week's Gemma-4 E2B run made the point from the other direction.
 Its prefill is 3.7x E4B's and the NPU clearly earns its place there — 135
 against 71 on the CPU. Its decode is 4.87 on the NPU against 13.48 on the
