@@ -206,9 +206,27 @@ numbers.)
 
 **Prefer Q4_0 files for MoE models.** On LFM2, moving from the Q8_0 to
 the Q4_0 release gained 74% decode, 39% prefill, half the disk, *and*
-better perplexity (14.77 vs 15.86 at 32 chunks — likely because the Q4_0
-is imatrix-calibrated). The 4-bit *file* and the 4-bit *NPU pipeline* are
+better perplexity (14.77 vs 15.86 at 32 chunks). Why the 4-bit file
+scores better is **unexplained** — neither file is imatrix-calibrated and
+both came from the same upload batch, so the obvious explanations are
+ruled out (decode research #4d). The measurement is reproducible; the
+mechanism is not known. The 4-bit *file* and the 4-bit *NPU pipeline* are
 independent choices: take the small file, then force W8A8.
+
+**Rule 2b: cap the context on large models, or you get silent nonsense.**
+Some models declare a huge default context — LFM2-24B-A2B asks for
+`n_ctx = 128000`, which allocates a **2500 MiB KV cache**. On top of a
+12.5 GB model that exhausts this board's 15 GB, and llama.cpp then
+produces **completely empty output with no error and exit code 0**. The
+only symptom is missing text.
+
+```sh
+# 12 GB+ model: always pass -c, or generation silently returns nothing
+build/bin/llama-completion -m LFM2-24B-A2B-Q4_0.gguf -c 4096 -p "..." -n 40
+```
+
+Budget roughly: model file + KV cache + ~1 GB must stay under 14 GB. If a
+big model produces no output, suspect the KV cache before anything else.
 
 **When in doubt, measure your own model** with step 6c below: run
 perplexity once with your settings and once with

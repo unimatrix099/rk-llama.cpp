@@ -908,12 +908,33 @@ LiquidAI releases (Q8_0 sha256 matches HF), and the in-session Q8_0
 references reproduce the previously recorded figures to four significant
 figures (20.7758 at 8 chunks, 15.8591 at 32 against the recorded 15.86).
 The measurement chain is sound and the effect holds at both sample
-sizes. The likely cause is that LiquidAI's Q4_0 is imatrix-calibrated
-while the Q8_0 is plain round-to-nearest — recorded as inference, not
-established. **Caveat before quoting it:** if the calibration corpus
-resembles wikitext, part of the advantage is measuring against the
-calibration set, so a non-wikitext eval is needed before claiming Q4_0
-is better in general rather than better on this benchmark.
+sizes.
+
+**Cause: unexplained. The imatrix hypothesis is disproved (2026-08-28).**
+This document originally recorded "LiquidAI's Q4_0 is imatrix-calibrated
+while the Q8_0 is plain round-to-nearest" as the likely cause. Three
+checks killed it:
+
+- **Neither file carries `quantize.imatrix.*` metadata.** ERNIE's GGUF
+  does, so the absence here is meaningful — both LFM2 quants are plain
+  round-to-nearest.
+- **The per-tensor recipes are identical but for one tensor.** Every
+  weight is Q4_0 where the other file has Q8_0, except
+  `token_embd.weight`: **Q6_K in the Q4_0 file, Q8_0 in the Q8_0 file.**
+  That is the only asymmetry, and it points the *wrong* way — Q8_0 is
+  ~8.5 bits against Q6_K's ~6.56, so the Q8_0 file has the higher-
+  precision embedding table and still scores worse. (A k-quant's
+  per-superblock scale structure beating a flat per-32-block scale on a
+  65536x2048 table is conceivable, but it is speculation and it is the
+  only candidate left.)
+- **Both files were uploaded in the same batch** (2025-10-06/07,
+  `upload-large-profile` commits), so they are not quantizations of
+  different base revisions.
+
+So a 4-bit file beats an 8-bit file from the same checkpoint, same
+recipe, no imatrix, and the mechanism is not established. The
+*measurement* is solid and reproduces at 8 and 32 chunks; only the
+explanation is missing. Do not repeat the imatrix story.
 
 Two operational conclusions:
 
@@ -1008,6 +1029,58 @@ afterwards, landed where it predicted.
 Recommended: `RKNPU_HYBRID=W8A8_STANDARD` for prefill-heavy work, pure
 CPU if decode dominates. The Q4_0 default (W4A4) is strictly worse on
 both axes here — 11% quality for slightly *less* prefill.
+
+#### 4g. LFM2-24B-A2B — 24 B of capacity at 15 t/s, and a silent OOM trap (2026-08-27)
+
+Chasing capacity at fixed decode cost: the same LFM2 family as #4d, but
+24 B total / 2 B active instead of 8.3 B / 1.5 B. LiquidAI published the
+GGUF on 2026-08-24. Q4_0 is 12.54 GB — the tightest fit attempted on this
+board's 15 GB. Same `lfm2moe` arch, so the #4c batched-matmul fix applies
+unchanged. 40 layers (2 dense + 38 MoE), 64 experts, top-4.
+
+| Config | pp128 | tg64 | PPL 8ch |
+|---|---|---|---|
+| pure CPU | 32.72 | **15.01** | 89.44 |
+| NPU W8A8 | **39.71** | 11.22 | 88.14 |
+| routed W8A8 | 39.44 | 14.03 | — |
+| NPU W4A4 (file default) | 39.35 | 13.28 | 99.07 |
+
+**15 t/s from a 24 B model**, against the 8 B's 23.44 — 3x the parameters
+for 64% of the decode. Backend behaviour is correct and matches ERNIE:
+W8A8 at parity with CPU (88.14 vs 89.44), W4A4 +10.8%.
+
+**The trap: it needs an explicit `-c`.** The model's default
+`n_ctx = 128000` allocates a **2500 MiB KV cache** on top of 12.54 GB of
+weights, which exhausts RAM. Generation then returns *silently empty
+output* — no error, no assert, exit code 0. `-c 4096` fixes it
+completely. This is the worst failure mode in these docs because nothing
+reports it; only the missing text does.
+
+**Perplexity says it is far worse than the 8 B; task output says it is
+not.** At matched `-c 512`, 16 chunks, pure CPU: **24 B = 94.71, 8 B =
+19.96**. Same gpt2 tokenizer, same 65536 vocab, same Q4_0 type, same
+context — so the numbers *are* comparable within this family and the 4.7x
+gap is real, not a harness artifact (two wrong diagnoses were eliminated
+first: mismatched context, and the `dense_2`/`output` loader warnings,
+which are name-formatting noise — the 24 B's tensor inventory is
+structurally identical to the 8 B's). Yet on direct prompts the two are
+indistinguishable:
+
+| Prompt | 24 B | 8 B |
+|---|---|---|
+| `17 * 24` | 408 ✓ | 408 ✓ |
+| largest planet | Jupiter ✓ | Jupiter ✓ |
+| why is the sky blue | correct, cites Rayleigh | correct, cites Rayleigh |
+
+The likeliest reading is heavy instruction/RL post-training, which is
+known to inflate raw language-modelling loss — but that is not
+established, and wikitext is evidently a poor proxy for this model.
+
+**Verdict: stay on LFM2-8B-A1B.** It is faster (23.44 vs 15.01), a third
+of the RAM, and equal on every task tried. Nothing measured here
+demonstrates the 24 B's extra capacity. Revisit only with a
+task-relevant eval. (LiquidAI's repo now points at a newer
+`LFM2.5-8B-A1B` — an untested follow-up candidate.)
 
 ### 5. Micro-tuning — MEASURED: far bigger than expected (sweep, 2026-08-10)
 
