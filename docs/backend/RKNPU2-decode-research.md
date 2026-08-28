@@ -38,6 +38,12 @@ NPU memory**. Companion documents:
 
 ## Where decode stands after the shipped work
 
+> 🧭 This document is the *investigation record* — hypotheses, dead ends
+> and the measurements behind them. If you just want the configuration to
+> run for a given model, use the model matrix in
+> `RKNPU2-deployment-guide.md` ("Known-good models"), which is the
+> maintained operational version.
+
 Decode re-reads the active weight set for every generated token, so it is
 memory-bandwidth bound. For Gemma-4-E4B Q4_0 (7.46 B dense):
 

@@ -16,13 +16,19 @@ Gemma-4 E4B Q4_0, four A76 threads, pinned clocks:
 
 | Configuration | prefill | decode | quality (wikitext PPL) | NPU memory |
 |---|---|---|---|---|
+| **Pure NPU W4A4 (all defaults)** | 37.0 | **6.89** | **26.88** | **2.5 GB** |
 | Routed — NPU prefill, CPU decode | **41.4** | 5.50 | 27.01 (CPU-exact) | high |
-| Pure NPU W4A4 (all defaults) | 37.0 | **5.49** | 26.88 | **2.5 GB** |
 | Pure NPU W8A8 | 41.4 | 4.55 | 27.61 | high |
 | Pure CPU (no NPU) | 25.2 | 4.9 | 27.01 | — |
 
 Both NPU paths now sit at CPU-parity quality; W4A4 additionally uses 29%
-less NPU memory and loads in seconds.
+less NPU memory, loads in seconds, and since the batched-matmul work
+(decode research #4c) is also the fastest decode path — so on E4B the
+defaults are simply the right answer.
+
+For other models see **[the model matrix](#known-good-models)** below;
+E4B is the only one measured where W4A4 is free and the NPU wins both
+phases.
 
 ## 0. Prerequisites
 
@@ -237,6 +243,53 @@ build/bin/llama-completion -m LFM2-24B-A2B-Q4_0.gguf -c 4096 -p "..." -n 40
 Budget roughly: model file + KV cache + ~1 GB must stay under 14 GB. If a
 big model produces no output, suspect the KV cache before anything else.
 
+<a id="known-good-models"></a>
+### Known-good models and their measured best configuration
+
+Everything below was measured on this board at `-t 4` on the A76 cores,
+pp128/tg64, `llama-bench -r 3`. **Copy the command; it is the config that
+won.** Full data and reasoning in decode research #4d–#4h.
+
+| Model | Best command prefix | pp128 | tg64 | Quality vs its own CPU |
+|---|---|---|---|---|
+| **Gemma-4 E4B** Q4_0 (7.5 B dense, multimodal) | *(none — defaults)* | 37.0 | 6.89 | **parity** (26.88 / 27.01) |
+| **LFM2-8B-A1B** Q4_0 (MoE 8.3 B / 1.5 B) | `RKNPU_CPU_DECODE=999999` | 55.1 | **23.4** | best on CPU (14.77) |
+| **LFM2.5-8B-A1B** Q4_0 (MoE, reasoning) | `RKNPU_HYBRID=W8A8_STANDARD` | **63.7** | 18.0 | **parity** (27.96 / 28.02) |
+| **ERNIE-4.5-21B-A3B** Q4_0 (MoE 21.8 B / 3 B) | `RKNPU_HYBRID=W8A8_STANDARD` | 25.6 | 7.4 | **parity** (6.079 / 6.088) |
+| **Gemma-4 E2B** QAT Q4_0 (~2 B dense) | `RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32` | **135.0** | 11.0 | −1.5% (60.26 / 59.35) |
+| **Qwen2.5-1.5B** Q8_0 | `RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32`, pinned `taskset -c 4-7` | **280.8** | 13.5 | −2.3% (9.08 / 8.88) |
+| LFM2-24B-A2B Q4_0 (MoE 24 B / 2 B) | `RKNPU_CPU_DECODE=999999 -c 4096` | 32.7 | 15.0 | parity, but see note |
+
+Pick by what you actually need:
+
+| Goal | Model | Why |
+|---|---|---|
+| Fastest decode | LFM2-8B-A1B, pure CPU | 23.4 t/s; nothing measured beats it |
+| Fastest prefill | Qwen2.5-1.5B / E2B | 280 / 135 — the NPU's strongest showing |
+| Multimodal | Gemma-4 E4B + mmproj | only vision option; vision runs on CPU |
+| Reasoning | LFM2.5-8B-A1B, W8A8 | emits `<think>`, so usable t/s is below 18.0 |
+| Most capacity at parity quality | ERNIE-4.5-21B-A3B, W8A8 | 21.8 B at CPU-exact quality |
+| Best 4-bit behaviour | Gemma-4 E4B | the only model where W4A4 is free |
+
+Notes that will save you a day:
+
+- **Only E4B should run the W4A4 default.** Every other model here needs
+  `RKNPU_HYBRID=W8A8_STANDARD`; the Q4_0 file selects W4A4 silently and
+  it costs 11–145% quality depending on tensor size (table above).
+- **On MoE models the NPU only helps prefill.** Expert weights are 3-D
+  and `MUL_MAT_ID` is unimplemented, so they always run on the CPU — on
+  ERNIE only 6.6% of parameters ever reach the NPU. Pure CPU is often the
+  best decode config for these.
+- **LFM2-24B-A2B is not recommended** despite working: slower than the
+  8 B (15.0 vs 23.4), three times the RAM, and identical answers on every
+  task tried. Revisit only with a task-relevant eval.
+- **Do not compare perplexity between rows.** Different models, several
+  with different tokenizers. Each "quality" figure is only against that
+  model's own CPU baseline.
+- **The unsloth `gemma-4-E2B-it-Q4_0.gguf` does not load** — a malformed
+  export, not a bad download (its sha256 matches). Use Google's QAT build
+  (`google/gemma-4-E2B-it-qat-q4_0-gguf`).
+
 **When in doubt, measure your own model** with step 6c below: run
 perplexity once with your settings and once with
 `RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=999999` (everything on the
@@ -287,10 +340,14 @@ RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32 taskset -c 4-7 \
   build/bin/llama-bench -m ~/models/gemma-4-E4B-it-Q4_0.gguf -p 128 -n 64 -r 3 -t 4
 # expect ~pp 41.4 / tg 5.50
 
-# pure NPU 4-bit (lowest memory)
+# pure NPU 4-bit (lowest memory, best decode — the recommended default)
 build/bin/llama-bench -m ~/models/gemma-4-E4B-it-Q4_0.gguf -p 128 -n 64 -r 3 -t 4
-# expect ~pp 37.0 / tg 5.49
+# expect ~pp 37.0 / tg 6.89
 ```
+
+If decode comes back near 5.5 rather than 6.9 on the second command, you
+are on a build from before the batched-matmul work (decode research #4c)
+— that change is worth +26% here.
 
 **c. Quality** — the check that actually proves correctness. A build
 that is fast but wrong will pass (b) and fail this:
