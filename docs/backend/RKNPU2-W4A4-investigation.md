@@ -95,6 +95,52 @@ load" reports against this backend on models with large tensors, and is
 worth checking against issue #15 (Qwen3-Coder-Next Q6_K load failure —
 Q6_K also routes through `W4A4_HADAMARD` for half its layers).
 
+### Re-tested 2026-08-29: no longer reproduces, but keep the workaround
+
+Code review flagged the `mallopt` as a permanent, process-wide side effect
+of merely *registering* the backend, arguing it inflates RSS for
+long-running servers. Both halves of that were tested: does the crash
+still happen without it, and does it actually cost anything?
+
+| Configuration | mallopt | Runs | Result | Peak RSS |
+|---|---|---|---|---|
+| Default (per-channel scales) | on | 6 | 6/6 ok | 7.91 GiB |
+| Default | **off** | 6 | **6/6 ok** | 7.91 GiB |
+| Legacy entropy (`RKNPU_PER_CHANNEL=0`) | on | 4 | 4/4 ok | 7.91 GiB |
+| Legacy entropy | **off** | 4 | **4/4 ok** | 7.91 GiB |
+| **Full legacy anchor** (also `RKNPU_HADAMARD_BLOCK=0`) | **off** | 6 | **6/6 ok** | 8.93 GiB |
+
+26 runs, zero crashes, against an original 0/6 survival rate.
+
+Two controls make that meaningful rather than a null from testing the
+wrong thing. `RKNPU_PER_CHANNEL=0` demonstrably takes effect — PPL 27.21
+becomes 172.18 — so the entropy/KL scale search really was running. And
+the full legacy anchor's higher peak RSS (8.93 vs 7.91 GiB) confirms it
+restored the larger calibration buffers, i.e. the test did present the
+kind of victim librknnrt was unmapping.
+
+**The RSS argument for removing it does not survive contact.** Peak RSS
+is bit-identical with and without, in every configuration. The
+allocations glibc would have served by `mmap` are simply not a
+significant share of this process's footprint — it is dominated by the
+mmap'd model file and the NPU device buffers, neither of which `mallopt`
+touches. (Cross-*session* RSS does drift, 7.91 vs 9.88 GiB in a later
+run, so only the within-session comparison is meaningful — and within a
+session it is exact.)
+
+**Recommendation: keep it.** The review's case for changing it rested on
+a cost that measurement puts at zero, while the hazard it guards is
+unfixed — librknnrt is closed source and still `munmap`s in that region.
+The crash stopped reproducing because our allocation pattern changed, not
+because the bug was fixed: we stopped presenting a victim. Removing the
+guard re-arms it for whatever future allocation pattern wanders back into
+that address range, for nothing in return.
+
+Caveat on the evidence: 26 passes do not prove absence for an
+intermittent fault. They are strong against an original 6/6 crash rate,
+and that asymmetry is the whole argument — the bug used to be trivially
+reproducible and now is not.
+
 ## Benchmarks (RK3588, `llama-bench -p 128 -n 64`)
 
 ### Gemma 4 E4B Q4_0 (7.46 B params, MoE-style with per-layer embeddings)
