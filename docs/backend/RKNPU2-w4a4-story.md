@@ -671,6 +671,93 @@ moved, and the accelerator becomes a liability. On this board the NPU is
 a prefill engine, and the smaller the model the more sharply that is
 true.
 
+## Act 14: Auditing our own claims, and a race nobody had hit
+
+With the models measured, the last stretch was spent checking the work
+rather than extending it — and it turned up three things worth the space.
+
+**A number we had published twice was wrong.** Two documents stated a
+"4 GB per-IOMMU-domain limit" and used it to argue that four-bit's real
+value was fitting larger models underneath it. The code says otherwise:
+`max_domain_size` is `INT32_MAX - 65536`, just under **2 GiB** — the
+*signed* 32-bit limit, which is the classic fingerprint of int32 offset
+arithmetic somewhere inside librknnrt. Forcing a model past one domain
+proves it binds: E4B's 2.5 GB of W4A4 weights with `RKNPU_DOMAINS=0` dies
+with "Out of memory in allowed IOMMU domains!", and loads fine on the
+default path across two.
+
+But the number being wrong was the smaller error. The *argument* was
+unsound at any value, because the allocator spreads tensors across
+sixteen domains — so it was never a model-size ceiling at all. The real
+ceiling is the board's 15 GB of RAM, and the real case for four-bit is
+bandwidth and footprint. I had also, an hour earlier, told the user that
+ERNIE's experts could not be pre-packed because of an NPU memory limit.
+Same mistake: the domain system would spread those 10.2 GB over six
+domains quite happily. It is physical RAM that blocks it. Right
+conclusion, wrong reason, now corrected in place.
+
+**A code review found a real race in the dispatch pool.** The pool seeds
+each worker with the generation counter it should wait for, and workers
+were being seeded with zero. A worker spawned once the counter had moved
+past zero therefore woke *immediately* on a stale value, and if the
+master had published the job but not yet announced it, ran its segment
+for a job it was never told about.
+
+That breaks the invariant the whole handshake rests on. `done == n-1` is
+supposed to mean "every segment ran"; with a spurious increment it can
+instead mean "one worker ran its own segment twice while its neighbour
+ran nothing", and the master goes on to dequantise a C buffer nobody
+computed. It needs the pool to grow mid-graph to happen at all — a narrow
+node before a full-width one — which is why thousands of benchmark runs
+never hit it.
+
+The interesting part was writing the test. The first version passed
+against the unfixed code, which makes it worthless: the window between
+publishing a job and announcing it is two stores wide, far shorter than
+the time it takes to create a thread, so the worker always arrives too
+late to misbehave. The window has to be held open deliberately — a
+test-only hook, compiled out of real builds — before the defect is
+reachable at all. Even then it still passed, because my warm-up jobs were
+single-segment and single-segment jobs take an early return that never
+touches the generation counter. Fixed that, and the pre-fix code finally
+failed the way the theory said it would:
+
+```
+segment 1 ran 0 times, expected 1
+segment 2 ran 2 times, expected 1
+```
+
+One worker twice, its neighbour never. A test that cannot fail is not
+evidence, and it took two corrections to get one that could.
+
+**And the review's most confident finding was the one measurement
+overturned.** It flagged `mallopt(M_MMAP_MAX, 0)` — the guard against
+librknnrt unmapping address ranges that alias glibc's large mallocs — as
+a permanent, process-wide side effect that inflates memory for
+long-running servers, and recommended narrowing its scope.
+
+Both halves turned out to be testable. Does the crash still happen
+without it? Twenty-six runs say no, including the full pre-August legacy
+configuration that recreates the original large calibration buffers,
+against an original rate of zero survivals in six. Does it cost anything?
+Peak RSS is bit-identical with and without it, in every configuration —
+because this process is dominated by the mmap'd model file and NPU device
+buffers, and `mallopt` touches neither.
+
+So the guard stays, and it stays for a reason worth stating: the crash
+stopped reproducing because *our* allocation pattern changed — per-channel
+scales retired the entropy search, block-diagonal FWHT retired the
+padding — not because the bug was fixed. librknnrt is still closed source
+and still unmaps in that range. We stopped presenting a victim, which is
+not the same as being safe. Removing a guard that measures free, to fix a
+cost that measures zero, would have been a bad trade dressed up as
+hygiene.
+
+Three checks, three different outcomes: a published number retracted, a
+latent bug fixed, and a recommendation declined on evidence. That last
+one only works because the cost was measurable. Reviews are hypotheses
+too.
+
 ## Where it ended up
 
 Gemma-4 E4B Q4_0, RK3588, `-t 4` on the big cores:
@@ -703,7 +790,12 @@ better perplexity than the Q8_0 it replaces.
 
 One caveat belongs next to those numbers rather than in a footnote: the
 4-bit parity is demonstrated on one 7.5 B model and does not hold at
-~2 B.
+~2 B. Seven models were measured in the end, and the rule that emerged —
+that W4A4 damage tracks the *area of the tensors the NPU quantizes*, not
+the model's parameter count — is the one finding here that predicted a
+result before it was measured, twice. The per-model configurations live
+in `RKNPU2-deployment-guide.md` under "Known-good models"; that is the
+maintained copy, and this document is the story of how they were found.
 
 ## What did not work, so nobody repeats it
 
@@ -717,6 +809,13 @@ One caveat belongs next to those numbers rather than in a footnote: the
 - **int8 scale clipping** — wraps without a clamp (PPL 10106).
 - **Minimum-block Hadamard** — dominated by pure block-diagonal.
 - **Spinning/pre-waking the dispatch pool** — steals cores from prep.
+- **Removing the `mallopt` crash guard** — declined on measurement: the
+  crash no longer reproduces without it (26/26), but peak RSS is
+  bit-identical with and without, so the cost that justified removing it
+  is zero and the hazard it guards is still unfixed upstream.
+- **A regression test that passes on the unfixed code** — twice. The
+  dispatch-pool race needs a deliberately widened window to be reachable
+  at all; without one the test proves only that the code compiles.
 - **Two MoE fix attempts** — rejecting 3D weights had no effect at all;
   additionally rejecting non-2D operands turned wrong output into NaN.
   Both reverted, and both were guesses at an unlocated bug. Fixed
@@ -775,3 +874,18 @@ One caveat belongs next to those numbers rather than in a footnote: the
 9. **Write down the failures with their numbers.** Well over half of
    this document is dead ends, and that half is what stops the next
    person from spending a week on them.
+10. **A test that cannot fail is not evidence.** Every regression test
+    here was run against the *unfixed* code first. The dispatch-pool test
+    passed on the broken version twice before it was worth keeping —
+    once because the race window is narrower than thread creation, once
+    because the warm-up jobs took an early return that never advanced the
+    counter the test depended on.
+11. **Verify the harness before believing the result.** A crash
+    reproduction returned `rc=127` on all twelve runs — the board has no
+    `/usr/bin/time`. Both arms failing *identically* is the tell: when a
+    result is suspiciously symmetric, suspect the instrument.
+12. **A review is a hypothesis, not a verdict.** Of the findings raised
+    against this code, most were real and were fixed; the most confident
+    one was declined, because the cost it was premised on measured
+    exactly zero. Both outcomes needed the same thing — a measurement,
+    not an argument.
