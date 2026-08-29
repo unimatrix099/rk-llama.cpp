@@ -1742,6 +1742,16 @@ GGML_API ggml_backend_reg_t ggml_backend_rknpu2_reg(void) {
     // intermittent SIGSEGV in the calibration buffers during weight upload).
     // Keeping large allocations on the brk heap moves them out of the
     // contested mmap address range.
+    //
+    // Re-tested 2026-08-29 after review flagged it as a process-wide side
+    // effect: the crash no longer reproduces without it (26/26 runs pass,
+    // including the full pre-2026-08-16 legacy anchor that recreates the
+    // original large calibration buffers — against an original 0/6 survival
+    // rate), and peak RSS is bit-identical with and without it in every
+    // configuration tried. Kept anyway: the allocation pattern that used to
+    // get hit is gone, not the hazard — librknnrt is closed source and still
+    // unmaps in that range. Zero measured cost, non-zero latent protection.
+    // See RKNPU2-W4A4-investigation.md, "Re-tested 2026-08-29".
     static const int rknpu_malloc_no_mmap = mallopt(M_MMAP_MAX, 0);
     (void) rknpu_malloc_no_mmap;
 #endif
