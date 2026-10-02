@@ -375,6 +375,12 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | Hadamard transform on NPU | ❌ not worth it | transform-free control still 3.7x slower |
 | Cooperative CPU+NPU decode | ❌ probe: gate failed | +5-9% at fat shapes, <25% gate (decode research #2) |
 | Speculative decoding (draft, ngram, NPU-verify) | ❌ all variants lose | decode research #1 tables |
+| Rebase onto upstream master (2026-10-02) | ✅ done, no regression | 2,707 upstream commits; paired A/B vs the pre-rebase build on the same file: E4B W4A4 PPL 26.8771 on both (32 ch), pp/tg equal or +1-3% in both configs. Needed only NULLs for three new optional vtable slots |
+| Gemma-4 MTP drafters (`--spec-type draft-mtp`) | ✅ best decode on the board | output-identical; n=3 on pure CPU: E4B 6.44→10.67 (+66%), E2B 13.88→19.94 (+44%); NPU: E4B W4A4 n=1 6.89→8.49, E2B W8A8 n=3 6.98→13.42 (+92%). n=3 wins on CPU because the M=4 verify batch matches the repacked Q4_0 4-row tile — decode research #1b |
+| MTP + routed mode | ❌ loses at every n | routed computes M<32 from the RKNPU host copy, which is plain Q4_0, not repacked: M=4 costs 529 ms vs 224 on the repacked path. A repacked routed copy is the clearest open opportunity — decode research #1b |
+| OMP team = ggml thread count (`set_n_threads`) | ✅ shipped | M>1 verify batches re-enabled the per-row OMP regions with a mismatched team: 40,956 clone3 per 64 MTP tokens. Fix: E4B NPU MTP n=1 5.26→8.49, no-draft and PPL unchanged — decode research #1b |
+| Drafter on CPU (`RKNPU_EXCLUDE_TYPES=f16`) | ❌ no effect | n=3 6.00 vs 5.99; kept as a diagnostic. `--device-draft` cannot do it (ACCEL buffer type) — decode research #1b |
+| unsloth `gemma-4-E4B-it-Q4_0.gguf` (current) | ⚠ not the measured file | mixed recipe (Q4_K embeddings, Q4_1/Q5_K, 720 tensors), CPU PPL ~2x ggml-org's; all E4B numbers here use ggml-org's Q4_0 |
 | Backend overhead surgery (OMP churn) | ✅ shipped | dispatch pool + if(M>1): decode clone3 = 0, NPU tg +28%, W4A4 tg +18%, env-free (decode research #3) |
 | QKV fusion | ❌ bounded out | re-profile: can only attack ~5 ms/token of driver misc (decode research #3 re-profile) |
 | W4A4 K-padding (block-diagonal FWHT) | ✅ shipped | tg 4.31→5.51, pp 34.4→38.0, NPU mem −29% — decode research #3b |

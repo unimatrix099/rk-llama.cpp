@@ -112,6 +112,91 @@ Could be revisited if: a ~150M same-tokenizer draft appears for a target
 worth running, or graph-split overhead at bs>1 drops enough (avenue #3)
 to make NPU verification cheap.
 
+> **Revisited 2026-10-02 — both conditions met, see #1b.** Gemma-4 ships
+> 78.8M MTP drafters that share the target's KV cache, and the rebase onto
+> upstream (2026-10-02) brought `--spec-type draft-mtp`. MTP now wins on
+> the CPU and on the NPU; the routed path still loses.
+
+### 1b. MTP drafters (Gemma-4) — MEASURED: up to +92% decode (2026-10-02)
+
+Setup: branch `rebase/w4a4-on-upstream` (upstream master 2026-10-02 plus
+this fork), drafters converted from `google/gemma-4-{E4B,E2B}-it-assistant`
+with `convert_hf_to_gguf.py --outtype f16` (~170 MB each). Targets: ggml-org
+E4B Q4_0 (the file every earlier E4B number used) and Google's E2B QAT
+Q4_0. `llama-server -md <drafter> --spec-type draft-mtp --spec-draft-n-max
+N`, greedy, 4 prompts x 128 tokens, server `predicted_per_second`
+averaged. Script: `rknpu2-gemma4-mtp-bench.sh`. Every MTP run produced
+output **byte-identical** to its no-draft run (4/4 prompts, all 30 cells).
+
+| decode t/s | no draft | n=1 | n=2 | **n=3** | n=4 |
+|---|---|---|---|---|---|
+| E4B pure CPU | 6.44 | 6.35 | 6.12 | **10.67** | 7.87 |
+| E4B pure NPU W4A4 (default) | 6.89 | **8.49** | 7.85 | 8.32 | 6.45 |
+| E4B routed W8A8 + `CPU_DECODE=32` | 5.62 | 5.71 | 5.76 | 4.58 | 4.36 |
+| E2B pure CPU | 13.88 | 13.35 | 12.42 | **19.94** | 15.10 |
+| E2B pure NPU W8A8 | 6.98 | 12.13 | 12.61 | **13.42** | 10.87 |
+| E2B routed W8A8 + `CPU_DECODE=32` | 11.17 | 10.71 | 10.12 | 7.97 | 7.51 |
+
+Acceptance falls with draft length (E4B CPU: 74/65/58/50% for n=1..4;
+lower on the W4A4 NPU: 68/57/50/43%, because its numerics differ slightly
+from the drafter's training target).
+
+**Why n=3 on the CPU — the 4-row tile.** An n=3 draft is verified as an
+M=4 batch, and ggml-cpu's repacked Q4_0 GEMM (`CPU_REPACK` buffer)
+processes rows in tiles of four. Measured batch cost, E4B,
+`llama-bench -p 1,2,3,4,5,6,8 -n 0`:
+
+| ms per batch | M=1 | M=2 | M=3 | **M=4** | M=5 | M=6 | M=8 |
+|---|---|---|---|---|---|---|---|
+| pure CPU (`CPU_REPACK`) | 150 | 231 | 293 | **224** | 308 | 369 | 405 |
+| routed (RKNPU host copy, plain Q4_0) | 175 | 283 | 359 | 529 | 608 | 642 | 882 |
+| pure NPU W4A4 | 172 | 237 | 247 | 262 | 285 | 302 | 338 |
+
+An M=4 batch is *cheaper* than M=2 or M=3 on the repacked path — which is
+why n=1 and n=2 lose and n=3 jumps. The cycle arithmetic checks out
+against the server numbers (E4B prompt 0: 53 verify cycles for 128
+tokens, 9.0 t/s -> 267 ms/cycle = 224 ms verify + ~15 ms per draft step).
+
+**Why routed loses.** In routed mode the weights live in the RKNPU
+buffer, and the CPU computes the M < 32 ops from its plain Q4_0 host copy
+— not the repacked layout, which only exists for tensors in a CPU buffer.
+So routed pays 529 ms for M=4 where pure CPU pays 224. The same effect is
+why pure-CPU decode (6.74 t/s llama-bench) now beats routed decode (5.68)
+on E4B. **This is the clearest open opportunity on the board:** a routed
+mode whose CPU-side copy is repacked would combine NPU prefill (~43 t/s)
+with repacked decode, and therefore with MTP at n=3 (~10.7 t/s).
+
+**The NPU win needed a fix — the #3 churn on a new path.** Before it,
+MTP *lost* on the NPU (E4B n=1..4: 5.26 / 5.45 / 5.99 / 4.94 against
+6.89), although the batch-cost table says an M=2 verify costs only 1.4x
+an M=1 step. Two hypotheses, tested in order:
+
+1. *The F16 drafter runs on the NPU's slow W16A16 path.* It does —
+   `--device-draft none` cannot move it, because the backend registers as
+   an `ACCEL` device and llama prepends ACCEL buffer types to the CPU's
+   list (`src/llama-model.cpp`), and `RKNPU_EXCLUDE` cannot target it
+   because the drafter's block names (`blk.0`-`blk.3`) collide with the
+   target's. Added `RKNPU_EXCLUDE_TYPES=f16` to move it. **Result: no
+   change** (n=3: 6.00 vs 5.99). Rejected.
+2. *libgomp team respawn.* strace: **40,956 `clone3` for 64 tokens** of
+   E4B MTP. Verify batches arrive with M > 1, which re-enables the per-row
+   A-prep and C-dequant OpenMP regions (`if(M > 1)`, #3), and their
+   default team size differs from ggml-cpu's `-t 4` team. Cheap check
+   first: `OMP_NUM_THREADS=4` -> n=1 8.45 t/s. Confirmed.
+
+The fix: the backend now implements `ggml_backend_set_n_threads` (via
+`get_proc_address`) and uses that count as the team size for both
+regions. n=1 5.26 -> **8.49**, n=3 5.99 -> 8.32; no-draft decode 6.89
+unchanged; llama-bench pp128/tg64 unchanged within noise (44.95 / 5.83);
+PPL bit-identical (35.0480, 8 chunks). The env workaround is no longer
+needed.
+
+**Verdicts.** MTP at n=3 is now the best decode on the board for both
+Gemma-4 models (E4B 10.67, E2B 19.94, pure CPU), output-identical, at the
+cost of CPU-speed prefill (E4B 24 t/s, E2B 73 t/s). On the NPU it is a
+solid win (E4B +23% at n=1, E2B +92% at n=3) with NPU prefill retained.
+Routed + MTP should not be used until the routed CPU copy is repacked.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
@@ -1185,7 +1270,8 @@ becomes a server.
 | `RKNPU_DEBUG_OPS` | unset | Diagnostic: log the geometry of every accepted mul_mat (dims, dst contiguity, row stride) (#4c) |
 | `RKNPU_SHARED_SIGNS` | 0 | 1 = one Hadamard sign vector per K instead of per tensor. Model-dependent: E4B +43% PPL (bad), Qwen −8% (good). Blocks/enables transform reuse — #3h |
 | `RKNPU_DOMAINS` | unset | Restrict NPU allocations to the listed IOMMU domains (`0,2` or `0-3`). Unset = the allocator uses domains 0-15 freely. **Setting it makes concurrent NPU access from multiple processes panic the kernel** — the backend prints a warning saying so. Diagnostic/experimental only; see the domain note below |
-| `OMP_NUM_THREADS=4` | unset | no longer required (the #3 code fix); still harmless |
+| `RKNPU_EXCLUDE_TYPES` | unset | Diagnostic: comma-separated ggml type names (`f16`, ...); weights of those types are never offloaded. Keeps an F16 MTP drafter on the CPU where `RKNPU_EXCLUDE` (name collision) and `--device-draft` (ACCEL buffer type) cannot — #1b. Measured no speed effect for Gemma-4 drafters |
+| `OMP_NUM_THREADS=4` | unset | no longer required: the #3 fix covers M=1, and since 2026-10-02 the backend takes ggml's thread count for M > 1 too (#1b); still harmless |
 
 `RKNPU_HADAMARD_BLOCK=0 RKNPU_PER_CHANNEL=0 RKNPU_A_CLIP=1.0
 RKNPU_B_CLIP=1.0` together reproduce the pre-2026-08-16 W4A4 numerics

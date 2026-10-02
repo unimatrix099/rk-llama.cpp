@@ -758,6 +758,55 @@ latent bug fixed, and a recommendation declined on evidence. That last
 one only works because the cost was measurable. Reviews are hypotheses
 too.
 
+## Act 15: The rebase, and the speculative decoding that finally worked
+
+The fork had drifted 2,707 commits behind upstream, and upstream had
+gained the thing Act 1 said this board lacked: a drafter cheap enough to
+pay for itself. Gemma-4 ships 78.8M-parameter MTP "assistant" models that
+read the target's own KV cache, and llama.cpp now drives them with
+`--spec-type draft-mtp`. So the fork was rebased first and tested second.
+
+The rebase itself was small — the backend needed three NULL vtable
+slots — but checking it was not. The first perplexity on the rebased
+build came back at 68, against 26.88 in August. The CPU reference was
+just as bad, which put the NPU in the clear and the *file* under
+suspicion: the guide said to download unsloth's E4B, and unsloth had
+since re-exported it with a different recipe. August's file had 666
+tensors; a log-file archaeology session found the match at ggml-org. On
+that file the rebased build reproduced 26.8771 to every printed digit.
+The guide had been sending people to a file nobody had measured.
+
+Then the sweep, and a number too good to accept: drafting three tokens
+ahead on the CPU gave 10.67 t/s where no drafter gave 6.44, while one and
+two tokens ahead were *slower* than none. A cliff like that is usually an
+instrument. It was not: ggml's repacked Q4_0 kernels work in tiles of
+four rows, so verifying four tokens costs 224 ms where verifying two
+costs 231 and three costs 293. Three drafts plus the token being checked
+is exactly one tile. The cycle arithmetic matched the server's numbers
+to within a few milliseconds.
+
+The NPU lost, and the obvious explanation was wrong. The drafter's F16
+weights were on the NPU's slowest path, and moving them took a new
+environment variable — `--device-draft` cannot do it, because the backend
+registers as an ACCEL device — and changed nothing at all. strace found
+the real cause in one run: 40,956 thread creations for 64 tokens. Act 3's
+libgomp respawn was back. Act 3 had fixed it for single-token decode by
+disabling the backend's OpenMP regions at M = 1; verification batches
+have M = 4, which switched them back on with a team size ggml did not
+share. Setting `OMP_NUM_THREADS=4` proved it in four minutes, and the
+code fix was to take ggml's thread count through the hook llama already
+calls. NPU decode with the drafter went from 5.26 to 8.49 t/s, with
+perplexity bit-identical.
+
+The verdict inverts Act 1 for this model family. With the drafter,
+Gemma-4 E4B decodes at 10.67 t/s and E2B at 19.94 — the fastest dense
+decode measured on the board, byte-identical output — at the price of
+CPU-speed prefill. The routed mode, the one this project recommended for
+months, loses with a drafter at every setting, because its CPU path
+reads an unrepacked copy of the weights. That is now the clearest thing
+left to build: a routed copy in the repacked layout would put NPU prefill
+and the four-row tile in the same process.
+
 ## Where it ended up
 
 Gemma-4 E4B Q4_0, RK3588, `-t 4` on the big cores:

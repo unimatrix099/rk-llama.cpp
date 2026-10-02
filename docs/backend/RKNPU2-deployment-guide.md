@@ -122,7 +122,11 @@ find `librknnrt.so` through a RUNPATH pointing at
 
 ```sh
 mkdir -p ~/models && cd ~/models
-wget https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_0.gguf
+# ggml-org's file is the one every E4B number in these docs was measured on
+# (666 tensors, sha256 a555b900…). The unsloth "Q4_0" is a different, mixed
+# recipe (Q4_K embeddings, Q4_1/Q5_K tensors, 720 tensors) that scores ~2x
+# worse perplexity on the CPU and does not load in pre-rebase builds.
+wget https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_0.gguf
 # optional, for multimodal (vision runs on CPU — see limitations):
 wget https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/mmproj-F16.gguf \
      -O mmproj-E4B-F16.gguf
@@ -260,6 +264,32 @@ won.** Full data and reasoning in decode research #4d–#4h.
 | **Qwen2.5-1.5B** Q8_0 | `RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32`, pinned `taskset -c 4-7` | **280.8** | 13.5 | −2.3% (9.08 / 8.88) |
 | LFM2-24B-A2B Q4_0 (MoE 24 B / 2 B) | `RKNPU_CPU_DECODE=999999 -c 4096` | 32.7 | 15.0 | parity, but see note |
 
+#### Gemma-4 with its MTP drafter (rebased tree, 2026-10-02)
+
+Needs the `rebase/w4a4-on-upstream` branch (upstream `--spec-type
+draft-mtp`) and a drafter converted from Google's
+`gemma-4-{E4B,E2B}-it-assistant` (see "MTP drafters" in section 7).
+Greedy output is byte-identical to running without the drafter. Measured
+with `llama-server`, 4 prompts x 128 tokens — decode research #1b.
+
+| Model | Command prefix + drafter flags | decode t/s | vs no drafter | prefill |
+|---|---|---|---|---|
+| **Gemma-4 E2B** | `RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=999999` + `--spec-draft-n-max 3` | **19.94** | +44% | CPU, 73 t/s |
+| Gemma-4 E2B | `RKNPU_HYBRID=W8A8_STANDARD` + `--spec-draft-n-max 3` | 13.42 | +92% | NPU, 166 t/s |
+| **Gemma-4 E4B** | `RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=999999` + `--spec-draft-n-max 3` | **10.67** | +66% | CPU, 24 t/s |
+| Gemma-4 E4B | *(defaults, W4A4)* + `--spec-draft-n-max 1` | 8.49 | +23% | NPU, 45 t/s |
+
+- **Use n-max 3 on the CPU, not 2 or 4.** The verify batch is n+1 = 4
+  rows, which matches the repacked Q4_0 kernel's 4-row tile; n=1 and n=2
+  are *slower* than no drafter on the CPU.
+- **Do not combine MTP with routed mode (`RKNPU_CPU_DECODE=32`).** It
+  loses at every n (E4B n=3: 4.58 vs 5.62): routed decode computes from
+  the RKNPU buffer's plain Q4_0 copy, not the repacked layout.
+- **Pick by workload.** Long answers to short prompts: the pure-CPU rows.
+  Long prompts (documents, RAG): the NPU rows keep NPU prefill.
+- `--device-draft` does not move the drafter off the NPU — the backend is
+  an ACCEL device. `RKNPU_EXCLUDE_TYPES=f16` does, but measured no gain.
+
 Pick by what you actually need:
 
 | Goal | Model | Why |
@@ -381,6 +411,27 @@ RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32 \
   build/bin/llama-server -m ~/models/gemma-4-E4B-it-Q4_0.gguf \
   --threads 4 --threads-batch 8 --jinja
 ```
+
+#### MTP drafters (Gemma-4, rebased tree only)
+
+```sh
+# one-time: convert Google's official drafter (needs torch: python3 -m venv
+# ~/venv-convert && ~/venv-convert/bin/pip install torch numpy safetensors
+# sentencepiece transformers --extra-index-url https://download.pytorch.org/whl/cpu)
+mkdir -p ~/hf/gemma-4-E4B-it-assistant && cd ~/hf/gemma-4-E4B-it-assistant
+for f in config.json generation_config.json model.safetensors tokenizer.json tokenizer_config.json; do
+  wget -q https://huggingface.co/google/gemma-4-E4B-it-assistant/resolve/main/$f; done
+cd ~/rk-llama.cpp && ~/venv-convert/bin/python convert_hf_to_gguf.py ~/hf/gemma-4-E4B-it-assistant \
+  --outtype f16 --outfile ~/models/gemma-4-E4B-it-assistant-F16.gguf
+
+# D. Fastest E4B decode: pure CPU + MTP, n-max 3
+RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=999999 \
+  build/bin/llama-server -m ~/models/gemma-4-E4B-it-Q4_0.gguf -t 4 --jinja \
+  -md ~/models/gemma-4-E4B-it-assistant-F16.gguf --spec-type draft-mtp --spec-draft-n-max 3
+```
+
+Measured with `-t 4` (so the batch thread count was 4 too);
+`--threads-batch 8` has not been measured with MTP.
 
 **Threading is the single biggest free win: use `-t 4`.** Four A76
 threads beat all eight cores by 19–66% on decode, because the A55s on
