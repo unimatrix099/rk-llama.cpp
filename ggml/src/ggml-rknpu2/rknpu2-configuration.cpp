@@ -81,6 +81,22 @@ static const std::vector<std::string>& excluded_name_substrings() {
     return list;
 }
 
+// RKNPU_EXCLUDE_TYPES=<type>[,<type>...] — same as RKNPU_EXCLUDE, but keyed
+// on the weight's ggml type name (e.g. "f16"). Exists for speculative
+// decoding: an MTP drafter shares block names with its target (blk.0 ...),
+// so a name filter cannot keep the drafter on the CPU without also taking
+// the target's first layers with it, while the type cleanly separates an
+// F16 drafter from a Q4_0 target.
+static const std::vector<std::string>& excluded_type_names() {
+    static const std::vector<std::string> list = []() {
+        std::vector<std::string> v;
+        const char* env = std::getenv("RKNPU_EXCLUDE_TYPES");
+        if (env != nullptr) v = split_string(env, ',');
+        return v;
+    }();
+    return list;
+}
+
 const Rknpu2HardwarePipeline* Rknpu2DeviceConfig::resolve_op_support(const struct ggml_tensor* w_tensor) const {
     if (!w_tensor) return nullptr;
 
@@ -129,6 +145,9 @@ const Rknpu2HardwarePipeline* Rknpu2DeviceConfig::resolve_op_support(const struc
         for (const auto& sub : excludes) {
             if (std::strstr(w_tensor->name, sub.c_str()) != nullptr) return nullptr;
         }
+    }
+    for (const auto& type_name : excluded_type_names()) {
+        if (type_name == ggml_type_name(w_tensor->type)) return nullptr;
     }
 
     // Selecting the pipeline cyclically based on the defined pattern
