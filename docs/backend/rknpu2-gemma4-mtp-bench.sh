@@ -35,9 +35,12 @@ CONFIGS=(
     "routed|RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32"
     "npu-default|"
 )
+# CONFIGS_OVERRIDE="name|env;name|env" replaces the list above
+if [ -n "${CONFIGS_OVERRIDE:-}" ]; then IFS=';' read -ra CONFIGS <<< "$CONFIGS_OVERRIDE"; fi
 
 echo "== phase 1: regression anchors (llama-bench pp128/tg64)" | tee "$OUT/summary.txt"
-for c in "${CONFIGS[@]}"; do
+[ -n "${SKIP_ANCHORS:-}" ] && CONFIGS_P1=() || CONFIGS_P1=("${CONFIGS[@]}")
+for c in "${CONFIGS_P1[@]}"; do
     name=${c%%|*}; envs=${c#*|}
     env $envs taskset -c 4-7 $BIN/llama-bench -m "$TGT" -p 128 -n 64 -r 3 -t 4 -o md \
         > "$OUT/bench-$name.md" 2>&1
