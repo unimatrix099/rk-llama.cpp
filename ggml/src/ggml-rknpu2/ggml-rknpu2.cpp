@@ -397,6 +397,13 @@ struct ggml_backend_rknpu_context {
     // Persistent threads for the per-node segment runs (see struct comment)
     rknpu_dispatch_pool dispatch_pool;
 
+    // Team size for the per-row OpenMP regions, set by llama through
+    // ggml_backend_set_n_threads; 0 means libgomp's default. Matching
+    // ggml-cpu's team matters whenever M > 1 at decode time (speculative
+    // verification batches): a different size makes libgomp tear down and
+    // respawn its team around every node, as in decode research #3.
+    int n_threads = 0;
+
     std::shared_ptr<rknpu_matmul_context> get_matmul_ctx(uintptr_t tensor_id, size_t offset, int M, int K, int N, int core_id, rknn_matmul_type type, rknn_matmul_layout ac_layout, int32_t domain_id) {
         std::lock_guard<std::mutex> lock(mutex);
 
@@ -502,6 +509,7 @@ static std::shared_ptr<rknn_tensor_mem> get_tensor_buffer(
 
 static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
     auto* backend_ctx = (ggml_backend_rknpu_context*)backend->context;
+    const int n_omp = backend_ctx->n_threads > 0 ? backend_ctx->n_threads : omp_get_max_threads();
 
     // Getting the current device configuration once
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
@@ -725,7 +733,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
                     // if(M > 1): at decode a single row costs a few us of NEON;
                     // forming a team per node is what libgomp punishes (#3)
-                    #pragma omp parallel for if(M > 1)
+                    #pragma omp parallel for if(M > 1) num_threads(n_omp)
                     for (int m = 0; m < M; ++m) {
                         const float* src_row = x + (size_t)m * row_stride;
                         std::vector<float> ready_row(K_seg_op);
@@ -838,7 +846,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         }
                     }
 
-                    #pragma omp parallel for if(M > 1)
+                    #pragma omp parallel for if(M > 1) num_threads(n_omp)
                     for (int m = 0; m < M; m++) {
                         // Handling types and quantizations
                         switch (pipeline->npu_type_c) {
@@ -1682,6 +1690,18 @@ static size_t ggml_backend_rknpu_reg_get_device_count(ggml_backend_reg_t reg) {
     return 1;
 }
 
+static void ggml_backend_rknpu_set_n_threads(ggml_backend_t backend, int n_threads) {
+    ((ggml_backend_rknpu_context*)backend->context)->n_threads = n_threads;
+}
+
+static void* ggml_backend_rknpu_reg_get_proc_address(ggml_backend_reg_t reg, const char* name) {
+    UNUSED(reg);
+    if (std::strcmp(name, "ggml_backend_set_n_threads") == 0) {
+        return (void*)ggml_backend_rknpu_set_n_threads;
+    }
+    return NULL;
+}
+
 static ggml_backend_dev_t ggml_backend_rknpu_reg_get_device(ggml_backend_reg_t reg, size_t index) {
     if (index != 0) {
         return NULL;
@@ -1766,7 +1786,7 @@ GGML_API ggml_backend_reg_t ggml_backend_rknpu2_reg(void) {
         /* .get_name         = */ ggml_backend_rknpu_reg_get_name,
         /* .get_device_count = */ ggml_backend_rknpu_reg_get_device_count,
         /* .get_device       = */ ggml_backend_rknpu_reg_get_device,
-        /* .get_proc_address = */ NULL,
+        /* .get_proc_address = */ ggml_backend_rknpu_reg_get_proc_address,
     };
 
     static struct ggml_backend_reg rknpu_backend_reg = {
