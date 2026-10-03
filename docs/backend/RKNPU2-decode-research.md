@@ -1359,6 +1359,79 @@ Pin clocks (`scripts/fix_freq_rk3588.sh`) and `ulimit -n 65536` first.
 
 ## Handover notes (continuing on another machine)
 
+### State as of 2026-10-02 (supersedes the board details below)
+
+- **Branch:** `rebase/w4a4-on-upstream`, local in the dev container, **not pushed**.
+  It is the whole fork rebased onto ggml-org master `4ebdf2c74` (2026-10-02), which
+  had moved 2,707 commits past the fork base `650bf14eb`. On top sit this session's
+  commits: vtable NULLs, the MTP bench script, the OMP team fix,
+  `RKNPU_EXCLUDE_TYPES`, and docs. `feat/w4a4-neon-prep` is unchanged at `7ac58d21c`.
+- **How the rebase was done** (repeat this for the next one):
+  - `feat/w4a4-neon-prep` has a *parentless* root commit `cb909e64f`, a copy of the
+    `rknpu2` tip `81eff6a45` with an identical tree. A one-shot rebase therefore
+    replays the whole tree as add/add conflicts, so do it in two stages:
+    1. `git rebase --onto upstream/master 650bf14eb` on a branch made at `81eff6a45`.
+       This carries the 12 base RKNPU2 commits; the only conflicts were in
+       `ggml/CMakeLists.txt` and `ggml-backend-reg.cpp`.
+    2. `git rebase --onto <stage-1 branch> cb909e64f` on a branch made at the feature
+       tip.
+  - `8c8f7ae5f` (the Gemma-4 QAT / `gemma4-assistant` workaround) was skipped, because
+    upstream's `src/models/gemma4*.cpp` supersedes it.
+  - Upstream's backend API v3 added optional vtable slots: `set/get_tensor_2d`,
+    `set/get_tensor_2d_async`, `alloc_buffer_n` and `get_alloc_size_n`. All are NULL
+    here, and upstream falls back to its old per-tensor paths.
+  - The fork's root `CMakeLists.txt` still carries a sanitizer block that upstream
+    moved to `cmake/common.cmake`. It is harmless while the options stay OFF.
+- **Validation:** a paired A/B against the pre-rebase build, run on the same file in
+  the same session. E4B W4A4 PPL was 26.8771 on both builds (32 chunks). Speed was
+  equal or 1–3% faster in both configs. Unit tests: 269 + 1,420 + 341 checks, all
+  green.
+- **Board sync without pushing:** the container makes a `git bundle create x.bundle
+  <base>..<branch>`, then `scp` copies it to the board. The board fetches upstream by
+  full SHA from GitHub, then fetches the branch from the bundle. The rebased tree is a
+  worktree at `~/rk-llama.cpp-rebase`. The pre-rebase tree and build at
+  `~/rk-llama.cpp` are kept as the A/B baseline.
+- **Board contents** (2026-10-02):
+  - In `~/models/`:
+    - `gemma-4-E4B-it-Q4_0-ggmlorg.gguf`: the measured E4B, sha `a555b900…`.
+    - `gemma-4-E4B-it-Q4_0.gguf`: the current unsloth recipe, 720 tensors. Don't use it
+      for comparisons.
+    - `gemma-4-E2B-it-qat-q4_0.gguf` (Google).
+    - `gemma-4-{E4B,E2B}-it-assistant-F16.gguf`: the MTP drafters, converted from the
+      safetensors in `~/hf/`.
+    - `LFM2.5-8B-A1B-Q4_0.gguf`.
+  - Deleted to free disk (91% full before): ERNIE and `~/Bonsai-demo`.
+  - The converter's Python env (with torch) is `~/venv-convert`.
+  - The clock-pin script is now `~/rk3588-scripts/fix_freq_rk3588.sh`; the old
+    `~/rknn-llm` path is gone. Clocks are **not** pinned after boot, so run it and check
+    for `userspace`.
+- **Logs:** `~/bench-logs/2026-10-02-rebase-ab/` holds the A/B, including the
+  `ggmlorg/` subfolder. `2026-10-02-mtp-E4B{,-dftcpu,-omp4}/`, `2026-10-02-nthreads/`
+  and `2026-10-02-mtp-E2B/` hold the MTP sweeps, batch-cost sweeps and the OMP-fix
+  validation.
+- **The board drifted after its 2026-09-24 reflash.** The pre-rebase build no longer
+  reproduces some August speeds on the same file. E4B W4A4 llama-bench tg64 is now
+  5.69 (was 6.89; `llama-server` still shows 6.89). Pure-CPU decode is now 6.74, which
+  beats routed at 5.68 (it was 4.9 vs 5.50). Quality anchors reproduce exactly.
+  Re-baseline before comparing against any pre-September number.
+- **Operational lessons from this session:**
+  - **"No route to host" to 192.168.0.x from the container is the sandbox firewall.**
+    The user restarts the sandbox without it; credentials are not the issue.
+  - **The container cannot reach huggingface.co.** Download on the board instead.
+  - **The container has no cmake.** A portable cmake tarball from GitHub releases
+    works. It also has only ~2 GB RAM: build with `-j1`, and use
+    `-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16` because native
+    detection turns off fp16.
+  - **Device selection can't keep anything off the NPU.** `--device none` and
+    `--device-draft none` don't work because the backend is an ACCEL device; use
+    `RKNPU_EXCLUDE` or `RKNPU_EXCLUDE_TYPES`.
+  - **Stop servers with a single SIGINT.** Two signals in a row (`timeout` plus
+    `kill`) trigger "Received second interrupt" and a segfault in librknnrt teardown.
+    That is a test-harness artifact, not a bug.
+- **Next opportunity:** a routed mode whose CPU-side copy uses the CPU_REPACK layout.
+  It would put NPU prefill and the M=4 repack tile in one process: E4B ~43 t/s prefill
+  plus ~10.7 t/s decode with MTP (#1b). Model candidates: `RKNPU2-model-landscape.md`.
+
 - Everything lives on `github.com/unimatrix099/rk-llama.cpp`; the current
   tip branch is `feat/w4a4-neon-prep` (stacked on
   `feat/int4-native-layout` ← `feat/mixed-precision-pipelines` ←

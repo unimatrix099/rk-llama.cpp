@@ -77,6 +77,12 @@ cd ~/rk-llama.cpp
 git checkout feat/w4a4-neon-prep
 ```
 
+> **Newer: `rebase/w4a4-on-upstream`** (2026-10-02) is the same fork
+> rebased onto upstream llama.cpp master, validated bit-identical, plus
+> Gemma-4 MTP support (`--spec-type draft-mtp`) and the OMP team fix.
+> Use it if you want MTP or newer model architectures. It is not yet
+> pushed to GitHub — check `git ls-remote origin` for it before cloning.
+
 > The optimizations live on `feat/w4a4-neon-prep`, stacked on
 > `feat/int4-native-layout` ← `feat/mixed-precision-pipelines` ←
 > `fix/w4a4-calibration-crashes` ← upstream `rknpu2`.
@@ -253,6 +259,9 @@ big model produces no output, suspect the KV cache before anything else.
 Everything below was measured on this board at `-t 4` on the A76 cores,
 pp128/tg64, `llama-bench -r 3`. **Copy the command; it is the config that
 won.** Full data and reasoning in decode research #4d–#4h.
+How these models compare on public intelligence benchmarks, which ones
+have MTP drafters, and which new models are worth testing next:
+`RKNPU2-model-landscape.md`.
 
 | Model | Best command prefix | pp128 | tg64 | Quality vs its own CPU |
 |---|---|---|---|---|
@@ -368,16 +377,22 @@ ulimit -n 65536
 # routed (best prefill, CPU-exact decode)
 RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=32 taskset -c 4-7 \
   build/bin/llama-bench -m ~/models/gemma-4-E4B-it-Q4_0.gguf -p 128 -n 64 -r 3 -t 4
-# expect ~pp 41.4 / tg 5.50
+# expect ~pp 41.4 / tg 5.50  (Aug 2026); ~pp 43.1 / tg 5.68 measured 2026-10-02
 
 # pure NPU 4-bit (lowest memory, best decode — the recommended default)
 build/bin/llama-bench -m ~/models/gemma-4-E4B-it-Q4_0.gguf -p 128 -n 64 -r 3 -t 4
-# expect ~pp 37.0 / tg 6.89
+# expect ~pp 37.0 / tg 6.89  (Aug 2026); ~pp 44.7-45.8 / tg 5.8-5.9 measured 2026-10-02
 ```
 
-If decode comes back near 5.5 rather than 6.9 on the second command, you
-are on a build from before the batched-matmul work (decode research #4c)
-— that change is worth +26% here.
+> **Re-baselined 2026-10-02.** After the board's 2026-09-24 reflash,
+> even the *pre-rebase* build measures differently on the same file:
+> llama-bench W4A4 tg64 is ~5.7-5.9 rather than 6.89 (`llama-server`
+> still shows 6.89 on real prompts), prefill is higher, and pure-CPU
+> decode (6.74) now beats routed (5.68). Quality (step c) reproduces to
+> every digit. Compare against the 2026-10-02 figures, not the August
+> ones, and when in doubt run the old and new build back to back on the
+> same file — only a paired comparison is meaningful (decode research,
+> handover notes).
 
 **c. Quality** — the check that actually proves correctness. A build
 that is fast but wrong will pass (b) and fail this:
