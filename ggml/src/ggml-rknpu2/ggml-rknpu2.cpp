@@ -2368,6 +2368,14 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             const struct ggml_tensor * src0 = op->src[0]; // Weights
             const struct ggml_tensor * src1 = op->src[1]; // Activations
 
+            // The weight must be one of ours: only RKNPU weight buffers hold
+            // the packed NPU copy graph_compute runs from (a null buffer is
+            // llama's load-time placement probe). Needed since supports_buft
+            // also accepts host buffers.
+            if (src0->buffer && strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(src0->buffer)), "RKNPU") != 0) {
+                return false;
+            }
+
             // Searching for available hardware pipeline for this tensor
             const auto* pipeline = config.resolve_op_support(src0);
             if (!pipeline) {
@@ -2562,7 +2570,11 @@ static ggml_backend_dev_t ggml_backend_rknpu_reg_get_device(ggml_backend_reg_t r
         /* .get_host_buffer_type = */ NULL,
         /* .buffer_from_host_ptr = */ NULL,
         /* .supports_op          = */ ggml_backend_rknpu_device_supports_op,
-        /* .supports_buft        = */ [](ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) { UNUSED(dev); return buft == &rknpu_buffer_type; },
+        // Host buffers too: every op here reads its inputs from host memory
+        // (get_tensor_real_ptr returns tensor->data outside RKNPU weight
+        // buffers), so the scheduler need not copy CPU-resident activations,
+        // KV cache or small weights into an RKNPU buffer at each split.
+        /* .supports_buft        = */ [](ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) { UNUSED(dev); return buft == &rknpu_buffer_type || ggml_backend_buft_is_host(buft); },
         /* .offload_op           = */ NULL,
         /* .event_new            = */ NULL,
         /* .event_free           = */ NULL,
