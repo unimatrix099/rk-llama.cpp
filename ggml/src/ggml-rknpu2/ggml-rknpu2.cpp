@@ -801,9 +801,9 @@ static void rknpu_softmax_row(const float* s_row, const ggml_fp16_t* mrow, int64
 }
 
 // GEGLU (gate, up) on the backend, so [up, gate, GLU, down] stay in one NPU
-// split. NEON tanh-GELU as in ggml-cpu's ggml_vec_geglu_f32 on ARM
-// (tanh(z) = 1 - 2/(e^{2z}+1) via the same exp, +-10 cut-offs), except
-// that the divide is a Newton-refined reciprocal (within ~1 ulp).
+// split. Same NEON tanh-GELU as ggml-cpu's ggml_vec_geglu_f32 on ARM
+// (tanh(z) = 1 - 2/(e^{2z}+1) via the same exp, +-10 cut-offs), so the
+// output is identical for widths that are multiples of 4.
 static bool rknpu_glu_supported(const struct ggml_tensor* op) {
     if (ggml_get_glu_op(op) != GGML_GLU_OP_GEGLU) return false;
     const struct ggml_tensor *a = op->src[0], *b = op->src[1];
@@ -821,13 +821,7 @@ static inline void rknpu_geglu_row(int64_t n, float* y, const float* x, const fl
     for (; i + 4 <= n; i += 4) {
         const float32x4_t xv = vld1q_f32(x + i);
         const float32x4_t z  = vmulq_f32(vmulq_f32(c0, xv), vfmaq_f32(one, vmulq_f32(c1, xv), xv));
-        // 1/(e^{2z}+1) by reciprocal estimate + two Newton steps instead of
-        // a divide (~1 ulp; FRECPS gives 2.0 for inf*0, so e = inf -> 0)
-        const float32x4_t d  = vaddq_f32(rknpu_v_expf(vmulq_f32(two, z)), one);
-        float32x4_t rc = vrecpeq_f32(d);
-        rc = vmulq_f32(rc, vrecpsq_f32(d, rc));
-        rc = vmulq_f32(rc, vrecpsq_f32(d, rc));
-        const float32x4_t th = vfmsq_f32(one, two, rc);
+        const float32x4_t th = vsubq_f32(one, vdivq_f32(two, vaddq_f32(rknpu_v_expf(vmulq_f32(two, z)), one)));
         float32x4_t gel = vmulq_f32(vmulq_f32(half, xv), vaddq_f32(one, th));
         gel = vbslq_f32(vcleq_f32(xv, vdupq_n_f32(-10.0f)), vdupq_n_f32(0.0f), gel);
         gel = vbslq_f32(vcgeq_f32(xv, vdupq_n_f32(10.0f)), xv, gel);
