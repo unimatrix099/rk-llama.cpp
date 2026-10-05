@@ -1136,22 +1136,27 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         for (size_t idx = 0; idx < num_active_segments; ++idx) {
                             RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, c_slot[c & 1][idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
                         }
-                        const int n_blocks = (rows + 3) / 4;
-                        #pragma omp parallel for num_threads(n_omp)
-                        for (int blk = 0; blk < n_blocks; ++blk) {
-                            const int r0 = blk * 4;
-                            const int nr = std::min(4, rows - r0);
-                            float common[4];
-                            for (int r = 0; r < nr; ++r) common[r] = scales_A[m0 + r0 + r] / hadamard_divisor;
-                            for (size_t idx = 0; idx < num_active_segments; ++idx) {
-                                const int N_offset = active_n_segments[idx].offset_n;
-                                rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
-                                    dst_batch + (size_t)(m0 + r0) * N + N_offset, (size_t)N,
-                                    (const int16_t*)c_slot[c & 1][idx]->virt_addr, r0, nr,
-                                    c_geom[idx].m_stride, c_geom[idx].outer, c_geom[idx].sub,
-                                    active_n_segments[idx].size_n, common,
-                                    scales_B_grid->data() + k_idx * (size_t)N + N_offset);
-                            }
+                        // tile-major over all rows of the chunk: each tile's
+                        // cells are one contiguous block of the native C;
+                        // threads take disjoint tile (column) ranges
+                        std::vector<float> common(rows);
+                        for (int r = 0; r < rows; ++r) common[r] = scales_A[m0 + r] / hadamard_divisor;
+                        const int TPT = 16;   // tiles per task
+                        std::vector<std::pair<int, int>> tasks;   // (segment, first tile)
+                        for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                            for (int t = 0; t < c_geom[idx].outer; t += TPT) tasks.emplace_back((int)idx, t);
+                        }
+                        #pragma omp parallel for num_threads(n_omp) schedule(dynamic, 1)
+                        for (int ti = 0; ti < (int)tasks.size(); ++ti) {
+                            const size_t idx = (size_t)tasks[ti].first;
+                            const int t0 = tasks[ti].second;
+                            const int N_offset = active_n_segments[idx].offset_n;
+                            rknpu2_quantization::dequant_acc_int16_tiled_perchan_tiles(
+                                dst_batch + (size_t)m0 * N + N_offset, (size_t)N,
+                                (const int16_t*)c_slot[c & 1][idx]->virt_addr, rows,
+                                c_geom[idx].m_stride, t0, std::min(t0 + TPT, c_geom[idx].outer), c_geom[idx].sub,
+                                active_n_segments[idx].size_n, common.data(),
+                                scales_B_grid->data() + k_idx * (size_t)N + N_offset);
                         }
                     };
 
