@@ -211,8 +211,30 @@ static void fwht_iterative(float* data, int size) {
             vst1_f32(data + i,     vadd_f32(lo, hi));
             vst1_f32(data + i + 2, vsub_f32(lo, hi));
         }
-        // stages h>=4: contiguous 4-wide butterflies
-        for (int h = 4; h < size; h <<= 1) {
+        // stages h>=4: contiguous 4-wide butterflies, two stages (h, 2h) per
+        // pass over the data (radix-4). Same adds and subtracts in the same
+        // order as two separate passes — stage h makes a+b, a-b, c+d, c-d and
+        // stage 2h combines them — so results are bit-identical, with half
+        // the load/store passes.
+        int h = 4;
+        for (; h * 2 < size; h <<= 2) {
+            for (int i = 0; i < size; i += h * 4) {
+                for (int j = i; j < i + h; j += 4) {
+                    const float32x4_t a = vld1q_f32(data + j);
+                    const float32x4_t b = vld1q_f32(data + j + h);
+                    const float32x4_t c = vld1q_f32(data + j + 2 * h);
+                    const float32x4_t d = vld1q_f32(data + j + 3 * h);
+                    const float32x4_t a1 = vaddq_f32(a, b), b1 = vsubq_f32(a, b);
+                    const float32x4_t c1 = vaddq_f32(c, d), d1 = vsubq_f32(c, d);
+                    vst1q_f32(data + j,         vaddq_f32(a1, c1));
+                    vst1q_f32(data + j + h,     vaddq_f32(b1, d1));
+                    vst1q_f32(data + j + 2 * h, vsubq_f32(a1, c1));
+                    vst1q_f32(data + j + 3 * h, vsubq_f32(b1, d1));
+                }
+            }
+        }
+        // odd stage count: one last single stage
+        for (; h < size; h <<= 1) {
             for (int i = 0; i < size; i += h * 2) {
                 for (int j = i; j < i + h; j += 4) {
                     float32x4_t x = vld1q_f32(data + j);
