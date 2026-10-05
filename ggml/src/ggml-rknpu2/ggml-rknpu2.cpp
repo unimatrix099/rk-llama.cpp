@@ -929,47 +929,6 @@ static void __attribute__((noinline)) rknpu_fused_gate_up_geglu_block(
     }
 }
 
-// Gate and up of rows r0..r0+nr of one N-segment straight from their INT16
-// C cells (one shared native geometry, 8-wide cells) to the GEGLU output,
-// tile by tile: the same operations as dequantizing both (store path) and
-// then rknpu_geglu_row, so element-exact, without the row buffers.
-static void __attribute__((noinline)) rknpu_gate_up_geglu_tiles(
-        float* y, size_t ys, const int16_t* cg, const int16_t* cu, int r0, int nr, const rknpu2_native_geom& geom,
-        int n_limit, const float* common_g, const float* common_u, const float* chan_g, const float* chan_u) {
-#ifdef __ARM_NEON
-    const float32x4_t c0 = vdupq_n_f32(0.79788456080286535587989211986876f), c1 = vdupq_n_f32(0.044715f);
-    const float32x4_t one = vdupq_n_f32(1.0f), two = vdupq_n_f32(2.0f), half = vdupq_n_f32(0.5f);
-    auto gelu_mul = [&](float32x4_t xv, float32x4_t g) {
-        const float32x4_t z  = vmulq_f32(vmulq_f32(c0, xv), vfmaq_f32(one, vmulq_f32(c1, xv), xv));
-        const float32x4_t th = vsubq_f32(one, vdivq_f32(two, vaddq_f32(rknpu_v_expf(vmulq_f32(two, z)), one)));
-        float32x4_t gel = vmulq_f32(vmulq_f32(half, xv), vaddq_f32(one, th));
-        gel = vbslq_f32(vcleq_f32(xv, vdupq_n_f32(-10.0f)), vdupq_n_f32(0.0f), gel);
-        gel = vbslq_f32(vcgeq_f32(xv, vdupq_n_f32(10.0f)), xv, gel);
-        return vmulq_f32(gel, g);
-    };
-    const int outer = n_limit / 8;
-    for (int t = 0; t < outer; ++t) {
-        const int n0 = t * 8;
-        const float32x4_t sg0 = vld1q_f32(chan_g + n0), sg1 = vld1q_f32(chan_g + n0 + 4);
-        const float32x4_t su0 = vld1q_f32(chan_u + n0), su1 = vld1q_f32(chan_u + n0 + 4);
-        for (int r = 0; r < nr; ++r) {
-            const size_t cell = ((size_t)t * geom.m_stride + r0 + r) * 8;
-            const int16x8_t g16 = vld1q_s16(cg + cell), u16 = vld1q_s16(cu + cell);
-            const float32x4_t vcg = vdupq_n_f32(common_g[r]), vcu = vdupq_n_f32(common_u[r]);
-            const float32x4_t x0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(g16))),  vmulq_f32(sg0, vcg));
-            const float32x4_t x1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(g16))), vmulq_f32(sg1, vcg));
-            const float32x4_t u0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(u16))),  vmulq_f32(su0, vcu));
-            const float32x4_t u1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(u16))), vmulq_f32(su1, vcu));
-            float* yr = y + (size_t)r * ys + n0;
-            vst1q_f32(yr,     gelu_mul(x0, u0));
-            vst1q_f32(yr + 4, gelu_mul(x1, u1));
-        }
-    }
-#else
-    GGML_ABORT("rknpu_gate_up_geglu_tiles needs NEON");
-#endif
-}
-
 static bool rknpu_fa_supported(const struct ggml_tensor* op) {
     const struct ggml_tensor *q = op->src[0], *k = op->src[1], *v = op->src[2], *mask = op->src[3], *sinks = op->src[4];
     if (!q || !k || !v || sinks) return false;
@@ -1507,24 +1466,6 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     };
 
 
-                    // single-pass tiles when gate and up share 8-wide cell geometries
-                    bool dg_tiles = false;
-#ifdef __ARM_NEON
-                    if (use_dg) {
-                        static const bool tiles_env = []() {
-                            const char* env = std::getenv("RKNPU_GEGLU_TILES");
-                            return env == nullptr || std::atoi(env) != 0;
-                        }();
-                        dg_tiles = tiles_env && dg.c_geom.size() == num_active_segments;
-                        for (size_t idx = 0; dg_tiles && idx < num_active_segments; ++idx) {
-                            const auto &a = c_geom[idx], &b = dg.c_geom[idx];
-                            dg_tiles = a.sub == 8 && b.sub == 8 && a.m_stride == b.m_stride && a.outer == b.outer &&
-                                       active_n_segments[idx].size_n % 8 == 0 &&
-                                       dg.segs[idx].offset_n == active_n_segments[idx].offset_n &&
-                                       dg.segs[idx].size_n == active_n_segments[idx].size_n;
-                        }
-                    }
-#endif
                     auto collect_fused_dg = [&](int c) {
                         const int m0 = c * MC, rows = std::min(MC, M - m0);
                         for (size_t idx = 0; idx < num_active_segments; ++idx) {
@@ -1537,21 +1478,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                             const int nr = std::min(4, rows - r0);
                             float common[4];
                             for (int r = 0; r < nr; ++r) common[r] = scales_A[m0 + r0 + r] / hadamard_divisor;
-                            if (dg_tiles) {
-                                float* y = (float*)get_tensor_real_ptr(fuse_glu);
-                                const size_t ys = fuse_glu->nb[1] / sizeof(float);
-                                for (size_t idx = 0; idx < num_active_segments; ++idx) {
-                                    const int N_offset = active_n_segments[idx].offset_n;
-                                    rknpu_gate_up_geglu_tiles(y + (size_t)(m0 + r0) * ys + N_offset, ys,
-                                        (const int16_t*)dg.c[c][idx]->virt_addr, (const int16_t*)cslot(c)[idx]->virt_addr,
-                                        r0, nr, c_geom[idx], active_n_segments[idx].size_n,
-                                        dg.common.data() + m0 + r0, common, dg.chan + N_offset,
-                                        scales_B_grid->data() + k_idx * (size_t)N + N_offset);
-                                }
-                            } else {
-                                rknpu_fused_gate_up_geglu_block(fuse_glu, dg, c, m0 + r0, r0, nr, N, common,
-                                    cslot(c), c_geom, active_n_segments, scales_B_grid->data() + k_idx * (size_t)N);
-                            }
+                            rknpu_fused_gate_up_geglu_block(fuse_glu, dg, c, m0 + r0, r0, nr, N, common,
+                                cslot(c), c_geom, active_n_segments, scales_B_grid->data() + k_idx * (size_t)N);
                         }
                     };
                     // deferred gate: C synced for the CPU, kept for the up's collect
