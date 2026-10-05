@@ -838,48 +838,58 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     #pragma omp parallel for if(M > 1) num_threads(n_omp)
                     for (int m = 0; m < (prep_on_team ? 0 : M); ++m) {
                         const float* src_row = x + (size_t)m * row_stride;
-                        std::vector<float> ready_row(K_seg_op);
+                        // Per-thread scratch that only grows: a fresh vector
+                        // per row per node was a heap allocation plus a zero
+                        // fill (std::vector value-initializes) that the code
+                        // below overwrites anyway — ~0.6 M of them per 512
+                        // token prefill. Every buffer is fully written before
+                        // it is read, so contents carried between rows are
+                        // never observed.
+                        static thread_local std::vector<float> signed_row, full_hadamard_row;
+                        static thread_local std::vector<uint8_t> packed_row;
+                        auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
 
-                        // Applying Hadamard Transform
+                        // Applying Hadamard Transform (the A row is read in
+                        // place from the transform output or the source row)
+                        const float* ready_row;
                         if (is_hadamard) {
-                            std::vector<float> signed_row(K);
-                            std::vector<float> full_hadamard_row(K_op);
+                            grow(signed_row, (size_t)K);
+                            grow(full_hadamard_row, (size_t)K_op);
                             rknpu2_quantization::mul_fp32(signed_row.data(), src_row, s_vec.data(), K);
                             rknpu2_calibration::hadamard_transform(full_hadamard_row.data(), signed_row.data(), K, K_op);
-
-                            memcpy(ready_row.data(), full_hadamard_row.data() + k_seg.offset_k, K_seg_op * sizeof(float));
+                            ready_row = full_hadamard_row.data() + k_seg.offset_k;
                         } else {
-                            memcpy(ready_row.data(), src_row + k_seg.offset_k, K_seg_op * sizeof(float));
+                            ready_row = src_row + k_seg.offset_k;
                         }
 
                         // Handling types and quantizations
                         if (pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_FP16) {
                             uint16_t* dst_ptr = (uint16_t*)dst_base;
                             uint16_t* dst_row = dst_ptr + (size_t)m * K_seg_op;
-                            rknpu2_quantization::convert_fp32_to_fp16(ready_row.data(), dst_row, K_seg_op);
+                            rknpu2_quantization::convert_fp32_to_fp16(ready_row, dst_row, K_seg_op);
                         }
                         else if (pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8) {
-                            scales_A[m] = rknpu2_quantization::amax_fp32(ready_row.data(), K_seg_op) / 127.0f;
+                            scales_A[m] = rknpu2_quantization::amax_fp32(ready_row, K_seg_op) / 127.0f;
 
                             int8_t* dst_ptr = (int8_t*)dst_base;
                             int8_t* dst_row = dst_ptr + (size_t)m * K_seg_op;
-                            rknpu2_quantization::quantize_fp32_to_int8(ready_row.data(), dst_row, K_seg_op, scales_A[m]);
+                            rknpu2_quantization::quantize_fp32_to_int8(ready_row, dst_row, K_seg_op, scales_A[m]);
                         }
                         else if (pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
                             // clip < 1 saturates the far tail for finer steps
                             // on the mass (RKNPU_A_CLIP, decode research #3d)
                             scales_A[m] = a_clip *
-                                          rknpu2_quantization::amax_fp32(ready_row.data(), K_seg_op) / 7.0f;
+                                          rknpu2_quantization::amax_fp32(ready_row, K_seg_op) / 7.0f;
 
                             uint8_t* dst_ptr = (uint8_t*)dst_base;
                             if (a_native) {
-                                std::vector<uint8_t> packed_row(K_seg_op / 2);
-                                rknpu2_quantization::quantize_fp32_to_int4_packed(ready_row.data(), packed_row.data(), K_seg_op, scales_A[m]);
+                                grow(packed_row, (size_t)K_seg_op / 2);
+                                rknpu2_quantization::quantize_fp32_to_int4_packed(ready_row, packed_row.data(), K_seg_op, scales_A[m]);
                                 rknpu2_native_scatter_row(dst_ptr, packed_row.data(), m,
                                                           a_geom.m_stride, a_geom.outer, a_geom.sub / 2);
                             } else {
                                 uint8_t* dst_row = dst_ptr + (size_t)m * (K_seg_op / 2);
-                                rknpu2_quantization::quantize_fp32_to_int4_packed(ready_row.data(), dst_row, K_seg_op, scales_A[m]);
+                                rknpu2_quantization::quantize_fp32_to_int4_packed(ready_row, dst_row, K_seg_op, scales_A[m]);
                             }
                         }
                     }
