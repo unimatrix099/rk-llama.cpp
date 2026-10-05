@@ -1059,9 +1059,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
             pipeline->ac_layout == RKNN_MM_LAYOUT_NATIVE &&
             (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4 || pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8) &&
             rknpu2_calibration::per_channel_b_scales() && n_omp > 1;
-        // Fuse the following GEGLU into this (gate) matmul's dequant when it
-        // is the GLU's src0, up (src1) is already computed, and nothing else
-        // can need the gate values (single K-segment, not a graph output)
+        // Fuse the following GEGLU into this (up) matmul's dequant: llama
+        // emits [gate, up, GLU], so when up is dequantized gate (the GLU's
+        // src0) is already in memory and up need never be written. Only if
+        // nothing else can need up (single K-segment, not a graph output).
         struct ggml_tensor* fuse_glu = nullptr;
         static const bool fuse_enabled = []() {
             const char* env = std::getenv("RKNPU_FUSE_GLU");
@@ -1069,7 +1070,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
         }();
         if (fuse_enabled && pipelined_node && node_i + 1 < cgraph->n_nodes) {
             struct ggml_tensor* nx = cgraph->nodes[node_i + 1];
-            if (nx->op == GGML_OP_GLU && nx->src[0] == node && nx->src[1] != node && rknpu_glu_supported(nx) &&
+            if (nx->op == GGML_OP_GLU && nx->src[1] == node && nx->src[0] != node && rknpu_glu_supported(nx) &&
                 nx->ne[0] == N && ggml_nrows(nx) == M && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
                 fuse_glu = nx;
             }
@@ -1290,12 +1291,12 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                             float common[4];
                             for (int r = 0; r < nr; ++r) common[r] = scales_A[m0 + r0 + r] / hadamard_divisor;
                             if (fused_now) {
-                                // gate rows of this block -> a per-thread contiguous
-                                // buffer (cache-resident), then GEGLU over whole rows
-                                const struct ggml_tensor* up_t = fuse_glu->src[1];
+                                // up rows of this block -> a per-thread contiguous
+                                // buffer (cache-resident), then GEGLU(gate, up) over rows
+                                const struct ggml_tensor* gate_t = fuse_glu->src[0];
                                 float* y_base = (float*)get_tensor_real_ptr(fuse_glu);
-                                const float* up_base = (const float*)get_tensor_real_ptr(up_t);
-                                const size_t ys = fuse_glu->nb[1] / sizeof(float), us = up_t->nb[1] / sizeof(float);
+                                const float* gate_base = (const float*)get_tensor_real_ptr(gate_t);
+                                const size_t ys = fuse_glu->nb[1] / sizeof(float), gs = gate_t->nb[1] / sizeof(float);
                                 static thread_local std::vector<float> gbuf;
                                 if (gbuf.size() < (size_t)4 * N) gbuf.resize((size_t)4 * N);
                                 for (size_t idx = 0; idx < num_active_segments; ++idx) {
@@ -1309,8 +1310,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                                         /*store=*/ true);
                                 }
                                 for (int r = 0; r < nr; ++r) {
-                                    rknpu_geglu_row(N, y_base + (size_t)(m0 + r0 + r) * ys, gbuf.data() + (size_t)r * N,
-                                                    up_base + (size_t)(m0 + r0 + r) * us);
+                                    rknpu_geglu_row(N, y_base + (size_t)(m0 + r0 + r) * ys,
+                                                    gate_base + (size_t)(m0 + r0 + r) * gs, gbuf.data() + (size_t)r * N);
                                 }
                                 continue;
                             }
