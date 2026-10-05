@@ -327,6 +327,82 @@ points: Q8_0 ~+0.1%, Q5_K_M ~+1%, Q4_K_M ~+2-3% over FP16), **and** mean
 KLD vs the CPU logits ≤ 0.65 (baseline + 2 SE) with same-top ≥ 68%. Unit
 tests and the 3-run server stability check stay unchanged.
 
+### 1e. Prefill loop, part 2 — E4B pp512 68.4 -> 161.5 t/s (2026-10-05)
+
+Continuation of #1d under the agreed gate (32-chunk PPL ≤ +2%, KLD vs CPU
+≤ 0.65, same-top ≥ 68%, 3 server runs, and from #11 on the NPU
+flash-attention hardware test). 25 iterations, 12 kept; full log in
+`rknpu2-autoresearch/prefill/results.tsv`.
+
+| # | Change | pp512 | Exact? | Verdict |
+|---|---|---|---|---|
+| 0 | baseline | 68.4 | — | — |
+| 4 | BF16 `per_layer_model_proj` on the NPU (W8A8 per-channel) | 97.8 | no (KLD 0.580 vs 0.591) | keep |
+| 5 | native INT16 dequant, four rows per tile | 108.0 | yes | keep |
+| 9 | per-thread scratch for A-prep rows, transformed row read in place | 109.6 | yes | keep |
+| 10 | **pipelined prefill**: 256-row chunks, A-prep and dequant on the OpenMP team overlap NPU runs on async threads | 120.3 | yes | keep |
+| 11 | **flash attention on the NPU** (see below) | 139.1 | no (FP16 attention) | keep |
+| 14 | NEON tanh-GELU for geglu (ggml used a scalar fp16-table gather) | 143.7 | no | keep |
+| 15 | radix-4 FWHT (two butterfly stages per pass) | 146.8 | yes | keep |
+| 16 | NEON softmax for the NPU attention rows | 154.5 | no | keep |
+| 17 | pipelined path stores on the first K-segment, no serial M×N memset | 158.2 | ±0 sign only | keep |
+| 18 | fused sign multiply + Hadamard transform | 159.4 | yes | keep |
+| 21 | NEON rms_norm (four double accumulators) + fused mul | 160.2 | PPL identical | keep |
+| 23 | radix-8 FWHT (three stages per pass) | 161.5 | yes | keep |
+
+Discarded, with the reason: store-first dequant *without* the pipeline
+(#6, −6.5%: the memset's streaming warm-up beat strided cold stores — the
+same idea won inside the pipeline as #17); FlashAttention CPU Q tile
+128/32 (#7/#8, 64 is optimal: a 128×256 f32 tile is 128 KB > 64 KB L1);
+tile-major dequant over all chunk rows (#12, −10%: strided dst rows thrash
+instead); NPU attention with both KV heads' matmuls concurrent (#13, −5%)
+and with the next head's Q·Kᵀ on a helper thread overlapping softmax (#20,
+−9%: a fifth thread on four cores competes with the spinning OpenMP team);
+pipeline chunk 128 (#19, noise); GELU reciprocal estimate (#22, no gain —
+and NaN when exp overflows: recpe(inf) = 0, inf·0); 8-row dequant blocks
+(#24, −3%); hoisted channel scales alone (#25, +0.2%, below threshold).
+
+**NPU flash attention (#11).** `rknpu2-attention-probe.c` priced the
+matmuls at ~135 ms per 512-token prefill on one core against ~1.3 s of CPU
+flash attention (go). Per KV head, the rk2 query heads' rows are stacked
+(GQA): S = Q·Kᵀ with K rows as a `TP_NORM` B, softmax (scale, softcap,
+mask) on the CPU team, O = P·V with V rows as a `NORM` B. Prefill only
+(≥ 32 query rows); F16 K/V; no ALiBi/sinks. It took three tries, and the
+first two are the instructive part:
+
+1. *+14%, guard passed* — but the guard's perplexity was bit-identical to
+   the previous build, which FP16 attention cannot produce. llama-perplexity
+   evaluates four sequences per batch (`ne[3] = 4`), which the first version
+   rejected, so the guard measured the CPU path. Fixed by supporting
+   `ne[3]` with ggml's K/V/mask broadcast.
+2. With the NPU path actually exercised, perplexity was **3.36 million**.
+   `test-rknpu2-flash-attn.cpp` (RKNPU vs CPU backend at Gemma-4 shapes)
+   showed every output row zero: Q·Kᵀ was right, P·V returned zeros. The
+   driver converts a non-native B **at `rknn_matmul_set_io_mem` time**, so
+   data written into an already-bound B buffer is never seen. Re-binding B
+   after each write fixes it; all cases now match the CPU to ≤ 1e-3.
+3. Correct version: 139.1 t/s, PPL 26.65 (−0.8%), KLD 0.597.
+
+Enabling it also exposed a latent bug class: `init_tensor`, `set_tensor`,
+`get_tensor` and `get_tensor_real_ptr` decided packing from the dtype alone,
+so compute-buffer tensors (which reuse offsets) could get or look up packed
+NPU allocations, and `get_alloc_size` could size them below `ggml_nbytes`.
+All four now treat COMPUTE buffers as plain memory, and the size is never
+below `ggml_nbytes`.
+
+**Final state** (E4B, default W4A4, `-t 4`, taskset 4-7): pp512 **161.5**,
+pp128 **150.4**, tg64 **8.63** (decode +4.7% as a side effect: the BF16
+projection, GELU and RMS norm also run per token), NPU + MTP n=1 **8.90**
+(was 8.49; output identical to the no-draft run). Quality: 32-chunk PPL
+27.24 (+1.4% vs 26.88), KLD vs CPU 0.587 (baseline 0.591), same-top 72.1%
+(baseline 70.4%).
+
+**Where prefill time goes now:** native INT16 dequant ~31% of samples
+(memory traffic: int16 C read + fp32 dst write per output element), FWHT
+~11%, GELU 8%, sign-multiply+transform 6%, RMS norm 5.5%, residual adds
+4%, NPU attention ~3% CPU. The NPU itself is no longer the limit at
+prefill; the CPU-side dequant of its INT16 output is.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
@@ -1401,6 +1477,8 @@ becomes a server.
 | `RKNPU_SHARED_SIGNS` | 0 | 1 = one Hadamard sign vector per K instead of per tensor. Model-dependent: E4B +43% PPL (bad), Qwen −8% (good). Blocks/enables transform reuse — #3h |
 | `RKNPU_DOMAINS` | unset | Restrict NPU allocations to the listed IOMMU domains (`0,2` or `0-3`). Unset = the allocator uses domains 0-15 freely. **Setting it makes concurrent NPU access from multiple processes panic the kernel** — the backend prints a warning saying so. Diagnostic/experimental only; see the domain note below |
 | `RKNPU_EXCLUDE_TYPES` | unset | Diagnostic: comma-separated ggml type names (`f16`, ...); weights of those types are never offloaded. Keeps an F16 MTP drafter on the CPU where `RKNPU_EXCLUDE` (name collision) and `--device-draft` (ACCEL buffer type) cannot — #1b. Measured no speed effect for Gemma-4 drafters |
+| `RKNPU_PIPELINE` | 1 | 0 = disable the pipelined W4A4 prefill path (256-row chunks overlapping CPU prep/dequant with NPU runs, #1e); for A/B only, results are identical |
+| `RKNPU_FLASH_ATTN` | 1 | 0 = keep prefill flash attention on the CPU (#1e) |
 | `RKNPU_PROFILE` | unset | Diagnostic: prints cumulative wall time in the backend (graph / per-node / NPU run) every ~5 s to stderr; take the slope over a decode window and divide by the token rate (#1c) |
 | `RKNPU_DISPATCH_POOL` | unset | 1 = old dispatch path: NPU segments on the persistent pool and serial M=1 A-prep instead of ggml's OpenMP team. For A/B comparison only (#1c) |
 | `OMP_NUM_THREADS=4` | unset | no longer required: the #3 fix covers M=1, and since 2026-10-02 the backend takes ggml's thread count for M > 1 too (#1b); still harmless |

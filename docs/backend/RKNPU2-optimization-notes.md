@@ -385,6 +385,11 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | Multi-core matmul context (`RKNN_NPU_CORE_0_1_2`) | ❌ unsupported | driver rejects the mask for matmul and falls back to one core — `rknpu2-run-latency-probe.c` |
 | Prefill profile (E4B pp512, 2026-10-05) | 📊 measured | CPU-bound: NPU busy 11% of wall time; BF16 `per_layer_model_proj` alone 33.5% of CPU samples — decode research #1d |
 | BF16 `per_layer_model_proj` off the scalar path | ⚠ pending re-gate | +32-42% pp512 (NPU W8A8 97.4, NPU W16A16 97.4, CPU NEON GEMM 90.6, vs 68.4); all three at baseline distance from the CPU model (KLD 0.58-0.60 vs 0.59) but failed the 8-chunk-PPL gate — decode research #1d |
+| Prefill loop part 2 (2026-10-05) | ✅ shipped | E4B pp512 68.4→161.5 (2.36×), pp128 85.4→150.4, decode 8.24→8.63; PPL32 +1.4%, KLD vs CPU 0.587 (baseline 0.591) — decode research #1e |
+| Pipelined W4A4 prefill (CPU prep/dequant overlap NPU) | ✅ shipped | +9.8%, bit-identical; prefill NPU runs are compute-bound so the extra B read per 256-row chunk costs ~4% — #1e |
+| Flash attention on the NPU (prefill) | ✅ shipped | +15.6%; FP16 QK^T/PV per KV head, CPU softmax. Driver converts non-native B at set_io_mem: re-bind after writing or P·V is zero — #1e |
+| Concurrency inside NPU attention (2 heads at once / helper-thread overlap) | ❌ slower | −5% / −9%: memory contention and thread oversubscription on 4 cores — #1e |
+| Compute-buffer tensors and packing | ✅ fixed | packing/lookup/sizing decided by dtype alone; now never for COMPUTE buffers, alloc size ≥ nbytes — #1e |
 | 8-chunk PPL as a W4A4 quality gate | ❌ unusable | scatters ±3% for 1e-7 perturbations; W4A4 top-1 agreement with CPU is ~70% (KLD 0.59) despite PPL parity — decode research #1d |
 | Server segfault on empty output mul_mat | ✅ fixed | pre-existing ~50% crash in llama-server: rejected zero-row op → 713 MB packed read-back overrun. Accept empty ops, abort on packed read-back; 0/12 after — decode research #1c |
 | Drafter on CPU (`RKNPU_EXCLUDE_TYPES=f16`) | ❌ no effect | n=3 6.00 vs 5.99; kept as a diagnostic. `--device-draft` cannot do it (ACCEL buffer type) — decode research #1b |
