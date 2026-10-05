@@ -197,6 +197,69 @@ cost of CPU-speed prefill (E4B 24 t/s, E2B 73 t/s). On the NPU it is a
 solid win (E4B +23% at n=1, E2B +92% at n=3) with NPU prefill retained.
 Routed + MTP should not be used until the routed CPU copy is repacked.
 
+### 1c. NPU decode loop — 5.81 -> 8.24 t/s, bit-identical (2026-10-05)
+
+An iterative measure/keep/revert loop on Gemma-4 E4B, pure NPU W4A4
+(defaults), `llama-bench -n 64 -r 3 -t 4`, taskset 4-7. Guard on every
+iteration: backend unit tests, 8-chunk PPL exactly 35.0480, and greedy
+`llama-server` output byte-identical on 4 prompts. Harness and full log:
+`rknpu2-autoresearch/`.
+
+| # | Change | tg t/s | Verdict |
+|---|---|---|---|
+| 0 | baseline (`rebase/w4a4-on-upstream`) | 5.81 | — |
+| 1 | Hadamard sign vector by pointer, not per-node copy | 5.79 | discard (noise) |
+| 2 | NEON `ggml_vec_dot_bf16` on ARM — ggml had only a scalar loop there; products in fp32, summed one by one in double in index order | 6.05 | **keep** +4.1% |
+| 3 | per-node NPU segments run on ggml's (size-matched, hot) OpenMP team instead of the dispatch pool | 7.78 | **keep** +28.7% |
+| 4 | at M=1 each team thread syncs and dequantizes its own segment right after its run | 7.89 | **keep** +1.4% |
+| 5 | M=1 int4 A-prep split across the team: Hadamard blocks per thread, amax + quantize in 64-element chunks | 8.02 | **keep** +1.6% |
+| 6 | bf16 dot four rows at a time (independent double chains, each in order) | 8.10 | **keep** +1.1% |
+| 7 | skip `rknn_matmul_set_io_mem` when the context already holds that A/C buffer | 8.24 | **keep** +1.7% |
+| 8 | weights <= 1M elements as one segment on one core | 8.20 | discard (slower) |
+| 9 | bf16 x4 with register accumulators (the array spilled) | 8.25 | discard (noise) |
+| fix | accept empty mul_mats; abort on packed read-back (see below) | 8.24 | **keep** (bug fix) |
+
+**Where the time went, and why #3 dominates.** perf cannot see the main
+thread while it blocks in `rknn_matmul_run`, so the backend got a
+`RKNPU_PROFILE` wall-time split. Baseline token (165 ms): 123 ms NPU runs,
+16 ms prep/dequant, 26 ms CPU ops. A no-code sweep then showed
+`OMP_WAIT_POLICY=passive` alone giving +11.7%: with `-t 4` on four cores
+the main thread, three libgomp workers and two dispatch-pool workers
+share the cores, and spinning libgomp workers delayed the pool workers'
+wake-up after each segment. Since the 2026-10-02 `set_n_threads` fix the
+backend's team matches ggml's, so the segments can run on the
+already-spinning workers without the #3 respawn churn — #3 turns the
+spinning into the dispatch itself, and beats the env var (7.78 vs 6.74).
+Prefill is unaffected by #3 and gained from #2 (pp128 45 -> 72 t/s: the
+scalar bf16 loop was on the prefill path too).
+
+**Where it stands.** Per token (~121 ms): NPU runs 98 ms, prep 8 ms, CPU
+ops ~17 ms. `rknpu2-run-latency-probe.c` measures 32.9 us fixed per
+`rknn_matmul_run`, 11.1 GB/s per core and **26.6 GB/s aggregate on three
+cores**; streaming E4B's 2.64 GB of W4A4 weights at that rate is ~99 ms,
+so the NPU share is at the board's memory-bandwidth ceiling. A context
+spanning all three cores (`RKNN_NPU_CORE_0_1_2`) is rejected by the driver
+for matmul, so one run per node is unavailable. Raising the 8192 K limit
+(ffn_down runs as two K-segments) would cut runs but changes numerics:
+each K-segment quantizes its own activation slice. Remaining bit-identical
+headroom is the ~25 ms of CPU work, mostly the BF16 `per_layer_model_proj`
+(memory-bound now) and attention.
+
+**The guard caught a pre-existing server crash.** Iteration 9's decode
+check segfaulted; a 12-run stress loop with core dumps put it at ~50%, in
+the pre-loop build too (4/8). Cause: when a ubatch produces no logits,
+llama-server builds the output projection with zero rows; `supports_op`
+rejected that empty op, the scheduler moved it to the CPU and first
+copied the whole weight out of the RKNPU buffer — E4B's tied
+`token_embd.weight`, 713 MB requested from a 671 MB NPU-packed allocation.
+The read ran 42 MB off the end. The copy was never used (zero rows), so
+output was always correct, and llama-bench never builds such a batch; the
+only other symptom was the CPU compute buffer silently growing from 118 to
+680 MiB, also in perplexity runs. Fix: accept empty mul_mats (a no-op
+`graph_compute` already skips), and abort with a message on any
+out-of-bounds read-back of a packed weight. After: 0/12 crashes, compute
+buffer back to normal, speed unchanged.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
@@ -1271,6 +1334,8 @@ becomes a server.
 | `RKNPU_SHARED_SIGNS` | 0 | 1 = one Hadamard sign vector per K instead of per tensor. Model-dependent: E4B +43% PPL (bad), Qwen −8% (good). Blocks/enables transform reuse — #3h |
 | `RKNPU_DOMAINS` | unset | Restrict NPU allocations to the listed IOMMU domains (`0,2` or `0-3`). Unset = the allocator uses domains 0-15 freely. **Setting it makes concurrent NPU access from multiple processes panic the kernel** — the backend prints a warning saying so. Diagnostic/experimental only; see the domain note below |
 | `RKNPU_EXCLUDE_TYPES` | unset | Diagnostic: comma-separated ggml type names (`f16`, ...); weights of those types are never offloaded. Keeps an F16 MTP drafter on the CPU where `RKNPU_EXCLUDE` (name collision) and `--device-draft` (ACCEL buffer type) cannot — #1b. Measured no speed effect for Gemma-4 drafters |
+| `RKNPU_PROFILE` | unset | Diagnostic: prints cumulative wall time in the backend (graph / per-node / NPU run) every ~5 s to stderr; take the slope over a decode window and divide by the token rate (#1c) |
+| `RKNPU_DISPATCH_POOL` | unset | 1 = old dispatch path: NPU segments on the persistent pool and serial M=1 A-prep instead of ggml's OpenMP team. For A/B comparison only (#1c) |
 | `OMP_NUM_THREADS=4` | unset | no longer required: the #3 fix covers M=1, and since 2026-10-02 the backend takes ggml's thread count for M > 1 too (#1b); still harmless |
 
 `RKNPU_HADAMARD_BLOCK=0 RKNPU_PER_CHANNEL=0 RKNPU_A_CLIP=1.0
