@@ -605,12 +605,15 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         }
 
         // Acquiring the Hadamard vector
-        std::vector<float> s_vec;
+        // By pointer, not by copy: the vector is K floats (up to 40 KB) and
+        // this runs per node per token (unordered_map values are
+        // pointer-stable; entries are never erased)
+        const float* s_vec = nullptr;
         if (is_hadamard) {
             std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
             auto it = src0_buf_ctx->hadamard_s_vectors.find(src0);
             GGML_ASSERT(it != src0_buf_ctx->hadamard_s_vectors.end() && "Hadamard 's' vector not found");
-            s_vec = it->second;
+            s_vec = it->second.data();
         }
 
         // Acquiring the B-matrix scale grid. By pointer: with per-channel
@@ -742,7 +745,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         if (is_hadamard) {
                             std::vector<float> signed_row(K);
                             std::vector<float> full_hadamard_row(K_op);
-                            rknpu2_quantization::mul_fp32(signed_row.data(), src_row, s_vec.data(), K);
+                            rknpu2_quantization::mul_fp32(signed_row.data(), src_row, s_vec, K);
                             rknpu2_calibration::hadamard_transform(full_hadamard_row.data(), signed_row.data(), K, K_op);
 
                             memcpy(ready_row.data(), full_hadamard_row.data() + k_seg.offset_k, K_seg_op * sizeof(float));
