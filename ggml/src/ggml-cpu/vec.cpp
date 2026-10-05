@@ -252,6 +252,28 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
         }
         GGML_F32x4_REDUCE_4(sumf, sum[0], sum[1], sum[2], sum[3]);
     }
+#elif defined(__ARM_NEON)
+    // Bit-identical to the scalar loop below: bf16 -> fp32 is an exact
+    // 16-bit shift, each product is formed in fp32 exactly as the scalar
+    // code forms it, and the products are accumulated one by one in double
+    // in index order. NEON only does the widening and the multiplies, which
+    // is where the scalar loop spends its time.
+    for (; i + 8 <= n; i += 8) {
+        const uint16x8_t xv = vld1q_u16((const uint16_t *)(x + i));
+        const uint16x8_t yv = vld1q_u16((const uint16_t *)(y + i));
+        const float32x4_t p_lo = vmulq_f32(vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(xv), 16)),
+                                           vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(yv), 16)));
+        const float32x4_t p_hi = vmulq_f32(vreinterpretq_f32_u32(vshll_high_n_u16(xv, 16)),
+                                           vreinterpretq_f32_u32(vshll_high_n_u16(yv, 16)));
+        const float64x2_t d0 = vcvt_f64_f32(vget_low_f32(p_lo));
+        const float64x2_t d1 = vcvt_high_f64_f32(p_lo);
+        const float64x2_t d2 = vcvt_f64_f32(vget_low_f32(p_hi));
+        const float64x2_t d3 = vcvt_high_f64_f32(p_hi);
+        sumf += vgetq_lane_f64(d0, 0); sumf += vgetq_lane_f64(d0, 1);
+        sumf += vgetq_lane_f64(d1, 0); sumf += vgetq_lane_f64(d1, 1);
+        sumf += vgetq_lane_f64(d2, 0); sumf += vgetq_lane_f64(d2, 1);
+        sumf += vgetq_lane_f64(d3, 0); sumf += vgetq_lane_f64(d3, 1);
+    }
 #endif
 
     for (; i < n; ++i) {
