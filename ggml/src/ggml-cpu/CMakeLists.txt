@@ -712,6 +712,11 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     message(STATUS "Adding CPU backend variant ${GGML_CPU_NAME}: ${ARCH_FLAGS} ${ARCH_DEFINITIONS}")
     target_sources(${GGML_CPU_NAME} PRIVATE ${GGML_CPU_SOURCES})
     target_compile_options(${GGML_CPU_NAME} PRIVATE ${ARCH_FLAGS})
+    if (GGML_RKNPU2 AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        # As in ggml-rknpu2: pin hot-loop alignment so performance on the
+        # RK3588 does not swing ~10% with unrelated code-layout changes
+        target_compile_options(${GGML_CPU_NAME} PRIVATE -falign-functions=64 -falign-loops=64)
+    endif()
     target_compile_definitions(${GGML_CPU_NAME} PRIVATE ${ARCH_DEFINITIONS})
 
     if (EMSCRIPTEN)
