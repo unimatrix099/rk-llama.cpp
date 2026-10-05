@@ -215,6 +215,18 @@ void dequant_acc_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const 
             float * d = dst + (size_t)r * dst_stride + n0;
             const float * cs = chan_scales + n0;
             size_t i = 0;
+#if defined(__aarch64__)
+            // Storing (first K-segment, dst not zeroed): zero-allocate each
+            // 64-byte destination line with DC ZVA before writing it, so the
+            // line is not first read from DRAM only to be overwritten (the
+            // read-for-ownership was ~40% of this kernel's traffic). Only for
+            // lines that are aligned and fully overwritten here: with 8-wide
+            // cells, tiles t and t+1 write the 16 floats of the line zeroed
+            // at even t. DCZID_EL0 on RK3588: 64-byte blocks, ZVA permitted.
+            if (store && sub == 8 && (n0 & 15) == 0 && n0 + 16 <= n_limit && ((uintptr_t)d & 63) == 0) {
+                __asm__ volatile("dc zva, %0" : : "r"(d) : "memory");
+            }
+#endif
 #ifdef __ARM_NEON
             const float32x4_t vc = vdupq_n_f32(common[r]);
             for (; i + 8 <= (size_t)lim; i += 8) {

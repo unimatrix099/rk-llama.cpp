@@ -477,6 +477,40 @@ static void test_dequant_tiled_rows(void) {
     }
 }
 
+// Store path with a 64-byte-aligned destination, so the DC ZVA line
+// zeroing fires: must equal accumulating onto zeroed rows, and must not touch
+// anything outside the rows/columns it owns.
+static void test_dequant_rows_store_zva(void) {
+    const int sub = 8, m_stride = 16;
+    for (int n_limit : {16, 64, 72, 256, 248}) {
+        const int outer = (n_limit + sub - 1) / sub;
+        std::vector<int16_t> C((size_t)outer * m_stride * sub);
+        for (auto& v : C) v = (int16_t)((int)(prng() % 4001) - 2000);
+        std::vector<float> chan(outer * sub), common(m_stride);
+        for (auto& v : chan) v = frand() * 0.01f;
+        for (auto& v : common) v = frand();
+        const size_t stride = 256 + 16;   // 64-byte multiple: every row 64-aligned
+        float* buf = (float*)aligned_alloc(64, (size_t)m_stride * stride * sizeof(float));
+        std::vector<float> ref((size_t)m_stride * stride);
+        for (int m0 = 0; m0 + 4 <= m_stride; m0 += 4) {
+            for (size_t q = 0; q < ref.size(); ++q) { ref[q] = 123.0f + (float)(q % 7); buf[q] = ref[q]; }
+            for (int r = 0; r < 4; ++r) {
+                float* row = ref.data() + (size_t)(m0 + r) * stride;
+                for (int n = 0; n < n_limit; ++n) row[n] = 0.0f;
+                rknpu2_quantization::dequant_acc_int16_tiled_perchan(row, C.data(), m0 + r, m_stride, outer, sub,
+                                                                     n_limit, common[m0 + r], chan.data());
+            }
+            rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(buf + (size_t)m0 * stride, stride, C.data(), m0, 4,
+                                                                      m_stride, outer, sub, n_limit, common.data() + m0,
+                                                                      chan.data(), /*store=*/ true);
+            bool same = true;
+            for (size_t q = 0; q < ref.size(); ++q) same &= (ref[q] == buf[q]);
+            CHECK(same, "rows store zva n=%d m0=%d", n_limit, m0);
+        }
+        free(buf);
+    }
+}
+
 int main(void) {
     test_quantize_int8();
     test_quantize_int4();
@@ -491,6 +525,7 @@ int main(void) {
     test_hadamard();
     test_hadamard_blocked();
     test_prep_split();
+    test_dequant_rows_store_zva();
     test_dequant_tiled_rows();
     CHECK(rknpu2_calibration::next_power_of_two(0) == 1, "npot 0");
     CHECK(rknpu2_calibration::next_power_of_two(1) == 1, "npot 1");
