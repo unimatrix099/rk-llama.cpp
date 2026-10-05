@@ -457,9 +457,25 @@ static void test_dequant_tiled_rows(void) {
                         }
                         rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
                             b.data() + (size_t)m0 * stride, stride, C.data(), m0, nrows, m_stride, outer, sub,
-                            n_limit, common.data() + m0, chan.data());
+                            n_limit, common.data() + m0, chan.data(), /*store=*/ false);
                         CHECK(memcmp(a.data(), b.data(), a.size() * 4) == 0,
                               "tiled rows sub=%d n=%d ms=%d m0=%d nr=%d", sub, n_limit, m_stride, m0, nrows);
+
+                        // store variant: equals accumulating onto zeroed rows
+                        // (as values: an exact -0 product may keep its sign)
+                        std::vector<float> az = init, bz = init;
+                        for (int r = 0; r < nrows; ++r) {
+                            float* row = az.data() + (size_t)(m0 + r) * stride;
+                            std::fill(row, row + (size_t)outer * sub > row + n_limit ? row + n_limit : row + (size_t)outer * sub, 0.0f);
+                            rknpu2_quantization::dequant_acc_int16_tiled_perchan(
+                                row, C.data(), m0 + r, m_stride, outer, sub, n_limit, common[m0 + r], chan.data());
+                        }
+                        rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
+                            bz.data() + (size_t)m0 * stride, stride, C.data(), m0, nrows, m_stride, outer, sub,
+                            n_limit, common.data() + m0, chan.data(), /*store=*/ true);
+                        bool same = true;
+                        for (size_t q = 0; q < az.size(); ++q) same &= (az[q] == bz[q]);
+                        CHECK(same, "tiled rows store sub=%d n=%d ms=%d m0=%d nr=%d", sub, n_limit, m_stride, m0, nrows);
                     }
                 }
             }
