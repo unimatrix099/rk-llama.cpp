@@ -832,6 +832,33 @@ static void rknpu_geglu(struct ggml_tensor* dst, int n_omp) {
     }
 }
 
+// Fused up-dequant + GEGLU for one row block of a pipelined FFN (llama order
+// [gate, up, GLU]): up rows go to a per-thread contiguous buffer, then
+// GEGLU(gate from memory, up from the buffer) is written to the GLU output.
+// Out of line on purpose: inlined into the pipelined collect's OpenMP region
+// it slowed the common path by ~10% even when not taken.
+static void __attribute__((noinline)) rknpu_fused_up_geglu_block(
+        const struct ggml_tensor* glu, int m_abs, int r0, int nr, int N, const float* common,
+        const std::vector<std::shared_ptr<rknn_tensor_mem>>& c_mem, const std::vector<rknpu2_native_geom>& c_geom,
+        const std::vector<MatrixSegmentN>& segs, const float* chan) {
+    const struct ggml_tensor* gate_t = glu->src[0];
+    float* y_base = (float*)get_tensor_real_ptr(glu);
+    const float* gate_base = (const float*)get_tensor_real_ptr(gate_t);
+    const size_t ys = glu->nb[1] / sizeof(float), gs = gate_t->nb[1] / sizeof(float);
+    static thread_local std::vector<float> ubuf;
+    if (ubuf.size() < (size_t)4 * N) ubuf.resize((size_t)4 * N);
+    for (size_t idx = 0; idx < segs.size(); ++idx) {
+        const int N_offset = segs[idx].offset_n;
+        rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
+            ubuf.data() + N_offset, (size_t)N, (const int16_t*)c_mem[idx]->virt_addr, r0, nr,
+            c_geom[idx].m_stride, c_geom[idx].outer, c_geom[idx].sub, segs[idx].size_n, common,
+            chan + N_offset, /*store=*/ true);
+    }
+    for (int r = 0; r < nr; ++r) {
+        rknpu_geglu_row(N, y_base + (size_t)(m_abs + r) * ys, gate_base + (size_t)(m_abs + r) * gs, ubuf.data() + (size_t)r * N);
+    }
+}
+
 static bool rknpu_fa_supported(const struct ggml_tensor* op) {
     const struct ggml_tensor *q = op->src[0], *k = op->src[1], *v = op->src[2], *mask = op->src[3], *sinks = op->src[4];
     if (!q || !k || !v || sinks) return false;
@@ -1291,28 +1318,9 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                             float common[4];
                             for (int r = 0; r < nr; ++r) common[r] = scales_A[m0 + r0 + r] / hadamard_divisor;
                             if (fused_now) {
-                                // up rows of this block -> a per-thread contiguous
-                                // buffer (cache-resident), then GEGLU(gate, up) over rows
-                                const struct ggml_tensor* gate_t = fuse_glu->src[0];
-                                float* y_base = (float*)get_tensor_real_ptr(fuse_glu);
-                                const float* gate_base = (const float*)get_tensor_real_ptr(gate_t);
-                                const size_t ys = fuse_glu->nb[1] / sizeof(float), gs = gate_t->nb[1] / sizeof(float);
-                                static thread_local std::vector<float> gbuf;
-                                if (gbuf.size() < (size_t)4 * N) gbuf.resize((size_t)4 * N);
-                                for (size_t idx = 0; idx < num_active_segments; ++idx) {
-                                    const int N_offset = active_n_segments[idx].offset_n;
-                                    rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
-                                        gbuf.data() + N_offset, (size_t)N,
-                                        (const int16_t*)c_slot[c & 1][idx]->virt_addr, r0, nr,
-                                        c_geom[idx].m_stride, c_geom[idx].outer, c_geom[idx].sub,
-                                        active_n_segments[idx].size_n, common,
-                                        scales_B_grid->data() + k_idx * (size_t)N + N_offset,
-                                        /*store=*/ true);
-                                }
-                                for (int r = 0; r < nr; ++r) {
-                                    rknpu_geglu_row(N, y_base + (size_t)(m0 + r0 + r) * ys,
-                                                    gate_base + (size_t)(m0 + r0 + r) * gs, gbuf.data() + (size_t)r * N);
-                                }
+                                rknpu_fused_up_geglu_block(fuse_glu, m0 + r0, r0, nr, N, common,
+                                    c_slot[c & 1], c_geom, active_n_segments,
+                                    scales_B_grid->data() + k_idx * (size_t)N);
                                 continue;
                             }
                             for (size_t idx = 0; idx < num_active_segments; ++idx) {
