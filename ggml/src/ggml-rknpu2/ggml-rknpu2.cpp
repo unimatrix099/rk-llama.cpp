@@ -263,25 +263,6 @@ static std::vector<MatrixSegmentN> compute_n_segments(int N, const std::vector<i
     return segments;
 }
 
-// Small weights run as one segment on the first active core instead of being
-// split N-wise across all of them: each extra segment is a full rknn_matmul_run
-// with its fixed launch/IRQ cost, which dominates when the matrix is tiny
-// (Gemma-4's per-layer-embedding gates/projections, 2560x256). The N split
-// does not change any result (per-output-channel arithmetic), but the packed B
-// layout follows it, so the load-time packer and the runtime must both use
-// this. Threshold in weight elements: RKNPU_SINGLE_CORE_MAX (default 1M; 0
-// disables).
-static std::vector<int> node_active_cores(const std::vector<int>& active_cores, int64_t K, int64_t N) {
-    static const int64_t max_elems = []() {
-        const char* env = std::getenv("RKNPU_SINGLE_CORE_MAX");
-        return env ? (int64_t)std::atoll(env) : (int64_t)1 << 20;
-    }();
-    if (active_cores.size() > 1 && K * N <= max_elems) {
-        return { active_cores[0] };
-    }
-    return active_cores;
-}
-
 // Split B-matrix into K-segments for hardware limit
 static std::vector<MatrixSegmentK> compute_k_segments(int K_op, int k_limit, int alignment) {
     std::vector<MatrixSegmentK> segments;
@@ -619,7 +600,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
             k_limit = (k_limit > 0) ? std::min(k_limit, pipeline->effective_k) : pipeline->effective_k;
         }
         auto all_k_segments = compute_k_segments(K_op, k_limit, pipeline->k_align);
-        auto all_n_segments = compute_n_segments(N, node_active_cores(config.active_cores, src0->ne[0], N), alignment);
+        auto all_n_segments = compute_n_segments(N, config.active_cores, alignment);
 
         std::vector<MatrixSegmentN> active_n_segments;
         for (const auto& seg : all_n_segments) {
@@ -1121,7 +1102,7 @@ static size_t get_tensor_packed_size(const struct ggml_tensor * tensor) {
         }
 
         auto k_segments = compute_k_segments(K_op, k_limit, pipeline->k_align);
-        auto n_segments = compute_n_segments(N, node_active_cores(config.active_cores, tensor->ne[0], N), pipeline->n_align);
+        auto n_segments = compute_n_segments(N, config.active_cores, pipeline->n_align);
 
         size_t total_size = 0;
         for (const auto& k_seg : k_segments) {
@@ -1428,7 +1409,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
         // Computing specific hardware segments
         auto k_segments = compute_k_segments(K_op, k_limit, pipeline->k_align);
-        auto n_segments = compute_n_segments(N, node_active_cores(config.active_cores, tensor->ne[0], N), pipeline->n_align);
+        auto n_segments = compute_n_segments(N, config.active_cores, pipeline->n_align);
 
         std::vector<float> seg_fp32;
         std::vector<uint8_t> seg_npu;
