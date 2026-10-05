@@ -388,6 +388,69 @@ struct rknpu_matmul_context {
 
 using rknpu_dispatch_pool = rknpu_dispatch_pool_t<rknpu_matmul_context>;
 
+// Runs one node's per-core segments on dedicated threads and returns at once,
+// so the caller's OpenMP team can do CPU work (the next chunk's A prep, the
+// previous chunk's dequant) while the NPU computes. The threads spend their
+// time blocked in rknn_matmul_run, so they do not compete for cores with the
+// team. Used only by the pipelined prefill path, where a job lasts tens of
+// milliseconds and condition-variable wake-up latency is irrelevant.
+struct rknpu_async_runner {
+    void start(const std::vector<std::shared_ptr<rknpu_matmul_context>>& ctxs) {
+        std::unique_lock<std::mutex> lock(mutex);
+        // Seed new workers with the generation *before* this job's bump, so
+        // they take this job (seeding after it would make a fresh worker
+        // wait for the next job and deadlock wait() — the inverse of the
+        // dispatch pool's stale-seed bug)
+        while (threads.size() < ctxs.size()) {
+            const int idx = (int)threads.size();
+            const uint64_t seed = generation;
+            threads.emplace_back([this, idx, seed] { worker(idx, seed); });
+        }
+        job = &ctxs;
+        pending = (int)ctxs.size();
+        ++generation;
+        cv_start.notify_all();
+    }
+    void wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv_done.wait(lock, [this] { return pending == 0; });
+        job = nullptr;
+    }
+    ~rknpu_async_runner() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            quit = true;
+            cv_start.notify_all();
+        }
+        for (auto& t : threads) t.join();
+    }
+  private:
+    void worker(int idx, uint64_t seen) {
+        for (;;) {
+            const std::vector<std::shared_ptr<rknpu_matmul_context>>* j;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv_start.wait(lock, [&] { return quit || generation != seen; });
+                if (quit) return;
+                seen = generation;
+                j = job;
+            }
+            if (j && idx < (int)j->size()) {
+                (*j)[idx]->run();
+                std::lock_guard<std::mutex> lock(mutex);
+                if (--pending == 0) cv_done.notify_all();
+            }
+        }
+    }
+    std::vector<std::thread> threads;
+    std::mutex mutex;
+    std::condition_variable cv_start, cv_done;
+    const std::vector<std::shared_ptr<rknpu_matmul_context>>* job = nullptr;
+    uint64_t generation = 0;
+    int pending = 0;
+    bool quit = false;
+};
+
 // Backend main context
 struct ggml_backend_rknpu_context {
     std::string name;
@@ -404,6 +467,7 @@ struct ggml_backend_rknpu_context {
 
     // Persistent threads for the per-node segment runs (see struct comment)
     rknpu_dispatch_pool dispatch_pool;
+    rknpu_async_runner async_runner;
 
     // Team size for the per-row OpenMP regions, set by llama through
     // ggml_backend_set_n_threads; 0 means libgomp's default. Matching
@@ -679,6 +743,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
 
         // Computing K dimensions segments
         size_t current_offset_in_tensor = 0;
+        std::vector<size_t> seg_b_offset(num_active_segments, 0);
         for (size_t k_idx = 0; k_idx < all_k_segments.size(); ++k_idx) {
             const auto& k_seg = all_k_segments[k_idx];
             const int K_seg_op = k_seg.size_k;
@@ -690,6 +755,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 for (size_t idx = 0; idx < num_active_segments; ++idx) {
                     if (active_n_segments[idx].offset_n == n_seg.offset_n) {
                         size_t offset_in_dma = current_offset_in_tensor;
+                        seg_b_offset[idx] = offset_in_dma;
 
                         // Getting matmul context from cache
                         matmul_ctxs[idx] = backend_ctx->get_matmul_ctx(
@@ -741,6 +807,157 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     (const float *)((const char *)src1_base + ib * src1_batch_nb);
                 float * const dst_batch =
                     (float *)((char *)dst_data + ib * dst_batch_nb);
+
+                // ===========================================
+                // ===== Pipelined prefill (W4A4, M > 256) =====
+                // ===========================================
+                // Rows are processed in 256-row chunks so the CPU work of one
+                // chunk overlaps the NPU work of another: A-prep of chunk c+1
+                // and dequant of chunk c-1 run on the OpenMP team while chunk
+                // c runs on the async runner's threads. Rows are quantized
+                // independently and B scales are per channel, so every output
+                // element is computed exactly as on the path below. Costs one
+                // extra B read per chunk (prefill NPU runs are compute-bound:
+                // 1.55 vs 1.62 ms/token at M=512 vs 256). RKNPU_PIPELINE=0
+                // disables it.
+                static const bool pipeline_enabled = []() {
+                    const char* env = std::getenv("RKNPU_PIPELINE");
+                    return env == nullptr || std::atoi(env) != 0;
+                }();
+                const int MC = 256;
+                const bool pipelined = pipeline_enabled && nbatch == 1 && M > MC &&
+                    pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4 &&
+                    pipeline->npu_type_c == rknpu2_configuration::NPU_TYPE_INT16 &&
+                    pipeline->ac_layout == RKNN_MM_LAYOUT_NATIVE && b_per_channel && n_omp > 1;
+                if (pipelined) {
+                    const int n_chunks = (M + MC - 1) / MC;
+                    // chunk contexts (M_op = MC), B bound once per context
+                    std::vector<std::shared_ptr<rknpu_matmul_context>> cctx(num_active_segments);
+                    for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                        cctx[idx] = backend_ctx->get_matmul_ctx(
+                            (uintptr_t)tensor_virt_addr, seg_b_offset[idx], MC, K_seg_op,
+                            active_n_segments[idx].size_n, active_n_segments[idx].core_id,
+                            matmul_type, pipeline->ac_layout, b_domain_id);
+                        if (!cctx[idx] || cctx[idx]->ctx == 0) return GGML_STATUS_FAILED;
+                        auto& mc = cctx[idx];
+                        if (!mc->b_bound) {
+                            rknn_tensor_mem* mem = rknn_create_mem_from_fd(mc->ctx, tensor_fd, tensor_virt_addr,
+                                                                          mc->io_attr.B.size, seg_b_offset[idx]);
+                            if (!mem) return GGML_STATUS_FAILED;
+                            auto deleter = [ctx = mc->ctx](rknn_tensor_mem* m) { if (m) rknn_destroy_mem(ctx, m); };
+                            mc->mem_B = std::shared_ptr<rknn_tensor_mem>(mem, deleter);
+                            RKNN_CHECK(rknn_matmul_set_io_mem(mc->ctx, mc->mem_B.get(), &mc->io_attr.B), "set_io_mem B chunk");
+                            mc->b_bound = true;
+                        }
+                    }
+                    // double-buffered A and C (slot encoded in the cache key's type field)
+                    std::shared_ptr<rknn_tensor_mem> a_slot[2];
+                    std::vector<std::shared_ptr<rknn_tensor_mem>> c_slot[2];
+                    for (int sl = 0; sl < 2; ++sl) {
+                        a_slot[sl] = get_tensor_buffer(backend_ctx, cctx[0]->ctx, cctx[0]->io_attr.A.size,
+                            std::make_tuple(MC, K_seg_op, (int)pipeline->npu_type_a + 16 * (sl + 1), b_domain_id),
+                            backend_ctx->a_buffer_cache);
+                        if (!a_slot[sl]) return GGML_STATUS_FAILED;
+                        c_slot[sl].resize(num_active_segments);
+                        for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                            c_slot[sl][idx] = get_tensor_buffer(backend_ctx, cctx[idx]->ctx, cctx[idx]->io_attr.C.size,
+                                std::make_tuple(MC, active_n_segments[idx].size_n, active_n_segments[idx].core_id,
+                                                (int)pipeline->npu_type_c + 16 * (sl + 1), b_domain_id),
+                                backend_ctx->c_buffer_cache);
+                            if (!c_slot[sl][idx]) return GGML_STATUS_FAILED;
+                        }
+                    }
+                    rknpu2_native_geom a_geom = {0, 0, 0};
+                    GGML_ASSERT(rknpu2_native_geom_from_dims(cctx[0]->io_attr.A.dims, cctx[0]->io_attr.A.n_dims, &a_geom) == 0);
+                    std::vector<rknpu2_native_geom> c_geom(num_active_segments);
+                    for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                        GGML_ASSERT(rknpu2_native_geom_from_dims(cctx[idx]->io_attr.C.dims, cctx[idx]->io_attr.C.n_dims, &c_geom[idx]) == 0);
+                    }
+                    const float a_clip = rknpu2_calibration::a_clip_factor();
+                    const float hadamard_divisor = is_hadamard ? (float)rknpu2_calibration::hadamard_block_len(K) : 1.0f;
+                    const int row_stride = (int)(src1->nb[1] / sizeof(float));
+                    std::vector<float> scales_A(M, 1.0f);
+
+                    auto prep = [&](int c) {
+                        const int m0 = c * MC, rows = std::min(MC, M - m0);
+                        uint8_t* dst_a = (uint8_t*)a_slot[c & 1]->virt_addr;
+                        #pragma omp parallel for num_threads(n_omp)
+                        for (int r = 0; r < rows; ++r) {
+                            const int m = m0 + r;
+                            const float* src_row = src1_batch + (size_t)m * row_stride;
+                            static thread_local std::vector<float> signed_row, full_row;
+                            static thread_local std::vector<uint8_t> packed_row;
+                            auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
+                            const float* ready_row;
+                            if (is_hadamard) {
+                                grow(signed_row, (size_t)K);
+                                grow(full_row, (size_t)K_op);
+                                rknpu2_quantization::mul_fp32(signed_row.data(), src_row, s_vec.data(), K);
+                                rknpu2_calibration::hadamard_transform(full_row.data(), signed_row.data(), K, K_op);
+                                ready_row = full_row.data() + k_seg.offset_k;
+                            } else {
+                                ready_row = src_row + k_seg.offset_k;
+                            }
+                            scales_A[m] = a_clip * rknpu2_quantization::amax_fp32(ready_row, K_seg_op) / 7.0f;
+                            grow(packed_row, (size_t)K_seg_op / 2);
+                            rknpu2_quantization::quantize_fp32_to_int4_packed(ready_row, packed_row.data(), K_seg_op, scales_A[m]);
+                            rknpu2_native_scatter_row(dst_a, packed_row.data(), r, a_geom.m_stride, a_geom.outer, a_geom.sub / 2);
+                        }
+                        RKNN_CHECK(rknn_mem_sync(cctx[0]->ctx, a_slot[c & 1].get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A chunk");
+                    };
+                    auto start = [&](int c) {
+                        for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                            auto& mc = cctx[idx];
+                            if (mc->bound_A != a_slot[c & 1].get()) {
+                                RKNN_CHECK(rknn_matmul_set_io_mem(mc->ctx, a_slot[c & 1].get(), &mc->io_attr.A), "set_io_mem A chunk");
+                                mc->bound_A = a_slot[c & 1].get();
+                            }
+                            if (mc->bound_C != c_slot[c & 1][idx].get()) {
+                                RKNN_CHECK(rknn_matmul_set_io_mem(mc->ctx, c_slot[c & 1][idx].get(), &mc->io_attr.C), "set_io_mem C chunk");
+                                mc->bound_C = c_slot[c & 1][idx].get();
+                            }
+                        }
+                        backend_ctx->async_runner.start(cctx);
+                    };
+                    auto collect = [&](int c) {
+                        const int m0 = c * MC, rows = std::min(MC, M - m0);
+                        for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                            RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, c_slot[c & 1][idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
+                        }
+                        const int n_blocks = (rows + 3) / 4;
+                        #pragma omp parallel for num_threads(n_omp)
+                        for (int blk = 0; blk < n_blocks; ++blk) {
+                            const int r0 = blk * 4;
+                            const int nr = std::min(4, rows - r0);
+                            float common[4];
+                            for (int r = 0; r < nr; ++r) common[r] = scales_A[m0 + r0 + r] / hadamard_divisor;
+                            for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                                const int N_offset = active_n_segments[idx].offset_n;
+                                rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
+                                    dst_batch + (size_t)(m0 + r0) * N + N_offset, (size_t)N,
+                                    (const int16_t*)c_slot[c & 1][idx]->virt_addr, r0, nr,
+                                    c_geom[idx].m_stride, c_geom[idx].outer, c_geom[idx].sub,
+                                    active_n_segments[idx].size_n, common,
+                                    scales_B_grid->data() + k_idx * (size_t)N + N_offset);
+                            }
+                        }
+                    };
+
+                    const auto t_run = g_rknpu_profile.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    prep(0);
+                    start(0);
+                    for (int c = 1; c < n_chunks; ++c) {
+                        prep(c);                         // overlaps NPU chunk c-1
+                        backend_ctx->async_runner.wait();
+                        start(c);
+                        collect(c - 1);                  // overlaps NPU chunk c
+                    }
+                    backend_ctx->async_runner.wait();
+                    collect(n_chunks - 1);
+                    if (g_rknpu_profile.on) g_rknpu_profile.run_ns += rknpu_profile::ns(t_run, std::chrono::steady_clock::now());
+                    continue;
+                }
+
                 // ===========================================
                 // ========== 2. Preparing A-matrix ==========
                 // ===========================================
