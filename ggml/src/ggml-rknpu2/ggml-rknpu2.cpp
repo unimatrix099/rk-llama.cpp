@@ -489,6 +489,21 @@ struct rknpu_async_runner {
     bool quit = false;
 };
 
+// A gate matmul whose dequant is deferred into the following up matmul's
+// fused GEGLU collect ([gate, up, GLU], gate consumed only by the GLU): its
+// INT16 C is kept per chunk and dequantized there into thread-local rows,
+// so gate's FP32 output is never written to (and read back from) DRAM.
+struct rknpu_deferred_gate {
+    struct ggml_tensor* gate = nullptr;   // pending: gate's dst is not written
+    const struct ggml_tensor* up = nullptr;
+    int M = 0, N = 0, MC = 0;
+    std::vector<std::vector<std::shared_ptr<rknn_tensor_mem>>> c;   // [chunk][n-segment]
+    std::vector<rknpu2_native_geom> c_geom;
+    std::vector<MatrixSegmentN> segs;
+    std::vector<float> common;            // per row: scale_A / hadamard divisor
+    const float* chan = nullptr;          // per-channel B scales (pointer-stable map value)
+};
+
 // Backend main context
 struct ggml_backend_rknpu_context {
     std::string name;
@@ -506,6 +521,7 @@ struct ggml_backend_rknpu_context {
     // Persistent threads for the per-node segment runs (see struct comment)
     rknpu_dispatch_pool dispatch_pool;
     rknpu_async_runner async_runner;
+    rknpu_deferred_gate deferred_gate;
 
     // (M, K, N, B layout, core) -> attention matmul context
     std::map<std::tuple<int, int, int, int, int>, std::unique_ptr<rknpu_attn_context>> attn_ctx_cache;
@@ -859,6 +875,60 @@ static void __attribute__((noinline)) rknpu_fused_up_geglu_block(
     }
 }
 
+// Rows r0..r0+nr of chunk `chunk` of a deferred gate, exactly as its own
+// collect would have stored them
+static void rknpu_deferred_gate_rows(const rknpu_deferred_gate& dg, float* dst, size_t dst_stride, int chunk, int r0, int nr) {
+    const int m_abs = chunk * dg.MC + r0;
+    for (size_t idx = 0; idx < dg.segs.size(); ++idx) {
+        const int N_offset = dg.segs[idx].offset_n;
+        rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
+            dst + N_offset, dst_stride, (const int16_t*)dg.c[chunk][idx]->virt_addr, r0, nr,
+            dg.c_geom[idx].m_stride, dg.c_geom[idx].outer, dg.c_geom[idx].sub, dg.segs[idx].size_n,
+            dg.common.data() + m_abs, dg.chan + N_offset, /*store=*/ true);
+    }
+}
+
+// Fallback when the fused up does not follow: write the gate's output after all
+static void rknpu_materialize_deferred_gate(rknpu_deferred_gate& dg, int n_omp) {
+    if (!dg.gate) return;
+    float* d = (float*)get_tensor_real_ptr(dg.gate);
+    const int n_chunks = (dg.M + dg.MC - 1) / dg.MC;
+    for (int c = 0; c < n_chunks; ++c) {
+        const int rows = std::min(dg.MC, dg.M - c * dg.MC);
+        const int n_blocks = (rows + 3) / 4;
+        #pragma omp parallel for num_threads(n_omp)
+        for (int blk = 0; blk < n_blocks; ++blk) {
+            const int r0 = blk * 4;
+            rknpu_deferred_gate_rows(dg, d + (size_t)(c * dg.MC + r0) * dg.N, (size_t)dg.N, c, r0, std::min(4, rows - r0));
+        }
+    }
+    dg.gate = nullptr;
+    dg.up = nullptr;
+}
+
+// rknpu_fused_up_geglu_block with the gate rows from a deferred gate
+static void __attribute__((noinline)) rknpu_fused_gate_up_geglu_block(
+        const struct ggml_tensor* glu, const rknpu_deferred_gate& dg, int chunk, int m_abs, int r0, int nr, int N,
+        const float* common, const std::vector<std::shared_ptr<rknn_tensor_mem>>& c_mem,
+        const std::vector<rknpu2_native_geom>& c_geom, const std::vector<MatrixSegmentN>& segs, const float* chan) {
+    float* y_base = (float*)get_tensor_real_ptr(glu);
+    const size_t ys = glu->nb[1] / sizeof(float);
+    static thread_local std::vector<float> ubuf, gbuf;
+    if (ubuf.size() < (size_t)4 * N) ubuf.resize((size_t)4 * N);
+    if (gbuf.size() < (size_t)4 * N) gbuf.resize((size_t)4 * N);
+    for (size_t idx = 0; idx < segs.size(); ++idx) {
+        const int N_offset = segs[idx].offset_n;
+        rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
+            ubuf.data() + N_offset, (size_t)N, (const int16_t*)c_mem[idx]->virt_addr, r0, nr,
+            c_geom[idx].m_stride, c_geom[idx].outer, c_geom[idx].sub, segs[idx].size_n, common,
+            chan + N_offset, /*store=*/ true);
+    }
+    rknpu_deferred_gate_rows(dg, gbuf.data(), (size_t)N, chunk, r0, nr);
+    for (int r = 0; r < nr; ++r) {
+        rknpu_geglu_row(N, y_base + (size_t)(m_abs + r) * ys, gbuf.data() + (size_t)r * N, ubuf.data() + (size_t)r * N);
+    }
+}
+
 static bool rknpu_fa_supported(const struct ggml_tensor* op) {
     const struct ggml_tensor *q = op->src[0], *k = op->src[1], *v = op->src[2], *mask = op->src[3], *sinks = op->src[4];
     if (!q || !k || !v || sinks) return false;
@@ -982,6 +1052,9 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
 
     for (int node_i = 0; node_i < cgraph->n_nodes; node_i++) {
         struct ggml_tensor* node = cgraph->nodes[node_i];
+        if (backend_ctx->deferred_gate.gate && node != backend_ctx->deferred_gate.up) {
+            rknpu_materialize_deferred_gate(backend_ctx->deferred_gate, n_omp);
+        }
         if (node->op == GGML_OP_FLASH_ATTN_EXT) {
             rknpu_flash_attn(backend_ctx, node, n_omp);
             continue;
@@ -1102,6 +1175,30 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 fuse_glu = nx;
             }
         }
+        // Defer this matmul's dequant into the next one's fused GEGLU when it
+        // is the gate of [gate, up, GLU] and nothing in the graph but the GLU
+        // reads it (see rknpu_deferred_gate)
+        static const bool defer_enabled = []() {
+            const char* env = std::getenv("RKNPU_DEFER_GATE");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        bool defer_gate = false;
+        if (defer_enabled && fuse_enabled && pipelined_node && all_k_segments.size() == 1 &&
+            node_i + 2 < cgraph->n_nodes && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            const struct ggml_tensor* nu = cgraph->nodes[node_i + 1];
+            const struct ggml_tensor* ng = cgraph->nodes[node_i + 2];
+            if (nu->op == GGML_OP_MUL_MAT && ng->op == GGML_OP_GLU && ng->src[0] == node && ng->src[1] == nu &&
+                rknpu_glu_supported(ng) && nu->src[1]->ne[1] == M && nu->src[0]->ne[1] == N &&
+                ng->ne[0] == N && ggml_nrows(ng) == M && !(nu->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                defer_gate = true;
+                for (int j = node_i + 1; j < cgraph->n_nodes && defer_gate; ++j) {
+                    const struct ggml_tensor* t = cgraph->nodes[j];
+                    if (t == ng) continue;
+                    if (t->view_src == node) defer_gate = false;
+                    for (int q = 0; q < GGML_MAX_SRC; ++q) defer_gate = defer_gate && t->src[q] != node;
+                }
+            }
+        }
         for (int64_t ib = 0; ib < nbatch && !pipelined_node; ++ib) {
             memset((char*)dst_data + ib * dst_batch_nb, 0, (size_t)M * N * sizeof(float));
         }
@@ -1217,6 +1314,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 const int MC = 256;
                 static_assert(MC == 256, "pipelined_node uses M > 256");
                 const bool fused_now = fuse_glu != nullptr && all_k_segments.size() == 1;
+                auto& dg = backend_ctx->deferred_gate;
+                const bool use_dg = dg.gate != nullptr && pipelined_node && fused_now && fuse_glu->src[0] == dg.gate &&
+                                    dg.up == node && dg.M == M && dg.N == N && dg.MC == MC;
+                if (dg.gate && !use_dg) rknpu_materialize_deferred_gate(dg, n_omp);
                 if (pipelined_node) {
                     const int n_chunks = (M + MC - 1) / MC;
                     // chunk contexts (M_op = MC), B bound once per context
@@ -1239,22 +1340,28 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         }
                     }
                     // double-buffered A and C (slot encoded in the cache key's type field)
+                    // (a deferred gate keeps one C per chunk, keyed apart from
+                    // the up matmul's slots)
                     std::shared_ptr<rknn_tensor_mem> a_slot[2];
-                    std::vector<std::shared_ptr<rknn_tensor_mem>> c_slot[2];
+                    const int n_cslots = defer_gate ? n_chunks : 2;
+                    std::vector<std::vector<std::shared_ptr<rknn_tensor_mem>>> c_slot(n_cslots);
                     for (int sl = 0; sl < 2; ++sl) {
                         a_slot[sl] = get_tensor_buffer(backend_ctx, cctx[0]->ctx, cctx[0]->io_attr.A.size,
                             std::make_tuple(MC, K_seg_op, (int)pipeline->npu_type_a + 16 * (sl + 1), b_domain_id),
                             backend_ctx->a_buffer_cache);
                         if (!a_slot[sl]) return GGML_STATUS_FAILED;
+                    }
+                    for (int sl = 0; sl < n_cslots; ++sl) {
                         c_slot[sl].resize(num_active_segments);
                         for (size_t idx = 0; idx < num_active_segments; ++idx) {
                             c_slot[sl][idx] = get_tensor_buffer(backend_ctx, cctx[idx]->ctx, cctx[idx]->io_attr.C.size,
                                 std::make_tuple(MC, active_n_segments[idx].size_n, active_n_segments[idx].core_id,
-                                                (int)pipeline->npu_type_c + 16 * (sl + 1), b_domain_id),
+                                                (int)pipeline->npu_type_c + 16 * (sl + 1) + (defer_gate ? 4096 : 0), b_domain_id),
                                 backend_ctx->c_buffer_cache);
                             if (!c_slot[sl][idx]) return GGML_STATUS_FAILED;
                         }
                     }
+                    auto cslot = [&](int c) -> std::vector<std::shared_ptr<rknn_tensor_mem>>& { return c_slot[defer_gate ? c : (c & 1)]; };
                     rknpu2_native_geom a_geom = {0, 0, 0};
                     GGML_ASSERT(rknpu2_native_geom_from_dims(cctx[0]->io_attr.A.dims, cctx[0]->io_attr.A.n_dims, &a_geom) == 0);
                     std::vector<rknpu2_native_geom> c_geom(num_active_segments);
@@ -1306,9 +1413,9 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                                 RKNN_CHECK(rknn_matmul_set_io_mem(mc->ctx, a_slot[c & 1].get(), &mc->io_attr.A), "set_io_mem A chunk");
                                 mc->bound_A = a_slot[c & 1].get();
                             }
-                            if (mc->bound_C != c_slot[c & 1][idx].get()) {
-                                RKNN_CHECK(rknn_matmul_set_io_mem(mc->ctx, c_slot[c & 1][idx].get(), &mc->io_attr.C), "set_io_mem C chunk");
-                                mc->bound_C = c_slot[c & 1][idx].get();
+                            if (mc->bound_C != cslot(c)[idx].get()) {
+                                RKNN_CHECK(rknn_matmul_set_io_mem(mc->ctx, cslot(c)[idx].get(), &mc->io_attr.C), "set_io_mem C chunk");
+                                mc->bound_C = cslot(c)[idx].get();
                             }
                         }
                         backend_ctx->async_runner.start(cctx);
@@ -1316,7 +1423,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     auto collect = [&](int c) {
                         const int m0 = c * MC, rows = std::min(MC, M - m0);
                         for (size_t idx = 0; idx < num_active_segments; ++idx) {
-                            RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, c_slot[c & 1][idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
+                            RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, cslot(c)[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
                         }
                         const int n_blocks = (rows + 3) / 4;
                         #pragma omp parallel for num_threads(n_omp)
@@ -1329,7 +1436,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                                 const int N_offset = active_n_segments[idx].offset_n;
                                 rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
                                     dst_batch + (size_t)(m0 + r0) * N + N_offset, (size_t)N,
-                                    (const int16_t*)c_slot[c & 1][idx]->virt_addr, r0, nr,
+                                    (const int16_t*)cslot(c)[idx]->virt_addr, r0, nr,
                                     c_geom[idx].m_stride, c_geom[idx].outer, c_geom[idx].sub,
                                     active_n_segments[idx].size_n, common,
                                     scales_B_grid->data() + k_idx * (size_t)N + N_offset,
@@ -1343,7 +1450,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     auto collect_fused = [&](int c) {
                         const int m0 = c * MC, rows = std::min(MC, M - m0);
                         for (size_t idx = 0; idx < num_active_segments; ++idx) {
-                            RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, c_slot[c & 1][idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
+                            RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, cslot(c)[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
                         }
                         const int n_blocks = (rows + 3) / 4;
                         #pragma omp parallel for num_threads(n_omp)
@@ -1353,11 +1460,40 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                             float common[4];
                             for (int r = 0; r < nr; ++r) common[r] = scales_A[m0 + r0 + r] / hadamard_divisor;
                             rknpu_fused_up_geglu_block(fuse_glu, m0 + r0, r0, nr, N, common,
-                                c_slot[c & 1], c_geom, active_n_segments,
+                                cslot(c), c_geom, active_n_segments,
                                 scales_B_grid->data() + k_idx * (size_t)N);
                         }
                     };
 
+
+                    auto collect_fused_dg = [&](int c) {
+                        const int m0 = c * MC, rows = std::min(MC, M - m0);
+                        for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                            RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, cslot(c)[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
+                        }
+                        const int n_blocks = (rows + 3) / 4;
+                        #pragma omp parallel for num_threads(n_omp)
+                        for (int blk = 0; blk < n_blocks; ++blk) {
+                            const int r0 = blk * 4;
+                            const int nr = std::min(4, rows - r0);
+                            float common[4];
+                            for (int r = 0; r < nr; ++r) common[r] = scales_A[m0 + r0 + r] / hadamard_divisor;
+                            rknpu_fused_gate_up_geglu_block(fuse_glu, dg, c, m0 + r0, r0, nr, N, common,
+                                cslot(c), c_geom, active_n_segments, scales_B_grid->data() + k_idx * (size_t)N);
+                        }
+                    };
+                    // deferred gate: C synced for the CPU, kept for the up's collect
+                    auto keep = [&](int c) {
+                        for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                            RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, cslot(c)[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
+                        }
+                    };
+                    auto collect_any = [&](int c) {
+                        if (defer_gate) keep(c);
+                        else if (use_dg) collect_fused_dg(c);
+                        else if (fused_now) collect_fused(c);
+                        else collect(c);
+                    };
 
                     const auto t_run = g_rknpu_profile.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     prep(0);
@@ -1366,10 +1502,25 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         prep(c);                         // overlaps NPU chunk c-1
                         backend_ctx->async_runner.wait();
                         start(c);
-                        if (fused_now) collect_fused(c - 1); else collect(c - 1);   // overlaps NPU chunk c
+                        collect_any(c - 1);   // overlaps NPU chunk c
                     }
                     backend_ctx->async_runner.wait();
-                    if (fused_now) collect_fused(n_chunks - 1); else collect(n_chunks - 1);
+                    collect_any(n_chunks - 1);
+                    if (use_dg) {
+                        dg.gate = nullptr;
+                        dg.up = nullptr;
+                    }
+                    if (defer_gate) {
+                        dg.gate = node;
+                        dg.up = cgraph->nodes[node_i + 1];
+                        dg.M = M; dg.N = N; dg.MC = MC;
+                        dg.c = c_slot;
+                        dg.c_geom = c_geom;
+                        dg.segs = active_n_segments;
+                        dg.common.resize(M);
+                        for (int m = 0; m < M; ++m) dg.common[m] = scales_A[m] / hadamard_divisor;
+                        dg.chan = scales_B_grid->data() + k_idx * (size_t)N;
+                    }
                     if (g_rknpu_profile.on) g_rknpu_profile.run_ns += rknpu_profile::ns(t_run, std::chrono::steady_clock::now());
                     continue;
                 }
@@ -1731,6 +1882,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
             ++node_i;   // the GLU was computed inside this node's dequant
         }
     }
+    rknpu_materialize_deferred_gate(backend_ctx->deferred_gate, n_omp);
 
     return GGML_STATUS_SUCCESS;
 }
