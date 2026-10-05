@@ -460,22 +460,6 @@ static void test_dequant_tiled_rows(void) {
                             n_limit, common.data() + m0, chan.data());
                         CHECK(memcmp(a.data(), b.data(), a.size() * 4) == 0,
                               "tiled rows sub=%d n=%d ms=%d m0=%d nr=%d", sub, n_limit, m_stride, m0, nrows);
-
-                        // tile-major variant over all rows, split into tile ranges
-                        if (m0 == 0 && nrows == 1) {
-                            std::vector<float> at = init, bt = init;
-                            for (int r = 0; r < m_stride; ++r) {
-                                rknpu2_quantization::dequant_acc_int16_tiled_perchan(
-                                    at.data() + (size_t)r * stride, C.data(), r, m_stride, outer, sub, n_limit, common[r], chan.data());
-                            }
-                            for (int t0 = 0; t0 < outer; t0 += 2) {
-                                rknpu2_quantization::dequant_acc_int16_tiled_perchan_tiles(
-                                    bt.data(), stride, C.data(), m_stride, m_stride, t0, std::min(t0 + 2, outer), sub,
-                                    n_limit, common.data(), chan.data());
-                            }
-                            CHECK(memcmp(at.data(), bt.data(), at.size() * 4) == 0,
-                                  "tiled tiles sub=%d n=%d ms=%d", sub, n_limit, m_stride);
-                        }
                     }
                 }
             }
