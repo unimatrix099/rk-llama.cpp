@@ -853,7 +853,21 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     // and libgomp respawns its workers on every node (see
                     // rknpu_dispatch_pool)
                     const auto t_run = g_rknpu_profile.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                    backend_ctx->dispatch_pool.run_all(matmul_ctxs);
+                    // On ggml's own OpenMP team when it is wide enough: with
+                    // the team size matched to ggml's (set_n_threads), libgomp
+                    // keeps the team hot, so the segments start on workers
+                    // that are already spinning instead of waking pool threads
+                    // that compete with those spinners for the same cores.
+                    static const bool use_pool = std::getenv("RKNPU_DISPATCH_POOL") != nullptr;
+                    const int n_seg = (int)matmul_ctxs.size();
+                    if (!use_pool && n_seg > 1 && n_omp >= n_seg) {
+                        #pragma omp parallel for num_threads(n_omp) schedule(static, 1)
+                        for (int i = 0; i < n_seg; ++i) {
+                            matmul_ctxs[i]->run();
+                        }
+                    } else {
+                        backend_ctx->dispatch_pool.run_all(matmul_ctxs);
+                    }
                     if (g_rknpu_profile.on) g_rknpu_profile.run_ns += rknpu_profile::ns(t_run, std::chrono::steady_clock::now());
                 }
 
