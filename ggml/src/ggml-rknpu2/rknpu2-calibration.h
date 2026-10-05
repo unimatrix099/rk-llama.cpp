@@ -58,6 +58,13 @@ float calculate_entropy_amax(const float* data, size_t n_elements, int num_bins 
  */
 void hadamard_transform(float* dst, const float* src, int K, int padded_size);
 
+// One block of hadamard_transform: writes dst[b*block, (b+1)*block) exactly
+// as hadamard_transform would (copy of src over [0, K), zero padding up to
+// padded_size, then the in-place FWHT of that block). Blocks are
+// independent, so callers may split them across threads with identical
+// results.
+void hadamard_transform_block(float* dst, const float* src, int K, int padded_size, int b);
+
 /**
  * @brief Calculates the next power of two for a given integer.
  * @param n The input integer.

@@ -768,10 +768,68 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     // the loop below runs per row per node
                     const float a_clip = rknpu2_calibration::a_clip_factor();
 
+                    // Decode (M == 1) on the INT4 native path: split the one
+                    // row across ggml's (hot, size-matched) OpenMP team —
+                    // Hadamard blocks per thread, then amax and quantization
+                    // in 64-element chunks. Element-exact vs the per-row loop
+                    // below: blocks are independent, max is order-free, and
+                    // chunk edges sit on the kernels' vector boundaries
+                    // (test_prep_split in test-rknpu2-prep-kernels.cpp).
+                    static const bool prep_serial = std::getenv("RKNPU_DISPATCH_POOL") != nullptr;
+                    const bool prep_on_team = M == 1 && n_omp > 1 && n_omp <= 64 && !prep_serial &&
+                                              pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4 && a_native;
+                    if (prep_on_team) {
+                        const float* src_row = x;
+                        std::vector<float> signed_row(is_hadamard ? K : 0);
+                        std::vector<float> full_row(is_hadamard ? K_op : 0);
+                        std::vector<uint8_t> packed_row(K_seg_op / 2);
+                        float amax_part[64];
+                        float scale = 0.0f;
+                        const int block = is_hadamard ? rknpu2_calibration::hadamard_block_len(K) : 1;
+                        const int n_blocks = is_hadamard ? K_op / block : 0;
+                        const int CH = 64;
+                        const int n_chunks = (K_seg_op + CH - 1) / CH;
+                        #pragma omp parallel num_threads(n_omp)
+                        {
+                            const int t = omp_get_thread_num();
+                            const int T = omp_get_num_threads();
+                            if (is_hadamard) {
+                                for (int b = t; b < n_blocks; b += T) {
+                                    const int off = b * block;
+                                    const int lim = std::min(off + block, K);
+                                    if (lim > off) {
+                                        rknpu2_quantization::mul_fp32(signed_row.data() + off, src_row + off, s_vec.data() + off, lim - off);
+                                    }
+                                    rknpu2_calibration::hadamard_transform_block(full_row.data(), signed_row.data(), K, K_op, b);
+                                }
+                                #pragma omp barrier
+                            }
+                            const float* ready = (is_hadamard ? full_row.data() : src_row) + k_seg.offset_k;
+                            const int e0 = (n_chunks * t / T) * CH;
+                            const int e1 = std::min((n_chunks * (t + 1) / T) * CH, K_seg_op);
+                            amax_part[t] = e1 > e0 ? rknpu2_quantization::amax_fp32(ready + e0, e1 - e0) : 0.0f;
+                            #pragma omp barrier
+                            #pragma omp single
+                            {
+                                float mx = 0.0f;
+                                for (int i = 0; i < T; ++i) mx = std::max(mx, amax_part[i]);
+                                // clip < 1 saturates the far tail for finer steps
+                                // on the mass (RKNPU_A_CLIP, decode research #3d)
+                                scale = a_clip * mx / 7.0f;
+                            }
+                            if (e1 > e0) {
+                                rknpu2_quantization::quantize_fp32_to_int4_packed(ready + e0, packed_row.data() + e0 / 2, e1 - e0, scale);
+                            }
+                        }
+                        scales_A[0] = scale;
+                        rknpu2_native_scatter_row((uint8_t*)dst_base, packed_row.data(), 0,
+                                                  a_geom.m_stride, a_geom.outer, a_geom.sub / 2);
+                    }
+
                     // if(M > 1): at decode a single row costs a few us of NEON;
                     // forming a team per node is what libgomp punishes (#3)
                     #pragma omp parallel for if(M > 1) num_threads(n_omp)
-                    for (int m = 0; m < M; ++m) {
+                    for (int m = 0; m < (prep_on_team ? 0 : M); ++m) {
                         const float* src_row = x + (size_t)m * row_stride;
                         std::vector<float> ready_row(K_seg_op);
 

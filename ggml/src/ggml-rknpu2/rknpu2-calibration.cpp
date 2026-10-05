@@ -343,4 +343,19 @@ void hadamard_transform(float* dst, const float* src, int K, int padded_size) {
     }
 }
 
+void hadamard_transform_block(float* dst, const float* src, int K, int padded_size, int b) {
+    const int block = hadamard_block_len(K);
+    const int off = b * block;
+    if (off >= padded_size) return;
+    const int lim = std::min(off + block, K);
+    if (lim > off) {
+        memcpy(dst + off, src + off, (lim - off) * sizeof(float));
+    }
+    const int zero_from = std::max(off, lim);
+    if (off + block > zero_from) {
+        memset(dst + zero_from, 0, (off + block - zero_from) * sizeof(float));
+    }
+    fwht_iterative(dst + off, block);
+}
+
 } // namespace rknpu2_calibration

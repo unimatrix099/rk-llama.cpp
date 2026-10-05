@@ -393,6 +393,45 @@ static void test_hadamard_blocked(void) {
     }
 }
 
+// The backend's M=1 prep splits the row across its OpenMP team: Hadamard
+// blocks per thread, then amax and int4 quantization in 64-element chunks.
+// Both must be element-exact against the whole-row calls.
+static void test_prep_split(void) {
+    for (int K : {2560, 10240, 10752, 1536, 256, 96, 12}) {
+        const int K_op = rknpu2_calibration::hadamard_k_op(K);
+        const int block = rknpu2_calibration::hadamard_block_len(K);
+        std::vector<float> src(K);
+        for (auto& v : src) v = frand();
+
+        std::vector<float> whole(K_op, -777.0f), split(K_op, -777.0f);
+        rknpu2_calibration::hadamard_transform(whole.data(), src.data(), K, K_op);
+        for (int b = K_op / block - 1; b >= 0; --b) {   // reverse order: blocks are independent
+            rknpu2_calibration::hadamard_transform_block(split.data(), src.data(), K, K_op, b);
+        }
+        CHECK(memcmp(whole.data(), split.data(), K_op * 4) == 0, "hadamard per-block K=%d", K);
+
+        // chunked amax + quantize, as split across T threads
+        const int n = K_op - (K_op % 2);
+        const float amax_whole = rknpu2_quantization::amax_fp32(whole.data(), n);
+        const float scale = 0.9f * amax_whole / 7.0f;
+        std::vector<uint8_t> q_whole(n / 2), q_split(n / 2, 0xAA);
+        rknpu2_quantization::quantize_fp32_to_int4_packed(whole.data(), q_whole.data(), n, scale);
+        for (int T : {1, 2, 3, 4, 7}) {
+            const int CH = 64, nch = (n + CH - 1) / CH;
+            float mx = 0.0f;
+            for (int t = 0; t < T; ++t) {
+                const int e0 = (nch * t / T) * CH, e1 = std::min((nch * (t + 1) / T) * CH, n);
+                if (e1 > e0) {
+                    mx = std::max(mx, rknpu2_quantization::amax_fp32(whole.data() + e0, e1 - e0));
+                    rknpu2_quantization::quantize_fp32_to_int4_packed(whole.data() + e0, q_split.data() + e0 / 2, e1 - e0, scale);
+                }
+            }
+            CHECK(mx == amax_whole, "chunked amax K=%d T=%d", K, T);
+            CHECK(memcmp(q_whole.data(), q_split.data(), n / 2) == 0, "chunked int4 K=%d T=%d", K, T);
+        }
+    }
+}
+
 int main(void) {
     test_quantize_int8();
     test_quantize_int4();
@@ -406,6 +445,7 @@ int main(void) {
     test_existing_conversions();
     test_hadamard();
     test_hadamard_blocked();
+    test_prep_split();
     CHECK(rknpu2_calibration::next_power_of_two(0) == 1, "npot 0");
     CHECK(rknpu2_calibration::next_power_of_two(1) == 1, "npot 1");
     CHECK(rknpu2_calibration::next_power_of_two(3) == 4, "npot 3");
