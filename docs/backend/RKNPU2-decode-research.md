@@ -260,6 +260,73 @@ only other symptom was the CPU compute buffer silently growing from 118 to
 out-of-bounds read-back of a packed weight. After: 0/12 crashes, compute
 buffer back to normal, speed unchanged.
 
+### 1d. Prefill loop, part 1 — the quality gate was the wrong instrument (2026-10-05)
+
+Goal: E4B prefill on the NPU, metric `llama-bench -p 512 -n 0 -r 3 -t 4`
+(taskset 4-7, default W4A4), baseline **68.4 t/s** (noise 68.2-68.4).
+Harness: `rknpu2-autoresearch/prefill/`.
+
+**Prefill is CPU-bound.** `RKNPU_PROFILE` over pp512: NPU runs 11% of wall
+time, backend prep/dequant 33%, CPU ops outside the backend 56%. perf:
+`ggml_vec_dot_bf16_x4` 33.5% (the BF16 `per_layer_model_proj`, a
+2560x10752 GEMM done one column at a time), int16 dequant 19.3%, CPU flash
+attention 16.4%, FWHT 6.6%.
+
+**Three ways to take the BF16 tensor off the scalar path — all +32-42%:**
+
+| # | Change | pp512 | 8-chunk PPL (base 35.0480) | 32-chunk PPL (base 26.8771) |
+|---|---|---|---|---|
+| 1 | BF16 weights on the NPU as W8A8 per-channel | **97.4** | 35.1168 (+0.20%) | — |
+| 2 | BF16 weights on the NPU as W16A16 | 97.4 | 34.2145 (−2.38%) | — |
+| 3 | 4x4 NEON bf16 GEMM tiles on the CPU, fp32 accumulation | 90.6 | 35.9984 (+2.71%) | 26.8168 (−0.22%) |
+
+All three failed the loop's original quality gate (8-chunk PPL within
+0.1%) and were reverted. #3 is the tell: the operator was checked end to
+end through ggml against a double reference (worst relative error 5e-8,
+1.25 M outputs, real shapes), yet the 8-chunk PPL moved +2.7% — and the
+32-chunk PPL moved −0.22%. A 1e-7 perturbation cannot be a real 2.7%
+quality change.
+
+**Why: W4A4 output is chaotic.** KL divergence over 4 chunks
+(`llama-perplexity --kl-divergence`), first against the W4A4 baseline's
+own logits:
+
+| vs W4A4 baseline logits | Mean KLD | Same top token |
+|---|---|---|
+| pure CPU | 0.738 | 70.4% |
+| #3 (1e-7 change in one op) | 0.409 | 75.2% |
+| #1 | 0.392 | 74.1% |
+| #2 | 0.406 | 74.7% |
+
+A 1e-7 change in one operator flips the top token at a quarter of the
+positions: perturbations are amplified through the 4-bit activation
+rounding. The baseline's logits are one sample of that noise, not a
+reference. Against the **CPU** logits (the true model):
+
+| vs CPU logits | pp512 | Mean KLD | Same top token |
+|---|---|---|---|
+| W4A4 baseline | 68.4 | 0.591 ± 0.029 | 70.4% |
+| #1 BF16 → W8A8 | 97.4 | 0.580 ± 0.025 | 71.0% |
+| #2 BF16 → W16A16 | 97.4 | 0.576 ± 0.025 | 69.8% |
+| #3 BF16 GEMM | 90.6 | 0.597 ± 0.027 | 70.5% |
+
+All three are as close to the true model as the baseline. Two findings
+that outlive this loop:
+
+- **8-chunk PPL cannot gate W4A4 changes.** It scatters ±3% for any
+  non-bit-identical change; a tolerance below that passes or fails at
+  random. 32 chunks is far steadier.
+- **W4A4 agrees with the CPU's top token only ~70% of the time** (KLD
+  ≈ 0.59) although its 32-chunk PPL is at parity (26.88 vs 27.01).
+  Perplexity parity hid real per-token divergence; this matters when
+  choosing W4A4 over W8A8 for E4B.
+
+**New quality gate (agreed 2026-10-05)**, replacing "8-chunk PPL within
+0.1%": 32-chunk PPL ≤ +2% over the W4A4 baseline (≤ 27.41; reference
+points: Q8_0 ~+0.1%, Q5_K_M ~+1%, Q4_K_M ~+2-3% over FP16), **and** mean
+KLD vs the CPU logits ≤ 0.65 (baseline + 2 SE) with same-top ≥ 68%. Unit
+tests and the 3-run server stability check stay unchanged.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do

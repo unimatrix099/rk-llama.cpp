@@ -383,6 +383,9 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | `OMP_WAIT_POLICY=passive` | ⚠ superseded | +11.7% on the pre-loop build with no code; the loop's OpenMP dispatch gets more (7.78 vs 6.74) and no longer needs it |
 | Small weights on one NPU core | ❌ slower | 8.20 vs 8.24; even 2560x256 gains more from 3-core bandwidth than it loses to extra runs — decode research #1c |
 | Multi-core matmul context (`RKNN_NPU_CORE_0_1_2`) | ❌ unsupported | driver rejects the mask for matmul and falls back to one core — `rknpu2-run-latency-probe.c` |
+| Prefill profile (E4B pp512, 2026-10-05) | 📊 measured | CPU-bound: NPU busy 11% of wall time; BF16 `per_layer_model_proj` alone 33.5% of CPU samples — decode research #1d |
+| BF16 `per_layer_model_proj` off the scalar path | ⚠ pending re-gate | +32-42% pp512 (NPU W8A8 97.4, NPU W16A16 97.4, CPU NEON GEMM 90.6, vs 68.4); all three at baseline distance from the CPU model (KLD 0.58-0.60 vs 0.59) but failed the 8-chunk-PPL gate — decode research #1d |
+| 8-chunk PPL as a W4A4 quality gate | ❌ unusable | scatters ±3% for 1e-7 perturbations; W4A4 top-1 agreement with CPU is ~70% (KLD 0.59) despite PPL parity — decode research #1d |
 | Server segfault on empty output mul_mat | ✅ fixed | pre-existing ~50% crash in llama-server: rejected zero-row op → 713 MB packed read-back overrun. Accept empty ops, abort on packed read-back; 0/12 after — decode research #1c |
 | Drafter on CPU (`RKNPU_EXCLUDE_TYPES=f16`) | ❌ no effect | n=3 6.00 vs 5.99; kept as a diagnostic. `--device-draft` cannot do it (ACCEL buffer type) — decode research #1b |
 | unsloth `gemma-4-E4B-it-Q4_0.gguf` (current) | ⚠ not the measured file | mixed recipe (Q4_K embeddings, Q4_1/Q5_K, 720 tensors), CPU PPL ~2x ggml-org's; all E4B numbers here use ggml-org's Q4_0 |

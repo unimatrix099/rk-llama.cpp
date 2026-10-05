@@ -1,0 +1,6 @@
+# metric_direction: higher_is_better
+iteration	timestamp	commit	metric	delta	guard	guard-metric	status	description
+0	2026-10-05T13:20:04+00:00	f9bf58201	68.428	0.0	pass	35.0480	baseline	initial state (post decode loop + server fix)
+1	2026-10-05T13:24:17+00:00	b001a9cfe	97.421	+28.993	FAIL	ppl 35.1168 (+0.196%)	discard	BF16 weights on NPU as W8A8: +42% but PPL outside 0.1%
+2	2026-10-05T13:27:59+00:00	516f64b64	97.424	+28.996	FAIL	ppl 34.2145 (-2.38%)	discard	BF16 weights on NPU as W16A16: same speed, PPL shift too large (suspect fp16 range/subnormals; W16A16 path unvalidated)
+3	2026-10-05T13:41:03+00:00	7c55f0903	90.603	+22.175	FAIL	ppl8 35.9984 (+2.7%); ppl32 26.8168 (-0.22%); op exact to 5e-8	discard	4x4 NEON bf16 GEMM: correct op, but 8-chunk PPL under W4A4 scatters +-3% for any perturbation -> guard cannot pass non-identical changes
