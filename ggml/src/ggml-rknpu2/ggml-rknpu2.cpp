@@ -859,78 +859,6 @@ static void __attribute__((noinline)) rknpu_fused_up_geglu_block(
     }
 }
 
-// ---- Elementwise glue ops (RMS_NORM, ADD, MUL) on the backend ----
-// They sit between every pair of matmuls in a transformer layer; running them
-// here keeps the layer in one NPU split instead of bouncing to the CPU backend
-// (each boundary copies the split's input activations between buffers).
-// Arithmetic matches ggml-cpu exactly: one float op per element for ADD/MUL,
-// and for RMS_NORM the same four-accumulator double sum as ggml-cpu's NEON
-// path followed by x * scale.
-static bool rknpu_eltwise_supported(const struct ggml_tensor* op) {
-    const struct ggml_tensor *a = op->src[0], *b = op->src[1];
-    if (!a || a->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
-    if (a->nb[0] != 4 || op->nb[0] != 4 || !ggml_are_same_shape(a, op)) return false;
-    if (op->op == GGML_OP_RMS_NORM) return ggml_is_contiguous_rows(a) && ggml_is_contiguous_rows(op);
-    if (!b || b->type != GGML_TYPE_F32 || b->nb[0] != 4) return false;
-    return ggml_can_repeat(b, a) && ggml_is_contiguous_rows(b) && a->ne[0] % b->ne[0] == 0;
-}
-
-static void rknpu_eltwise(struct ggml_tensor* dst, int n_omp) {
-    const struct ggml_tensor *a = dst->src[0], *b = dst->src[1];
-    const char* a_base = (const char*)get_tensor_real_ptr(a);
-    const char* b_base = b ? (const char*)get_tensor_real_ptr(b) : nullptr;
-    char* d_base = (char*)get_tensor_real_ptr(dst);
-    const int64_t ne0 = a->ne[0], ne1 = a->ne[1], ne2 = a->ne[2], ne3 = a->ne[3];
-    const int64_t nr = ne1 * ne2 * ne3;
-    float eps = 0.0f;
-    if (dst->op == GGML_OP_RMS_NORM) memcpy(&eps, dst->op_params, sizeof(float));
-    #pragma omp parallel for num_threads(n_omp) if(nr > 1)
-    for (int64_t ir = 0; ir < nr; ++ir) {
-        const int64_t i3 = ir / (ne2 * ne1), i2 = (ir - i3 * ne2 * ne1) / ne1, i1 = ir - i3 * ne2 * ne1 - i2 * ne1;
-        const float* x = (const float*)(a_base + i1 * a->nb[1] + i2 * a->nb[2] + i3 * a->nb[3]);
-        float* y = (float*)(d_base + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
-        if (dst->op == GGML_OP_RMS_NORM) {
-            double sum = 0.0;
-            int64_t i = 0;
-#ifdef __ARM_NEON
-            float64x2_t s0 = vdupq_n_f64(0.0), s1 = s0, s2 = s0, s3 = s0;
-            for (; i + 8 <= ne0; i += 8) {
-                const float32x4_t va = vld1q_f32(x + i), vb = vld1q_f32(x + i + 4);
-                const float32x4_t pa = vmulq_f32(va, va), pb = vmulq_f32(vb, vb);
-                s0 = vaddq_f64(s0, vcvt_f64_f32(vget_low_f32(pa)));
-                s1 = vaddq_f64(s1, vcvt_high_f64_f32(pa));
-                s2 = vaddq_f64(s2, vcvt_f64_f32(vget_low_f32(pb)));
-                s3 = vaddq_f64(s3, vcvt_high_f64_f32(pb));
-            }
-            sum = vaddvq_f64(vaddq_f64(vaddq_f64(s0, s1), vaddq_f64(s2, s3)));
-#endif
-            for (; i < ne0; ++i) sum += (double)(x[i] * x[i]);
-            const float mean = sum / ne0;
-            const float scale = 1.0f / sqrtf(mean + eps);
-            i = 0;
-#ifdef __ARM_NEON
-            const float32x4_t vs = vdupq_n_f32(scale);
-            for (; i + 4 <= ne0; i += 4) vst1q_f32(y + i, vmulq_f32(vld1q_f32(x + i), vs));
-#endif
-            for (; i < ne0; ++i) y[i] = x[i] * scale;
-            continue;
-        }
-        const float* w = (const float*)(b_base + (i1 % b->ne[1]) * b->nb[1] + (i2 % b->ne[2]) * b->nb[2] + (i3 % b->ne[3]) * b->nb[3]);
-        const int64_t nw = b->ne[0];
-        const bool is_add = dst->op == GGML_OP_ADD;
-        for (int64_t r0 = 0; r0 < ne0; r0 += nw) {
-            int64_t i = 0;
-#ifdef __ARM_NEON
-            for (; i + 4 <= nw; i += 4) {
-                const float32x4_t xv = vld1q_f32(x + r0 + i), wv = vld1q_f32(w + i);
-                vst1q_f32(y + r0 + i, is_add ? vaddq_f32(xv, wv) : vmulq_f32(xv, wv));
-            }
-#endif
-            for (; i < nw; ++i) y[r0 + i] = is_add ? x[r0 + i] + w[i] : x[r0 + i] * w[i];
-        }
-    }
-}
-
 static bool rknpu_fa_supported(const struct ggml_tensor* op) {
     const struct ggml_tensor *q = op->src[0], *k = op->src[1], *v = op->src[2], *mask = op->src[3], *sinks = op->src[4];
     if (!q || !k || !v || sinks) return false;
@@ -1060,10 +988,6 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
         }
         if (node->op == GGML_OP_GLU) {
             rknpu_geglu(node, n_omp);
-            continue;
-        }
-        if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
-            rknpu_eltwise(node, n_omp);
             continue;
         }
         if (node->op != GGML_OP_MUL_MAT) continue;
@@ -2423,16 +2347,6 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
     switch (op->op) {
         case GGML_OP_NONE:
             return true;
-
-        case GGML_OP_RMS_NORM:
-        case GGML_OP_ADD:
-        case GGML_OP_MUL: {
-            static const bool elt_enabled = []() {
-                const char* env = std::getenv("RKNPU_ELTWISE");
-                return env == nullptr || std::atoi(env) != 0;
-            }();
-            return elt_enabled && rknpu_eltwise_supported(op);
-        }
 
         case GGML_OP_GLU: {
             static const bool glu_enabled = []() {
