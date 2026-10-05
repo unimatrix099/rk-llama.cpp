@@ -668,6 +668,15 @@ struct rknpu_profile {
 };
 static rknpu_profile g_rknpu_profile;
 
+// RKNPU_PIPELINE=0 disables the pipelined W4A4 prefill path
+static bool rknpu_pipeline_enabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("RKNPU_PIPELINE");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 // ===========================================
 // ===== Flash attention on the NPU (prefill) =====
 // ===========================================
@@ -988,7 +997,17 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
 
         // Cleaning the C-matrix buffer, every slice of it
         float* dst_data = (float*)get_tensor_real_ptr(dst);
-        for (int64_t ib = 0; ib < nbatch; ++ib) {
+        // The pipelined prefill path (below) stores on the first K-segment
+        // instead of accumulating, so its M x N output is not zeroed here
+        // (a serial memset on the main thread, ~8% of pp512). Same
+        // conditions as `pipelined` there.
+        const bool pipelined_node = rknpu_pipeline_enabled() && nbatch == 1 && M > 256 &&
+            pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4 &&
+            pipeline->npu_type_c == rknpu2_configuration::NPU_TYPE_INT16 &&
+            pipeline->ac_layout == RKNN_MM_LAYOUT_NATIVE &&
+            (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4 || pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8) &&
+            rknpu2_calibration::per_channel_b_scales() && n_omp > 1;
+        for (int64_t ib = 0; ib < nbatch && !pipelined_node; ++ib) {
             memset((char*)dst_data + ib * dst_batch_nb, 0, (size_t)M * N * sizeof(float));
         }
 
@@ -1100,16 +1119,9 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 // extra B read per chunk (prefill NPU runs are compute-bound:
                 // 1.55 vs 1.62 ms/token at M=512 vs 256). RKNPU_PIPELINE=0
                 // disables it.
-                static const bool pipeline_enabled = []() {
-                    const char* env = std::getenv("RKNPU_PIPELINE");
-                    return env == nullptr || std::atoi(env) != 0;
-                }();
                 const int MC = 256;
-                const bool pipelined = pipeline_enabled && nbatch == 1 && M > MC &&
-                    pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4 &&
-                    pipeline->npu_type_c == rknpu2_configuration::NPU_TYPE_INT16 &&
-                    pipeline->ac_layout == RKNN_MM_LAYOUT_NATIVE && b_per_channel && n_omp > 1;
-                if (pipelined) {
+                static_assert(MC == 256, "pipelined_node uses M > 256");
+                if (pipelined_node) {
                     const int n_chunks = (M + MC - 1) / MC;
                     // chunk contexts (M_op = MC), B bound once per context
                     std::vector<std::shared_ptr<rknpu_matmul_context>> cctx(num_active_segments);
@@ -1218,10 +1230,12 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                                     (const int16_t*)c_slot[c & 1][idx]->virt_addr, r0, nr,
                                     c_geom[idx].m_stride, c_geom[idx].outer, c_geom[idx].sub,
                                     active_n_segments[idx].size_n, common,
-                                    scales_B_grid->data() + k_idx * (size_t)N + N_offset);
+                                    scales_B_grid->data() + k_idx * (size_t)N + N_offset,
+                                    /*store=*/ k_idx == 0);   // dst not zeroed (pipelined_node)
                             }
                         }
                     };
+
 
                     const auto t_run = g_rknpu_profile.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     prep(0);

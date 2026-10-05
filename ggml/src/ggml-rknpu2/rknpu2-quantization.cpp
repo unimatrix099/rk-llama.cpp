@@ -203,7 +203,7 @@ void dequant_acc_int16_tiled_perchan(float * dst, const int16_t * src_native,
 // body for full 8-groups, same mul-then-fma tail), so results are identical.
 void dequant_acc_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const int16_t * src_native,
                                           int32_t m0, int32_t nrows, int32_t m_stride, int32_t outer, int32_t sub,
-                                          int32_t n_limit, const float * common, const float * chan_scales) {
+                                          int32_t n_limit, const float * common, const float * chan_scales, bool store) {
     for (int32_t t = 0; t < outer; ++t) {
         const int32_t n0 = t * sub;
         const int32_t lim = std::min(sub, n_limit - n0);
@@ -223,12 +223,18 @@ void dequant_acc_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const 
                 float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16)));
                 float32x4_t sc0 = vmulq_f32(vld1q_f32(cs + i),     vc);
                 float32x4_t sc1 = vmulq_f32(vld1q_f32(cs + i + 4), vc);
-                vst1q_f32(d + i,     vfmaq_f32(vld1q_f32(d + i),     f0, sc0));
-                vst1q_f32(d + i + 4, vfmaq_f32(vld1q_f32(d + i + 4), f1, sc1));
+                if (store) {
+                    vst1q_f32(d + i,     vmulq_f32(f0, sc0));
+                    vst1q_f32(d + i + 4, vmulq_f32(f1, sc1));
+                } else {
+                    vst1q_f32(d + i,     vfmaq_f32(vld1q_f32(d + i),     f0, sc0));
+                    vst1q_f32(d + i + 4, vfmaq_f32(vld1q_f32(d + i + 4), f1, sc1));
+                }
             }
 #endif
             for (; i < (size_t)lim; ++i) {
-                d[i] = fmaf((float)cell[i], cs[i] * common[r], d[i]);
+                d[i] = store ? (float)cell[i] * (cs[i] * common[r])
+                             : fmaf((float)cell[i], cs[i] * common[r], d[i]);
             }
         }
     }
