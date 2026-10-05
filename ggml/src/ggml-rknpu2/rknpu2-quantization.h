@@ -102,7 +102,7 @@ void dequant_acc_int16_tiled_perchan(float * dst, const int16_t * src_native,
                                      int32_t n_limit, float common, const float * chan_scales);
 void dequant_acc_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const int16_t * src_native,
                                           int32_t m0, int32_t nrows, int32_t m_stride, int32_t outer, int32_t sub,
-                                          int32_t n_limit, const float * common, const float * chan_scales, bool store);
+                                          int32_t n_limit, const float * common, const float * chan_scales);
 
 /**
  * @brief Per-output-channel dequantize-accumulate for INT32 C matrices

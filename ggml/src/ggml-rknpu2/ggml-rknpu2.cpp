@@ -642,22 +642,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
         const size_t  dst_batch_nb  = (dst->ne[2]  > 1) ? dst->nb[2]  : dst->nb[3];
         const char* const src1_base = (const char*)get_tensor_real_ptr(src1);
 
-        // Cleaning the C-matrix buffer, every slice of it — except on the
-        // prefill path that dequantizes native INT16 C row blocks with
-        // per-channel scales: there the first K-segment stores instead of
-        // accumulating, so zeroing M x N floats (and reading the zeros back)
-        // is skipped. Same conditions as rows_path in section 5.
-        const bool store_first_k = M > 1 &&
-            pipeline->npu_type_c == rknpu2_configuration::NPU_TYPE_INT16 &&
-            pipeline->ac_layout == RKNN_MM_LAYOUT_NATIVE &&
-            (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4 ||
-             pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8) &&
-            rknpu2_calibration::per_channel_b_scales();
+        // Cleaning the C-matrix buffer, every slice of it
         float* dst_data = (float*)get_tensor_real_ptr(dst);
-        if (!store_first_k) {
-            for (int64_t ib = 0; ib < nbatch; ++ib) {
-                memset((char*)dst_data + ib * dst_batch_nb, 0, (size_t)M * N * sizeof(float));
-            }
+        for (int64_t ib = 0; ib < nbatch; ++ib) {
+            memset((char*)dst_data + ib * dst_batch_nb, 0, (size_t)M * N * sizeof(float));
         }
 
         // Acquiring the Hadamard vector
@@ -1066,8 +1054,6 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     for (size_t idx = 0; idx < num_active_segments && rows_path; idx++) {
                         rows_path = c_native[idx] != 0;
                     }
-                    // dst was not zeroed for this path (store_first_k)
-                    GGML_ASSERT(rows_path == store_first_k && "RKNPU2: store_first_k / rows_path mismatch");
                     if (rows_path) {
                         const int n_blocks = (M + 3) / 4;
                         #pragma omp parallel for num_threads(n_omp)
@@ -1085,8 +1071,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                                     (const int16_t*)mem_C_segments[idx]->virt_addr, m0, nr,
                                     c_geoms[idx].m_stride, c_geoms[idx].outer, c_geoms[idx].sub,
                                     active_n_segments[idx].size_n, common,
-                                    scales_B_grid->data() + k_idx * (size_t)N + N_offset,
-                                    /*store=*/ k_idx == 0);
+                                    scales_B_grid->data() + k_idx * (size_t)N + N_offset);
                             }
                         }
                     } else {
