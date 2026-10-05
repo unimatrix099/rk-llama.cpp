@@ -191,19 +191,6 @@ static bool is_power_of_two(int n) {
 }
 
 // Iterative Fast Walsh-Hadamard Transform (in-place)
-#ifdef __ARM_NEON
-// stages h=1 and h=2 of one 4-element group, in registers (the first two
-// FWHT stages never leave a 4-lane vector)
-static inline float32x4_t fwht4(float32x4_t v) {
-    const float32x4_t sw = vrev64q_f32(v);
-    const float32x4_t u  = vtrn1q_f32(vaddq_f32(v, sw), vsubq_f32(v, sw));      // h=1
-    const float32x2_t lo = vget_low_f32(u), hi = vget_high_f32(u);
-    return vcombine_f32(vadd_f32(lo, hi), vsub_f32(lo, hi));                    // h=2
-}
-
-static void fwht_stages_from4(float* data, int size);
-#endif
-
 static void fwht_iterative(float* data, int size) {
 #ifdef __ARM_NEON
     if (size >= 4) {
@@ -224,7 +211,69 @@ static void fwht_iterative(float* data, int size) {
             vst1_f32(data + i,     vadd_f32(lo, hi));
             vst1_f32(data + i + 2, vsub_f32(lo, hi));
         }
-        fwht_stages_from4(data, size);
+        // stages h>=4: contiguous 4-wide butterflies, two stages (h, 2h) per
+        // pass over the data (radix-4). Same adds and subtracts in the same
+        // order as two separate passes — stage h makes a+b, a-b, c+d, c-d and
+        // stage 2h combines them — so results are bit-identical, with half
+        // the load/store passes.
+        int h = 4;
+        // three stages (h, 2h, 4h) per pass while they fit (radix-8)
+        for (; h * 4 < size; h <<= 3) {
+            for (int i = 0; i < size; i += h * 8) {
+                for (int j = i; j < i + h; j += 4) {
+                    float32x4_t v0 = vld1q_f32(data + j),         v1 = vld1q_f32(data + j + h);
+                    float32x4_t v2 = vld1q_f32(data + j + 2 * h), v3 = vld1q_f32(data + j + 3 * h);
+                    float32x4_t v4 = vld1q_f32(data + j + 4 * h), v5 = vld1q_f32(data + j + 5 * h);
+                    float32x4_t v6 = vld1q_f32(data + j + 6 * h), v7 = vld1q_f32(data + j + 7 * h);
+                    // stage h
+                    float32x4_t t0 = vaddq_f32(v0, v1), t1 = vsubq_f32(v0, v1);
+                    float32x4_t t2 = vaddq_f32(v2, v3), t3 = vsubq_f32(v2, v3);
+                    float32x4_t t4 = vaddq_f32(v4, v5), t5 = vsubq_f32(v4, v5);
+                    float32x4_t t6 = vaddq_f32(v6, v7), t7 = vsubq_f32(v6, v7);
+                    // stage 2h
+                    v0 = vaddq_f32(t0, t2); v2 = vsubq_f32(t0, t2);
+                    v1 = vaddq_f32(t1, t3); v3 = vsubq_f32(t1, t3);
+                    v4 = vaddq_f32(t4, t6); v6 = vsubq_f32(t4, t6);
+                    v5 = vaddq_f32(t5, t7); v7 = vsubq_f32(t5, t7);
+                    // stage 4h
+                    vst1q_f32(data + j,         vaddq_f32(v0, v4));
+                    vst1q_f32(data + j + 4 * h, vsubq_f32(v0, v4));
+                    vst1q_f32(data + j + h,     vaddq_f32(v1, v5));
+                    vst1q_f32(data + j + 5 * h, vsubq_f32(v1, v5));
+                    vst1q_f32(data + j + 2 * h, vaddq_f32(v2, v6));
+                    vst1q_f32(data + j + 6 * h, vsubq_f32(v2, v6));
+                    vst1q_f32(data + j + 3 * h, vaddq_f32(v3, v7));
+                    vst1q_f32(data + j + 7 * h, vsubq_f32(v3, v7));
+                }
+            }
+        }
+        for (; h * 2 < size; h <<= 2) {
+            for (int i = 0; i < size; i += h * 4) {
+                for (int j = i; j < i + h; j += 4) {
+                    const float32x4_t a = vld1q_f32(data + j);
+                    const float32x4_t b = vld1q_f32(data + j + h);
+                    const float32x4_t c = vld1q_f32(data + j + 2 * h);
+                    const float32x4_t d = vld1q_f32(data + j + 3 * h);
+                    const float32x4_t a1 = vaddq_f32(a, b), b1 = vsubq_f32(a, b);
+                    const float32x4_t c1 = vaddq_f32(c, d), d1 = vsubq_f32(c, d);
+                    vst1q_f32(data + j,         vaddq_f32(a1, c1));
+                    vst1q_f32(data + j + h,     vaddq_f32(b1, d1));
+                    vst1q_f32(data + j + 2 * h, vsubq_f32(a1, c1));
+                    vst1q_f32(data + j + 3 * h, vsubq_f32(b1, d1));
+                }
+            }
+        }
+        // odd stage count: one last single stage
+        for (; h < size; h <<= 1) {
+            for (int i = 0; i < size; i += h * 2) {
+                for (int j = i; j < i + h; j += 4) {
+                    float32x4_t x = vld1q_f32(data + j);
+                    float32x4_t y = vld1q_f32(data + j + h);
+                    vst1q_f32(data + j,     vaddq_f32(x, y));
+                    vst1q_f32(data + j + h, vsubq_f32(x, y));
+                }
+            }
+        }
         return;
     }
 #endif
@@ -239,75 +288,6 @@ static void fwht_iterative(float* data, int size) {
         }
     }
 }
-
-#ifdef __ARM_NEON
-// FWHT stages h >= 4 (radix-8, then radix-4, then single passes)
-static void fwht_stages_from4(float* data, int size) {
-        // stages h>=4: contiguous 4-wide butterflies, two stages (h, 2h) per
-    // pass over the data (radix-4). Same adds and subtracts in the same
-    // order as two separate passes — stage h makes a+b, a-b, c+d, c-d and
-    // stage 2h combines them — so results are bit-identical, with half
-    // the load/store passes.
-    int h = 4;
-    // three stages (h, 2h, 4h) per pass while they fit (radix-8)
-    for (; h * 4 < size; h <<= 3) {
-        for (int i = 0; i < size; i += h * 8) {
-            for (int j = i; j < i + h; j += 4) {
-                float32x4_t v0 = vld1q_f32(data + j),         v1 = vld1q_f32(data + j + h);
-                float32x4_t v2 = vld1q_f32(data + j + 2 * h), v3 = vld1q_f32(data + j + 3 * h);
-                float32x4_t v4 = vld1q_f32(data + j + 4 * h), v5 = vld1q_f32(data + j + 5 * h);
-                float32x4_t v6 = vld1q_f32(data + j + 6 * h), v7 = vld1q_f32(data + j + 7 * h);
-                // stage h
-                float32x4_t t0 = vaddq_f32(v0, v1), t1 = vsubq_f32(v0, v1);
-                float32x4_t t2 = vaddq_f32(v2, v3), t3 = vsubq_f32(v2, v3);
-                float32x4_t t4 = vaddq_f32(v4, v5), t5 = vsubq_f32(v4, v5);
-                float32x4_t t6 = vaddq_f32(v6, v7), t7 = vsubq_f32(v6, v7);
-                // stage 2h
-                v0 = vaddq_f32(t0, t2); v2 = vsubq_f32(t0, t2);
-                v1 = vaddq_f32(t1, t3); v3 = vsubq_f32(t1, t3);
-                v4 = vaddq_f32(t4, t6); v6 = vsubq_f32(t4, t6);
-                v5 = vaddq_f32(t5, t7); v7 = vsubq_f32(t5, t7);
-                // stage 4h
-                vst1q_f32(data + j,         vaddq_f32(v0, v4));
-                vst1q_f32(data + j + 4 * h, vsubq_f32(v0, v4));
-                vst1q_f32(data + j + h,     vaddq_f32(v1, v5));
-                vst1q_f32(data + j + 5 * h, vsubq_f32(v1, v5));
-                vst1q_f32(data + j + 2 * h, vaddq_f32(v2, v6));
-                vst1q_f32(data + j + 6 * h, vsubq_f32(v2, v6));
-                vst1q_f32(data + j + 3 * h, vaddq_f32(v3, v7));
-                vst1q_f32(data + j + 7 * h, vsubq_f32(v3, v7));
-            }
-        }
-    }
-    for (; h * 2 < size; h <<= 2) {
-        for (int i = 0; i < size; i += h * 4) {
-            for (int j = i; j < i + h; j += 4) {
-                const float32x4_t a = vld1q_f32(data + j);
-                const float32x4_t b = vld1q_f32(data + j + h);
-                const float32x4_t c = vld1q_f32(data + j + 2 * h);
-                const float32x4_t d = vld1q_f32(data + j + 3 * h);
-                const float32x4_t a1 = vaddq_f32(a, b), b1 = vsubq_f32(a, b);
-                const float32x4_t c1 = vaddq_f32(c, d), d1 = vsubq_f32(c, d);
-                vst1q_f32(data + j,         vaddq_f32(a1, c1));
-                vst1q_f32(data + j + h,     vaddq_f32(b1, d1));
-                vst1q_f32(data + j + 2 * h, vsubq_f32(a1, c1));
-                vst1q_f32(data + j + 3 * h, vsubq_f32(b1, d1));
-            }
-        }
-    }
-    // odd stage count: one last single stage
-    for (; h < size; h <<= 1) {
-        for (int i = 0; i < size; i += h * 2) {
-            for (int j = i; j < i + h; j += 4) {
-                float32x4_t x = vld1q_f32(data + j);
-                float32x4_t y = vld1q_f32(data + j + h);
-                vst1q_f32(data + j,     vaddq_f32(x, y));
-                vst1q_f32(data + j + h, vsubq_f32(x, y));
-            }
-        }
-    }
-}
-#endif
 
 int next_power_of_two(int n) {
     if (n == 0) return 1;
@@ -419,20 +399,6 @@ void hadamard_transform_signed(float* dst, const float* src, const float* signs,
     // == mul_fp32(tmp, src, signs, K) followed by hadamard_transform(dst,
     // tmp, K, padded_size): the products go straight into dst instead of
     // through a scratch row and a memcpy
-    const int block = hadamard_block_len(K);
-#ifdef __ARM_NEON
-    // natural block-diagonal case: the sign multiply and FWHT stages h=1,2
-    // in one pass over the row (same ops in the same order as below)
-    if (padded_size == K && block >= 4 && K % 4 == 0) {
-        for (int i = 0; i < K; i += 4) {
-            vst1q_f32(dst + i, fwht4(vmulq_f32(vld1q_f32(src + i), vld1q_f32(signs + i))));
-        }
-        for (int off = 0; off < K; off += block) {
-            fwht_stages_from4(dst + off, block);
-        }
-        return;
-    }
-#endif
     int i = 0;
 #ifdef __ARM_NEON
     for (; i + 4 <= K; i += 4) {
@@ -445,6 +411,7 @@ void hadamard_transform_signed(float* dst, const float* src, const float* signs,
     if (padded_size > K) {
         memset(dst + K, 0, (padded_size - K) * sizeof(float));
     }
+    const int block = hadamard_block_len(K);
     for (int off = 0; off < padded_size; off += block) {
         fwht_iterative(dst + off, block);
     }
