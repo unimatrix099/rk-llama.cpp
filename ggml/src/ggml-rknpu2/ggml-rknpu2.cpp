@@ -732,79 +732,96 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
     const int64_t ik3 = i3 / (n_seq / k->ne[3]);
     const int64_t iv3 = i3 / (n_seq / v->ne[3]);
     const char* m_seq = mask ? m_base + (i3 % mask->ne[3]) * mask->nb[3] : nullptr;
+
+    // Phase-by-phase over all KV heads, so the heads' matmuls run
+    // concurrently on separate NPU cores (core g % 3) and the CPU phases
+    // use the whole team across all heads' rows.
+    std::vector<rknpu_attn_context*> qk(n_kvh), pv(n_kvh);
     for (int64_t g = 0; g < n_kvh; ++g) {
         const int core = (int)(g % 3);
-        rknpu_attn_context* qk = bctx->get_attn_ctx((int)M, (int)DK, (int)n_kv, RKNN_MM_LAYOUT_TP_NORM, core);
-        rknpu_attn_context* pv = bctx->get_attn_ctx((int)M, (int)n_kv, (int)DV, RKNN_MM_LAYOUT_NORM, core);
-        GGML_ASSERT(qk && pv && "RKNPU2: attention matmul context creation failed");
+        qk[g] = bctx->get_attn_ctx((int)M, (int)DK, (int)n_kv, RKNN_MM_LAYOUT_TP_NORM, core);
+        pv[g] = bctx->get_attn_ctx((int)M, (int)n_kv, (int)DV, RKNN_MM_LAYOUT_NORM, core);
+        GGML_ASSERT(qk[g] && pv[g] && "RKNPU2: attention matmul context creation failed");
+    }
+    const int64_t R = n_kvh * M;   // rows over all heads
 
-        // A = Q rows of the rk2 heads of this group, FP16, row r = hh*n_q + i
-        uint16_t* a = (uint16_t*)qk->A->virt_addr;
-        #pragma omp parallel for num_threads(n_omp)
-        for (int64_t r = 0; r < M; ++r) {
-            const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
-            rknpu_fp32_to_fp16((const float*)(q_base + i * q->nb[1] + h * q->nb[2] + i3 * q->nb[3]), a + r * DK, DK);
-        }
-        // B = K rows (n_kv x DK, TP_NORM) and V rows (n_kv x DV, NORM)
-        uint16_t* bk = (uint16_t*)qk->B->virt_addr;
-        uint16_t* bv = (uint16_t*)pv->B->virt_addr;
-        for (int64_t j = 0; j < n_kv; ++j) {
-            memcpy(bk + j * DK, k_base + j * k->nb[1] + g * k->nb[2] + ik3 * k->nb[3], DK * 2);
-            memcpy(bv + j * DV, v_base + j * v->nb[1] + g * v->nb[2] + iv3 * v->nb[3], DV * 2);
-        }
-        rknn_mem_sync(qk->ctx, qk->A, RKNN_MEMORY_SYNC_TO_DEVICE);
-        rknn_mem_sync(qk->ctx, qk->B, RKNN_MEMORY_SYNC_TO_DEVICE);
-        rknn_mem_sync(pv->ctx, pv->B, RKNN_MEMORY_SYNC_TO_DEVICE);
+    // 1. A = Q rows (row r = hh*n_q + i of head group g), B = K and V rows
+    #pragma omp parallel for num_threads(n_omp)
+    for (int64_t gr = 0; gr < R; ++gr) {
+        const int64_t g = gr / M, r = gr % M;
+        const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
+        rknpu_fp32_to_fp16((const float*)(q_base + i * q->nb[1] + h * q->nb[2] + i3 * q->nb[3]),
+                           (uint16_t*)qk[g]->A->virt_addr + r * DK, DK);
+    }
+    #pragma omp parallel for num_threads(n_omp)
+    for (int64_t gj = 0; gj < n_kvh * n_kv; ++gj) {
+        const int64_t g = gj / n_kv, j = gj % n_kv;
+        memcpy((uint16_t*)qk[g]->B->virt_addr + j * DK, k_base + j * k->nb[1] + g * k->nb[2] + ik3 * k->nb[3], DK * 2);
+        memcpy((uint16_t*)pv[g]->B->virt_addr + j * DV, v_base + j * v->nb[1] + g * v->nb[2] + iv3 * v->nb[3], DV * 2);
+    }
+    for (int64_t g = 0; g < n_kvh; ++g) {
+        rknn_mem_sync(qk[g]->ctx, qk[g]->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+        rknn_mem_sync(qk[g]->ctx, qk[g]->B, RKNN_MEMORY_SYNC_TO_DEVICE);
+        rknn_mem_sync(pv[g]->ctx, pv[g]->B, RKNN_MEMORY_SYNC_TO_DEVICE);
         // Re-bind B after writing it: for a non-native B the driver converts
         // it to its internal layout at set_io_mem time, so data written into
         // an already-bound buffer is never seen (P*V came back all zeros)
-        RKNN_CHECK(rknn_matmul_set_io_mem(qk->ctx, qk->B, &qk->io_attr.B), "set_io_mem attn K");
-        RKNN_CHECK(rknn_matmul_set_io_mem(pv->ctx, pv->B, &pv->io_attr.B), "set_io_mem attn V");
-        rknn_matmul_run(qk->ctx);
-        rknn_mem_sync(qk->ctx, qk->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+        RKNN_CHECK(rknn_matmul_set_io_mem(qk[g]->ctx, qk[g]->B, &qk[g]->io_attr.B), "set_io_mem attn K");
+        RKNN_CHECK(rknn_matmul_set_io_mem(pv[g]->ctx, pv[g]->B, &pv[g]->io_attr.B), "set_io_mem attn V");
+    }
 
-        // softmax rows into P (FP16) = A of the second matmul
-        const float* S = (const float*)qk->C->virt_addr;
-        uint16_t* P = (uint16_t*)pv->A->virt_addr;
-        #pragma omp parallel for num_threads(n_omp)
-        for (int64_t r = 0; r < M; ++r) {
-            const int64_t i = r % n_q;
-            static thread_local std::vector<float> row;
-            if ((int64_t)row.size() < n_kv) row.resize(n_kv);
-            const float* s_row = S + r * n_kv;
-            const ggml_fp16_t* mrow = mask ? (const ggml_fp16_t*)(m_seq + i * mask->nb[1]) : nullptr;
-            float mx = -INFINITY;
+    // 2. S = Q K^T, all heads at once (one team thread per head blocks in the run)
+    #pragma omp parallel for num_threads(n_omp) schedule(static, 1)
+    for (int64_t g = 0; g < n_kvh; ++g) {
+        rknn_matmul_run(qk[g]->ctx);
+        rknn_mem_sync(qk[g]->ctx, qk[g]->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+    }
+
+    // 3. softmax rows into P (FP16) = A of the second matmul
+    #pragma omp parallel for num_threads(n_omp)
+    for (int64_t gr = 0; gr < R; ++gr) {
+        const int64_t g = gr / M, r = gr % M;
+        const int64_t i = r % n_q;
+        static thread_local std::vector<float> row;
+        if ((int64_t)row.size() < n_kv) row.resize(n_kv);
+        const float* s_row = (const float*)qk[g]->C->virt_addr + r * n_kv;
+        const ggml_fp16_t* mrow = mask ? (const ggml_fp16_t*)(m_seq + i * mask->nb[1]) : nullptr;
+        float mx = -INFINITY;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            float x = s_row[j] * scale;
+            if (softcap != 0.0f) x = softcap * tanhf(x);
+            if (mrow) x += ggml_fp16_to_fp32(mrow[j]);
+            row[j] = x;
+            mx = std::max(mx, x);
+        }
+        float sum = 0.0f;
+        if (mx != -INFINITY) {
             for (int64_t j = 0; j < n_kv; ++j) {
-                float x = s_row[j] * scale;
-                if (softcap != 0.0f) x = softcap * tanhf(x);
-                if (mrow) x += ggml_fp16_to_fp32(mrow[j]);
-                row[j] = x;
-                mx = std::max(mx, x);
+                const float e = row[j] == -INFINITY ? 0.0f : expf(row[j] - mx);
+                row[j] = e;
+                sum += e;
             }
-            float sum = 0.0f;
-            if (mx != -INFINITY) {
-                for (int64_t j = 0; j < n_kv; ++j) {
-                    const float e = row[j] == -INFINITY ? 0.0f : expf(row[j] - mx);
-                    row[j] = e;
-                    sum += e;
-                }
-            }
-            const float inv = sum == 0.0f ? 0.0f : 1.0f / sum;
-            for (int64_t j = 0; j < n_kv; ++j) row[j] = (mx == -INFINITY) ? 0.0f : row[j] * inv;
-            rknpu_fp32_to_fp16(row.data(), P + r * n_kv, n_kv);
         }
-        rknn_mem_sync(pv->ctx, pv->A, RKNN_MEMORY_SYNC_TO_DEVICE);
-        rknn_matmul_run(pv->ctx);
-        rknn_mem_sync(pv->ctx, pv->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+        const float inv = sum == 0.0f ? 0.0f : 1.0f / sum;
+        for (int64_t j = 0; j < n_kv; ++j) row[j] = (mx == -INFINITY) ? 0.0f : row[j] * inv;
+        rknpu_fp32_to_fp16(row.data(), (uint16_t*)pv[g]->A->virt_addr + r * n_kv, n_kv);
+    }
 
-        // O rows -> dst (permuted: row (i*n_head + h))
-        const float* O = (const float*)pv->C->virt_addr;
-        #pragma omp parallel for num_threads(n_omp)
-        for (int64_t r = 0; r < M; ++r) {
-            const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
-            // permute(0, 2, 1, 3): row (i3*n_q*n_head + i*n_head + h)
-            memcpy(d_base + (i3 * n_q * n_head + i * n_head + h) * dst->nb[1], O + r * DV, DV * sizeof(float));
-        }
+    // 4. O = P V, all heads at once
+    #pragma omp parallel for num_threads(n_omp) schedule(static, 1)
+    for (int64_t g = 0; g < n_kvh; ++g) {
+        rknn_mem_sync(pv[g]->ctx, pv[g]->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+        rknn_matmul_run(pv[g]->ctx);
+        rknn_mem_sync(pv[g]->ctx, pv[g]->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+    }
+
+    // 5. O rows -> dst; permute(0, 2, 1, 3): row (i3*n_q*n_head + i*n_head + h)
+    #pragma omp parallel for num_threads(n_omp)
+    for (int64_t gr = 0; gr < R; ++gr) {
+        const int64_t g = gr / M, r = gr % M;
+        const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
+        memcpy(d_base + (i3 * n_q * n_head + i * n_head + h) * dst->nb[1],
+               (const float*)pv[g]->C->virt_addr + r * DV, DV * sizeof(float));
     }
     }
 }
