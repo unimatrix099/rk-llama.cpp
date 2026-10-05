@@ -58,6 +58,10 @@ float calculate_entropy_amax(const float* data, size_t n_elements, int num_bins 
  */
 void hadamard_transform(float* dst, const float* src, int K, int padded_size);
 
+// mul_fp32(tmp, src, signs, K) then hadamard_transform(dst, tmp, K,
+// padded_size), fused: identical results, one pass and one buffer fewer.
+void hadamard_transform_signed(float* dst, const float* src, const float* signs, int K, int padded_size);
+
 // One block of hadamard_transform: writes dst[b*block, (b+1)*block) exactly
 // as hadamard_transform would (copy of src over [0, K), zero padding up to
 // padded_size, then the in-place FWHT of that block). Blocks are

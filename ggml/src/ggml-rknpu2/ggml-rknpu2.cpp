@@ -1177,15 +1177,13 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         for (int r = 0; r < rows; ++r) {
                             const int m = m0 + r;
                             const float* src_row = src1_batch + (size_t)m * row_stride;
-                            static thread_local std::vector<float> signed_row, full_row;
+                            static thread_local std::vector<float> full_row;
                             static thread_local std::vector<uint8_t> packed_row;
                             auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
                             const float* ready_row;
                             if (is_hadamard) {
-                                grow(signed_row, (size_t)K);
                                 grow(full_row, (size_t)K_op);
-                                rknpu2_quantization::mul_fp32(signed_row.data(), src_row, s_vec.data(), K);
-                                rknpu2_calibration::hadamard_transform(full_row.data(), signed_row.data(), K, K_op);
+                                rknpu2_calibration::hadamard_transform_signed(full_row.data(), src_row, s_vec.data(), K, K_op);
                                 ready_row = full_row.data() + k_seg.offset_k;
                             } else {
                                 ready_row = src_row + k_seg.offset_k;
@@ -1356,7 +1354,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         // token prefill. Every buffer is fully written before
                         // it is read, so contents carried between rows are
                         // never observed.
-                        static thread_local std::vector<float> signed_row, full_hadamard_row;
+                        static thread_local std::vector<float> full_hadamard_row;
                         static thread_local std::vector<uint8_t> packed_row;
                         auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
 
@@ -1364,10 +1362,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         // place from the transform output or the source row)
                         const float* ready_row;
                         if (is_hadamard) {
-                            grow(signed_row, (size_t)K);
                             grow(full_hadamard_row, (size_t)K_op);
-                            rknpu2_quantization::mul_fp32(signed_row.data(), src_row, s_vec.data(), K);
-                            rknpu2_calibration::hadamard_transform(full_hadamard_row.data(), signed_row.data(), K, K_op);
+                            rknpu2_calibration::hadamard_transform_signed(full_hadamard_row.data(), src_row, s_vec.data(), K, K_op);
                             ready_row = full_hadamard_row.data() + k_seg.offset_k;
                         } else {
                             ready_row = src_row + k_seg.offset_k;

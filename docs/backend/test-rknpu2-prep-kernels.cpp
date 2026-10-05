@@ -410,6 +410,16 @@ static void test_prep_split(void) {
         }
         CHECK(memcmp(whole.data(), split.data(), K_op * 4) == 0, "hadamard per-block K=%d", K);
 
+        // fused sign multiply + transform == mul_fp32 then hadamard_transform
+        {
+            std::vector<float> signs(K), tmp(K), ref(K_op, -1.0f), fused(K_op, -2.0f);
+            for (int i = 0; i < K; ++i) signs[i] = (prng() & 1) ? 1.0f : -1.0f;
+            rknpu2_quantization::mul_fp32(tmp.data(), src.data(), signs.data(), K);
+            rknpu2_calibration::hadamard_transform(ref.data(), tmp.data(), K, K_op);
+            rknpu2_calibration::hadamard_transform_signed(fused.data(), src.data(), signs.data(), K, K_op);
+            CHECK(memcmp(ref.data(), fused.data(), K_op * 4) == 0, "hadamard signed K=%d", K);
+        }
+
         // chunked amax + quantize, as split across T threads
         const int n = K_op - (K_op % 2);
         const float amax_whole = rknpu2_quantization::amax_fp32(whole.data(), n);

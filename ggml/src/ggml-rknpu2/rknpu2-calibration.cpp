@@ -365,6 +365,28 @@ void hadamard_transform(float* dst, const float* src, int K, int padded_size) {
     }
 }
 
+void hadamard_transform_signed(float* dst, const float* src, const float* signs, int K, int padded_size) {
+    // == mul_fp32(tmp, src, signs, K) followed by hadamard_transform(dst,
+    // tmp, K, padded_size): the products go straight into dst instead of
+    // through a scratch row and a memcpy
+    int i = 0;
+#ifdef __ARM_NEON
+    for (; i + 4 <= K; i += 4) {
+        vst1q_f32(dst + i, vmulq_f32(vld1q_f32(src + i), vld1q_f32(signs + i)));
+    }
+#endif
+    for (; i < K; ++i) {
+        dst[i] = src[i] * signs[i];
+    }
+    if (padded_size > K) {
+        memset(dst + K, 0, (padded_size - K) * sizeof(float));
+    }
+    const int block = hadamard_block_len(K);
+    for (int off = 0; off < padded_size; off += block) {
+        fwht_iterative(dst + off, block);
+    }
+}
+
 void hadamard_transform_block(float* dst, const float* src, int K, int padded_size, int b) {
     const int block = hadamard_block_len(K);
     const int off = b * block;
