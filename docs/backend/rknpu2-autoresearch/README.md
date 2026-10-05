@@ -20,3 +20,12 @@ stress loop exists (see #1c, the empty-mul_mat segfault).
 
 Board address and model paths are hard-coded for the Orange Pi 5 Ultra
 used here (`pi@192.168.0.178`, `~/models/gemma-4-E4B-it-Q4_0-ggmlorg.gguf`).
+
+## `cpu-npu/` — prefill loop part 3, CPU-side work (2026-10-05)
+
+Loop recorded in decode research #1f. `verify.sh` prints E4B pure-NPU W4A4
+`llama-bench -p 512 -r 3 -t 4` t/s. `guard.sh` is the #1d/#1e tolerant guard:
+unit tests, 32-chunk PPL ≤ 27.41, KLD vs `~/kld-cpu-e4b-4ch.bin` ≤ 0.65 with
+same-top ≥ 68%, the NPU flash-attention hardware test, and 3 `decode-check.sh`
+server runs. Keep threshold: +0.8 t/s over the best build so far.
+`results.tsv` is the log: 161.6 → 207.3 t/s, 6 keeps, all bit-identical.

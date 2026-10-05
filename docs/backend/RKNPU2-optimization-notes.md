@@ -390,6 +390,11 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | Flash attention on the NPU (prefill) | ✅ shipped | +15.6%; FP16 QK^T/PV per KV head, CPU softmax. Driver converts non-native B at set_io_mem: re-bind after writing or P·V is zero — #1e |
 | Concurrency inside NPU attention (2 heads at once / helper-thread overlap) | ❌ slower | −5% / −9%: memory contention and thread oversubscription on 4 cores — #1e |
 | Compute-buffer tensors and packing | ✅ fixed | packing/lookup/sizing decided by dtype alone; now never for COMPUTE buffers, alloc size ≥ nbytes — #1e |
+| Prefill loop part 3: CPU-side work (2026-10-05) | ✅ shipped | E4B pp512 161.5→203.4 (+26%), pp128 150.4→169.7, decode 8.65; all 6 keeps bit-identical — decode research #1f |
+| GEGLU in the backend, fused into up's dequant; gate's dequant deferred into it | ✅ shipped | +7.3% / +3.7% / +3.5%: gate's FP32 never round-trips through DRAM; dequant at N=10240 runs ~3.5× slower per element than at N≤2560 (mixed strided read/write streams) — #1f |
+| Host buffer types in `supports_buft`; RKNPU buffers flagged `is_host` | ✅ shipped | +2.6% / +3.3%: no scheduler copies between NPU and CPU splits — #1f |
+| DC ZVA on dequant stores; K-segment-local Hadamard | ✅ shipped | +2.4% / +2.5%, bit-identical — #1f |
+| RMS_NORM/ADD/MUL in the backend; NEON ggml-cpu binary ops; merged K-segment pass; larger dequant row blocks | ❌ no gain | ggml-cpu's fused rms_norm_mul wins; merged K-segment pass is noise; 8-64-row blocks −5..−7% — #1f |
 | 8-chunk PPL as a W4A4 quality gate | ❌ unusable | scatters ±3% for 1e-7 perturbations; W4A4 top-1 agreement with CPU is ~70% (KLD 0.59) despite PPL parity — decode research #1d |
 | Server segfault on empty output mul_mat | ✅ fixed | pre-existing ~50% crash in llama-server: rejected zero-row op → 713 MB packed read-back overrun. Accept empty ops, abort on packed read-back; 0/12 after — decode research #1c |
 | Drafter on CPU (`RKNPU_EXCLUDE_TYPES=f16`) | ❌ no effect | n=3 6.00 vs 5.99; kept as a diagnostic. `--device-draft` cannot do it (ACCEL buffer type) — decode research #1b |

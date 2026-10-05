@@ -403,6 +403,77 @@ projection, GELU and RMS norm also run per token), NPU + MTP n=1 **8.90**
 4%, NPU attention ~3% CPU. The NPU itself is no longer the limit at
 prefill; the CPU-side dequant of its INT16 output is.
 
+### 1f. Prefill loop, part 3 — CPU-side work: pp512 161.5 -> 203.4 t/s (2026-10-05)
+
+Goal: shrink the CPU share of the pipelined W4A4 prefill (dequant of the
+NPU's INT16 output, transform, the ops between matmuls) or move it into
+the backend. Same gate as #1e (32-chunk PPL ≤ +2%, KLD vs CPU ≤ 0.65,
+same-top ≥ 68%, NPU flash-attention test, 3 server runs); keep threshold
++0.8 t/s over the best so far. 25 iterations, 6 kept, **every keep
+bit-identical** (PPL 27.2432, KLD 0.587297, same-top 72.059% throughout).
+Log: `rknpu2-autoresearch/cpu-npu/results.tsv`.
+
+| # | Change | pp512 | Verdict |
+|---|---|---|---|
+| 0 | baseline (end of #1e) | 161.6 | — |
+| 1 | GEGLU in the backend (`RKNPU_GLU`), so [gate, up, GLU, down] stay in one NPU split | 173.4 | keep |
+| 6 | up matmul's dequant fused with GEGLU: up rows go to a thread-local buffer, GLU written directly (`RKNPU_FUSE_GLU`); `-falign-functions/loops=64` for the backend | 179.9 | keep |
+| 8 | `supports_buft` accepts host buffer types: no scheduler copies of CPU-produced activations into the NPU split | 184.7 | keep |
+| 10 | DC ZVA on the dequant store path: destination lines zero-allocated, no read-for-ownership | 189.2 | keep |
+| 16 | RKNPU buffer type reports `is_host` (`RKNPU_HOST_BUFFERS`): CPU splits read NPU outputs in place, no copy-back | 195.4 | keep |
+| 18 | K-segmented weights (ffn_down, 8192+2048) transform only their own Hadamard blocks | 200.3 | keep |
+| 23 | **FFN gate's dequant deferred into up's fused GEGLU** (`RKNPU_DEFER_GATE`): gate's INT16 C is kept per chunk and dequantized into a thread-local row next to up, so gate's FP32 output never goes to DRAM and back | 207.3 | keep |
+
+**Code layout matters (#2–#6).** Fusion variants first measured ~10%
+*slower* than the unfused build, and so did adding unrelated dead code.
+Pinning the backend's function and loop alignment to 64 bytes
+(`-falign-functions=64 -falign-loops=64` in its CMakeLists) removed the
+effect, and the fused build then won. Single-digit-percent differences
+between builds still carry this noise (#24 vs #25 below): a same-binary
+A/B behind an env switch is the reliable comparison.
+
+**Why deferring the gate wins (#23).** A standalone microbenchmark of the
+dequant kernel (4 threads, cold caches, `MC = 256`) found that it costs
+**~1.0–1.2 ns per element at N = 10240, against 0.27–0.33 at N ≤ 2560**.
+That is ~5 GB/s, while reading C alone in the same pattern runs at ~10
+GB/s and writing the destination alone at ~28 GB/s. The collapse comes
+from mixing the page-hopping C reads (the native layout puts each 8-column
+tile 4 KB apart) with many strided destination streams, and it hits the
+two N = 10240 FFN matmuls hardest. Things that did *not* fix it in place:
+16-row blocks (#22, −6%; a sweep of 4/8/16/32/64 rows gave
+200.8/190.9/187.8/191.5/187.9), column-split blocking, a padded stride.
+Not writing the gate at all does fix it: about 21 MB less DRAM traffic per
+layer per 256-row chunk.
+
+Discarded, with the reason. Backend RMS_NORM/ADD/MUL (#7, #9, #19): ggml-cpu's
+fused `rms_norm_mul` beats separate passes even with no copies left.
+DC ZVA on the GEGLU output (#11). NEON binary ops in ggml-cpu (#12).
+ggml-cpu alignment pinning (#13). Fusing FWHT h=1,2 with the sign multiply
+(#14): it is off the critical path. Deferring collect by a chunk (#15):
+DRAM contention. Gemma-4 Q/K/V emitted back to back (#17). Pipeline chunk
+128 (#20): extra B reads. ffn_down's two K-segments merged into one
+pipelined pass with a two-source dequant (#21): verified to fire, but
+200.7/201.3 off vs 200.7/201.8 on, so noise. Gate+up+GEGLU in one tile
+pass with no row buffers (#24): same-binary A/B +0.8%, but below threshold
+against the best build. GEGLU divide replaced by reciprocal estimate plus
+Newton steps (#25): slower.
+
+**Final state** (E4B, default W4A4, `-t 4`, taskset 4-7): pp512 **203.4**
+(+26% over #1e, 2.97× the pre-#1d 68.4), pp128 **169.7**, tg64 **8.65**.
+NPU + MTP n=1: **8.65 t/s** (was 8.90 in #1e, 8.49 before #1e), output
+identical to the no-draft reference (4/4) with the host-flagged RKNPU
+buffers. Quality unchanged from #1e.
+
+**Where prefill time goes now** (perf, user cycles): `dequant_acc` 23%
+(q/k/v/o/down collects plus the deferred gate and up rows), GEGLU math 11%,
+FWHT 10% + sign/transform 6.6%, ggml-cpu `rms_norm_mul` 7% and `add` 5%,
+INT4 quantize 4%, NPU-attention softmax 5%, libgomp waits ~11%. The NPU is
+still fully hidden. Possible next steps:
+- a narrower C type (the NPU cannot apply dequant scales: INT8→FP32 matmul
+  type 9 aborts at run, INT8→INT8 saturates);
+- deferring the other single-consumer outputs (q/k → per-head norm);
+- the tile-pass GEGLU (#24) re-tested behind an env A/B.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
@@ -1479,6 +1550,10 @@ becomes a server.
 | `RKNPU_EXCLUDE_TYPES` | unset | Diagnostic: comma-separated ggml type names (`f16`, ...); weights of those types are never offloaded. Keeps an F16 MTP drafter on the CPU where `RKNPU_EXCLUDE` (name collision) and `--device-draft` (ACCEL buffer type) cannot — #1b. Measured no speed effect for Gemma-4 drafters |
 | `RKNPU_PIPELINE` | 1 | 0 = disable the pipelined W4A4 prefill path (256-row chunks overlapping CPU prep/dequant with NPU runs, #1e); for A/B only, results are identical |
 | `RKNPU_FLASH_ATTN` | 1 | 0 = keep prefill flash attention on the CPU (#1e) |
+| `RKNPU_GLU` | 1 | 0 = leave GEGLU on ggml-cpu instead of the backend's NEON copy (#1f) |
+| `RKNPU_FUSE_GLU` | 1 | 0 = do not fuse GEGLU into the up matmul's dequant (#1f); results identical |
+| `RKNPU_DEFER_GATE` | 1 | 0 = dequantize the FFN gate into its own output instead of deferring it into up's fused GEGLU (#1f); results identical |
+| `RKNPU_HOST_BUFFERS` | 1 | 0 = RKNPU buffer type not reported as host memory, so the scheduler copies NPU outputs back for CPU splits (#1f) |
 | `RKNPU_PROFILE` | unset | Diagnostic: prints cumulative wall time in the backend (graph / per-node / NPU run) every ~5 s to stderr; take the slope over a decode window and divide by the token rate (#1c) |
 | `RKNPU_DISPATCH_POOL` | unset | 1 = old dispatch path: NPU segments on the persistent pool and serial M=1 A-prep instead of ggml's OpenMP team. For A/B comparison only (#1c) |
 | `OMP_NUM_THREADS=4` | unset | no longer required: the #3 fix covers M=1, and since 2026-10-02 the backend takes ggml's thread count for M > 1 too (#1b); still harmless |
