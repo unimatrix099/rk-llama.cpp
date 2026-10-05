@@ -1463,13 +1463,7 @@ inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, c
     for (; i + 4 <= n; i += 4) {
         const float32x4_t xv = vld1q_f32(x + i);
         const float32x4_t z  = vmulq_f32(vmulq_f32(c0, xv), vfmaq_f32(one, vmulq_f32(c1, xv), xv));
-        // 2/(e+1) via reciprocal estimate + two Newton steps (~1 ulp) instead
-        // of vdivq_f32, which is long-latency on Cortex-A76
-        const float32x4_t den = vaddq_f32(ggml_v_expf(vmulq_f32(two, z)), one);
-        float32x4_t rcp = vrecpeq_f32(den);
-        rcp = vmulq_f32(rcp, vrecpsq_f32(den, rcp));
-        rcp = vmulq_f32(rcp, vrecpsq_f32(den, rcp));
-        const float32x4_t th = vsubq_f32(one, vmulq_f32(two, rcp));
+        const float32x4_t th = vsubq_f32(one, vdivq_f32(two, vaddq_f32(ggml_v_expf(vmulq_f32(two, z)), one)));
         float32x4_t gel = vmulq_f32(vmulq_f32(half, xv), vaddq_f32(one, th));
         gel = vbslq_f32(vcleq_f32(xv, vdupq_n_f32(-10.0f)), vdupq_n_f32(0.0f), gel);
         gel = vbslq_f32(vcgeq_f32(xv, vdupq_n_f32(10.0f)), xv, gel);
