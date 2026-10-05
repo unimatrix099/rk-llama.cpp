@@ -784,6 +784,54 @@ static void rknpu_softmax_row(const float* s_row, const ggml_fp16_t* mrow, int64
     rknpu_fp32_to_fp16(tmp, out, n);
 }
 
+// GEGLU (gate, up) on the backend, so [up, gate, GLU, down] stay in one NPU
+// split. Same NEON tanh-GELU as ggml-cpu's ggml_vec_geglu_f32 on ARM
+// (tanh(z) = 1 - 2/(e^{2z}+1) via the same exp, +-10 cut-offs), so the
+// output is identical for widths that are multiples of 4.
+static bool rknpu_glu_supported(const struct ggml_tensor* op) {
+    if (ggml_get_glu_op(op) != GGML_GLU_OP_GEGLU) return false;
+    const struct ggml_tensor *a = op->src[0], *b = op->src[1];
+    if (!a || !b || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous_1(a) || !ggml_is_contiguous_1(b)) return false;
+    if (a->ne[0] % 4 != 0 || a->ne[0] != b->ne[0] || a->nb[0] != 4 || b->nb[0] != 4 || op->nb[0] != 4) return false;
+    return ggml_nrows(a) == ggml_nrows(op) && ggml_nrows(b) == ggml_nrows(op);
+}
+
+static inline void rknpu_geglu_row(int64_t n, float* y, const float* x, const float* g) {
+    int64_t i = 0;
+#ifdef __ARM_NEON
+    const float32x4_t c0 = vdupq_n_f32(0.79788456080286535587989211986876f), c1 = vdupq_n_f32(0.044715f);
+    const float32x4_t one = vdupq_n_f32(1.0f), two = vdupq_n_f32(2.0f), half = vdupq_n_f32(0.5f);
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t xv = vld1q_f32(x + i);
+        const float32x4_t z  = vmulq_f32(vmulq_f32(c0, xv), vfmaq_f32(one, vmulq_f32(c1, xv), xv));
+        const float32x4_t th = vsubq_f32(one, vdivq_f32(two, vaddq_f32(rknpu_v_expf(vmulq_f32(two, z)), one)));
+        float32x4_t gel = vmulq_f32(vmulq_f32(half, xv), vaddq_f32(one, th));
+        gel = vbslq_f32(vcleq_f32(xv, vdupq_n_f32(-10.0f)), vdupq_n_f32(0.0f), gel);
+        gel = vbslq_f32(vcgeq_f32(xv, vdupq_n_f32(10.0f)), xv, gel);
+        vst1q_f32(y + i, vmulq_f32(gel, vld1q_f32(g + i)));
+    }
+#endif
+    for (; i < n; ++i) {   // not reached for the supported widths (multiple of 4)
+        const float v = x[i];
+        const float gl = v <= -10.0f ? 0.0f : v >= 10.0f ? v
+                       : 0.5f * v * (1.0f + tanhf(0.79788456080286535587989211986876f * v * (1.0f + 0.044715f * v * v)));
+        y[i] = gl * g[i];
+    }
+}
+
+static void rknpu_geglu(struct ggml_tensor* dst, int n_omp) {
+    const struct ggml_tensor *a = dst->src[0], *b = dst->src[1];
+    const int64_t nc = a->ne[0], nr = ggml_nrows(dst);
+    const char* a_base = (const char*)get_tensor_real_ptr(a);
+    const char* b_base = (const char*)get_tensor_real_ptr(b);
+    char* d_base = (char*)get_tensor_real_ptr(dst);
+    #pragma omp parallel for num_threads(n_omp) if(nr > 1)
+    for (int64_t r = 0; r < nr; ++r) {
+        rknpu_geglu_row(nc, (float*)(d_base + r * dst->nb[1]), (const float*)(a_base + r * a->nb[1]), (const float*)(b_base + r * b->nb[1]));
+    }
+}
+
 static bool rknpu_fa_supported(const struct ggml_tensor* op) {
     const struct ggml_tensor *q = op->src[0], *k = op->src[1], *v = op->src[2], *mask = op->src[3], *sinks = op->src[4];
     if (!q || !k || !v || sinks) return false;
@@ -909,6 +957,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
         struct ggml_tensor* node = cgraph->nodes[node_i];
         if (node->op == GGML_OP_FLASH_ATTN_EXT) {
             rknpu_flash_attn(backend_ctx, node, n_omp);
+            continue;
+        }
+        if (node->op == GGML_OP_GLU) {
+            rknpu_geglu(node, n_omp);
             continue;
         }
         if (node->op != GGML_OP_MUL_MAT) continue;
@@ -2228,6 +2280,14 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
     switch (op->op) {
         case GGML_OP_NONE:
             return true;
+
+        case GGML_OP_GLU: {
+            static const bool glu_enabled = []() {
+                const char* env = std::getenv("RKNPU_GLU");
+                return env == nullptr || std::atoi(env) != 0;
+            }();
+            return glu_enabled && rknpu_glu_supported(op);
+        }
 
         case GGML_OP_FLASH_ATTN_EXT: {
             static const bool fa_enabled = []() {
