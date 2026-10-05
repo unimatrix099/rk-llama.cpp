@@ -1265,6 +1265,11 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     const float hadamard_divisor = is_hadamard ? (float)rknpu2_calibration::hadamard_block_len(K) : 1.0f;
                     const int row_stride = (int)(src1->nb[1] / sizeof(float));
                     std::vector<float> scales_A(M, 1.0f);
+                    static const int dq_rows = []() {
+                        const char* env = std::getenv("RKNPU_DQ_ROWS");
+                        const int v = env ? std::atoi(env) : 16;
+                        return (v >= 4 && v <= 64 && v % 4 == 0) ? v : 16;
+                    }();
                     const int h_block = is_hadamard ? rknpu2_calibration::hadamard_block_len(K) : 1;
                     const bool seg_on_blocks = is_hadamard && all_k_segments.size() > 1 && K_op == K &&
                                                k_seg.offset_k % h_block == 0 && K_seg_op % h_block == 0;
@@ -1318,12 +1323,18 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         for (size_t idx = 0; idx < num_active_segments; ++idx) {
                             RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, c_slot[c & 1][idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
                         }
-                        const int n_blocks = (rows + 3) / 4;
+                        // Row blocks of dq_rows: C is [N/8][MC][8], so a block
+                        // reads dq_rows * 16 contiguous bytes per 8-column tile
+                        // and then jumps a page (MC * 16 = 4 KB) to the next
+                        // tile. 4-row blocks read one line per page, which
+                        // defeats the prefetcher (it does not cross pages).
+                        const int dqr = dq_rows;
+                        const int n_blocks = (rows + dqr - 1) / dqr;
                         #pragma omp parallel for num_threads(n_omp)
                         for (int blk = 0; blk < n_blocks; ++blk) {
-                            const int r0 = blk * 4;
-                            const int nr = std::min(4, rows - r0);
-                            float common[4];
+                            const int r0 = blk * dqr;
+                            const int nr = std::min(dqr, rows - r0);
+                            float common[64];
                             for (int r = 0; r < nr; ++r) common[r] = scales_A[m0 + r0 + r] / hadamard_divisor;
                             for (size_t idx = 0; idx < num_active_segments; ++idx) {
                                 const int N_offset = active_n_segments[idx].offset_n;
