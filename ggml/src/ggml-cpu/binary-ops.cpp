@@ -28,7 +28,22 @@ static inline void vec_binary_op_contiguous(const int64_t n, dst_t * z, const sr
     constexpr auto src1_to_f32 = type_conversion_table<src1_t>::to_f32;
     constexpr auto f32_to_dst  = type_conversion_table<dst_t >::from_f32;
 
-    for (int i = 0; i < n; i++) {
+    int i = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    // all-f32: one vector op per element, identical to the scalar op
+    if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<src1_t, float> && std::is_same_v<dst_t, float>) {
+        for (; i + 4 <= n; i += 4) {
+            const float32x4_t a = vld1q_f32(x + i), b = vld1q_f32(y + i);
+            float32x4_t r;
+            if constexpr (op == op_add)      r = vaddq_f32(a, b);
+            else if constexpr (op == op_sub) r = vsubq_f32(a, b);
+            else if constexpr (op == op_mul) r = vmulq_f32(a, b);
+            else                             r = vdivq_f32(a, b);
+            vst1q_f32(z + i, r);
+        }
+    }
+#endif
+    for (; i < n; i++) {
         z[i] = f32_to_dst(op(src0_to_f32(x[i]), src1_to_f32(y[i])));
     }
 }
