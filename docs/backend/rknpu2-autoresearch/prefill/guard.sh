@@ -19,6 +19,10 @@ Q=$(ssh -o BatchMode=yes $B 'ulimit -n 65536; cd ~/rk-llama.cpp-rebase; M=~/mode
 read -r P32 KLD TOP <<< "$Q"
 echo "ppl32=$P32 kld=$KLD same_top=$TOP"
 python3 -c "import sys; p,k,t=$P32,$KLD,$TOP; sys.exit(0 if (p <= 26.8771*1.02 and k <= 0.65 and t >= 68.0) else 1)" || { echo "quality gate failed"; exit 1; }
+# NPU flash attention vs CPU at Gemma-4 shapes (prefill path the decode check never reaches)
+FA=$(ssh -o BatchMode=yes $B 'cd ~/rk-llama.cpp-rebase && g++ -O2 docs/backend/test-rknpu2-flash-attn.cpp -I ggml/include -Lbuild/bin -lggml -lggml-base -lggml-cpu -lggml-rknpu2 -Wl,-rpath,$PWD/build/bin -o /tmp/test-rknpu2-flash-attn && ulimit -n 65536 && /tmp/test-rknpu2-flash-attn 2>&1 | grep -c " OK$"'; true)
+echo "flash-attn test: $FA/5 OK"
+[ "$FA" = "5" ] || { echo "flash-attn test failed"; exit 1; }
 for i in 1 2 3; do
   out=$(ssh -o BatchMode=yes $B 'bash ~/rk-llama.cpp-rebase/docs/backend/rknpu2-autoresearch/decode-check.sh 2>&1 | tail -1'; true)
   echo "server run $i: $out"
