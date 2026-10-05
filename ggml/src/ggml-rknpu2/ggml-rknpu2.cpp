@@ -1214,12 +1214,13 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         for (size_t idx = 0; idx < num_active_segments; ++idx) {
                             RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, c_slot[c & 1][idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
                         }
-                        const int n_blocks = (rows + 3) / 4;
+                        const int RB = 4;   // rows per block (8 measured slower, prefill loop #24)
+                        const int n_blocks = (rows + RB - 1) / RB;
                         #pragma omp parallel for num_threads(n_omp)
                         for (int blk = 0; blk < n_blocks; ++blk) {
-                            const int r0 = blk * 4;
-                            const int nr = std::min(4, rows - r0);
-                            float common[4];
+                            const int r0 = blk * RB;
+                            const int nr = std::min(RB, rows - r0);
+                            float common[RB];
                             for (int r = 0; r < nr; ++r) common[r] = scales_A[m0 + r0 + r] / hadamard_divisor;
                             for (size_t idx = 0; idx < num_active_segments; ++idx) {
                                 const int N_offset = active_n_segments[idx].offset_n;

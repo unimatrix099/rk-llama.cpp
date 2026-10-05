@@ -210,6 +210,31 @@ void dequant_acc_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const 
         if (lim <= 0) {
             break;
         }
+#ifdef __ARM_NEON
+        // full 8-wide cells (the INT16 C sub size): the tile's channel
+        // scales are loaded once for all rows; per element the same
+        // cs*common product and fma/mul as the general loop below
+        if (lim == 8) {
+            const float32x4_t cs0 = vld1q_f32(chan_scales + n0), cs1 = vld1q_f32(chan_scales + n0 + 4);
+            for (int32_t r = 0; r < nrows; ++r) {
+                const int16_t * cell = src_native + ((size_t)t * m_stride + m0 + r) * sub;
+                float * d = dst + (size_t)r * dst_stride + n0;
+                const float32x4_t vc = vdupq_n_f32(common[r]);
+                const int16x8_t s16 = vld1q_s16(cell);
+                const float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16)));
+                const float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16)));
+                const float32x4_t sc0 = vmulq_f32(cs0, vc), sc1 = vmulq_f32(cs1, vc);
+                if (store) {
+                    vst1q_f32(d,     vmulq_f32(f0, sc0));
+                    vst1q_f32(d + 4, vmulq_f32(f1, sc1));
+                } else {
+                    vst1q_f32(d,     vfmaq_f32(vld1q_f32(d),     f0, sc0));
+                    vst1q_f32(d + 4, vfmaq_f32(vld1q_f32(d + 4), f1, sc1));
+                }
+            }
+            continue;
+        }
+#endif
         for (int32_t r = 0; r < nrows; ++r) {
             const int16_t * cell = src_native + ((size_t)t * m_stride + m0 + r) * sub;
             float * d = dst + (size_t)r * dst_stride + n0;
