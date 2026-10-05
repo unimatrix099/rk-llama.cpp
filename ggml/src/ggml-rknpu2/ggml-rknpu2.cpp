@@ -1175,6 +1175,9 @@ static void dequantize_row(
         const ggml_fp16_t* src = (const ggml_fp16_t*)raw_data;
         const ggml_fp16_t* src_row = src + (size_t)n * K;
         for (int k = 0; k < K; ++k) row_out[k] = ggml_fp16_to_fp32(src_row[k]);
+    } else if (tensor->type == GGML_TYPE_BF16) {
+        const ggml_bf16_t* src_row = (const ggml_bf16_t*)raw_data + (size_t)n * K;
+        for (int k = 0; k < K; ++k) row_out[k] = ggml_bf16_to_fp32(src_row[k]);
     } else if (tensor->type == GGML_TYPE_Q8_0) {
         const block_q8_0* src = (const block_q8_0*)raw_data;
         dequantize_row_q8_0(src + (size_t)n * (K / QK8_0), row_out, K);
