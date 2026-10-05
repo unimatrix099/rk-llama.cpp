@@ -1317,12 +1317,6 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                             const int nr = std::min(4, rows - r0);
                             float common[4];
                             for (int r = 0; r < nr; ++r) common[r] = scales_A[m0 + r0 + r] / hadamard_divisor;
-                            if (fused_now) {
-                                rknpu_fused_up_geglu_block(fuse_glu, m0 + r0, r0, nr, N, common,
-                                    c_slot[c & 1], c_geom, active_n_segments,
-                                    scales_B_grid->data() + k_idx * (size_t)N);
-                                continue;
-                            }
                             for (size_t idx = 0; idx < num_active_segments; ++idx) {
                                 const int N_offset = active_n_segments[idx].offset_n;
                                 rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
@@ -1335,6 +1329,26 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                             }
                         }
                     };
+                    // GEGLU-fused variant of collect for the up matmul (a
+                    // separate lambda: a branch inside collect's OpenMP region
+                    // cost ~10% even when not taken)
+                    auto collect_fused = [&](int c) {
+                        const int m0 = c * MC, rows = std::min(MC, M - m0);
+                        for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                            RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, c_slot[c & 1][idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
+                        }
+                        const int n_blocks = (rows + 3) / 4;
+                        #pragma omp parallel for num_threads(n_omp)
+                        for (int blk = 0; blk < n_blocks; ++blk) {
+                            const int r0 = blk * 4;
+                            const int nr = std::min(4, rows - r0);
+                            float common[4];
+                            for (int r = 0; r < nr; ++r) common[r] = scales_A[m0 + r0 + r] / hadamard_divisor;
+                            rknpu_fused_up_geglu_block(fuse_glu, m0 + r0, r0, nr, N, common,
+                                c_slot[c & 1], c_geom, active_n_segments,
+                                scales_B_grid->data() + k_idx * (size_t)N);
+                        }
+                    };
 
 
                     const auto t_run = g_rknpu_profile.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1344,10 +1358,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         prep(c);                         // overlaps NPU chunk c-1
                         backend_ctx->async_runner.wait();
                         start(c);
-                        collect(c - 1);                  // overlaps NPU chunk c
+                        if (fused_now) collect_fused(c - 1); else collect(c - 1);   // overlaps NPU chunk c
                     }
                     backend_ctx->async_runner.wait();
-                    collect(n_chunks - 1);
+                    if (fused_now) collect_fused(n_chunks - 1); else collect(n_chunks - 1);
                     if (g_rknpu_profile.on) g_rknpu_profile.run_ns += rknpu_profile::ns(t_run, std::chrono::steady_clock::now());
                     continue;
                 }
