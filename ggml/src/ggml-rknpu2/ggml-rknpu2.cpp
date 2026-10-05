@@ -689,6 +689,92 @@ static void rknpu_fp32_to_fp16(const float* src, uint16_t* dst, int64_t n) {
     for (; i < n; ++i) dst[i] = ggml_fp32_to_fp16(src[i]);
 }
 
+#ifdef __ARM_NEON
+// exp(x), four lanes: the ARM optimized-routines approximation ggml-cpu uses
+// (ggml_v_expf; max error 1.45 ulp + 0.5), copied here because ggml-cpu's
+// vector helpers are internal to that backend
+static inline float32x4_t rknpu_v_expf(float32x4_t x) {
+    const float32x4_t r = vdupq_n_f32(0x1.8p23f);
+    const float32x4_t z = vfmaq_f32(r, x, vdupq_n_f32(0x1.715476p+0f));
+    const float32x4_t n = vsubq_f32(z, r);
+    const float32x4_t b = vfmsq_f32(vfmsq_f32(x, n, vdupq_n_f32(0x1.62e4p-1f)), n, vdupq_n_f32(0x1.7f7d1cp-20f));
+    const uint32x4_t e = vshlq_n_u32(vreinterpretq_u32_f32(z), 23);
+    const float32x4_t k = vreinterpretq_f32_u32(vaddq_u32(e, vreinterpretq_u32_f32(vdupq_n_f32(1))));
+    const uint32x4_t c = vcagtq_f32(n, vdupq_n_f32(126));
+    const float32x4_t u = vmulq_f32(b, b);
+    const float32x4_t j = vfmaq_f32(
+        vmulq_f32(vdupq_n_f32(0x1.ffffecp-1f), b),
+        vfmaq_f32(vfmaq_f32(vdupq_n_f32(0x1.fffdb6p-2f), vdupq_n_f32(0x1.555e66p-3f), b),
+                  vfmaq_f32(vdupq_n_f32(0x1.573e2ep-5f), vdupq_n_f32(0x1.0e4020p-7f), b), u), u);
+    if (!vpaddd_u64(vreinterpretq_u64_u32(c)))
+        return vfmaq_f32(k, j, k);
+    const uint32x4_t d = vandq_u32(vclezq_f32(n), vdupq_n_u32(0x82000000));
+    const float32x4_t s1 = vreinterpretq_f32_u32(vaddq_u32(d, vdupq_n_u32(0x7f000000)));
+    const float32x4_t s2 = vreinterpretq_f32_u32(vsubq_u32(e, d));
+    return vbslq_f32(vcagtq_f32(n, vdupq_n_f32(192)), vmulq_f32(s1, s1),
+                     vbslq_f32(c, vmulq_f32(vfmaq_f32(s2, s2, j), s1), vfmaq_f32(k, k, j)));
+}
+#endif
+
+// One attention row: P = softmax(softcap(s*scale) + mask), written as FP16.
+// Masked (-inf) positions give exactly 0; an all-masked row gives zeros.
+static void rknpu_softmax_row(const float* s_row, const ggml_fp16_t* mrow, int64_t n, float scale, float softcap,
+                              float* tmp, uint16_t* out) {
+    int64_t j = 0;
+    float mx = -INFINITY;
+#ifdef __ARM_NEON
+    float32x4_t vmx = vdupq_n_f32(-INFINITY);
+    const float32x4_t vs = vdupq_n_f32(scale), vcap = vdupq_n_f32(softcap);
+    const float32x4_t one = vdupq_n_f32(1.0f), two = vdupq_n_f32(2.0f);
+    for (; j + 4 <= n; j += 4) {
+        float32x4_t x = vmulq_f32(vld1q_f32(s_row + j), vs);
+        if (softcap != 0.0f) {   // softcap * tanh(x), tanh(x) = 1 - 2/(e^{2x}+1)
+            x = vmulq_f32(vcap, vsubq_f32(one, vdivq_f32(two, vaddq_f32(rknpu_v_expf(vmulq_f32(two, x)), one))));
+        }
+        if (mrow) x = vaddq_f32(x, vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16((const uint16_t*)mrow + j))));
+        vst1q_f32(tmp + j, x);
+        vmx = vmaxq_f32(vmx, x);
+    }
+    mx = vmaxvq_f32(vmx);
+#endif
+    for (; j < n; ++j) {
+        float x = s_row[j] * scale;
+        if (softcap != 0.0f) x = softcap * tanhf(x);
+        if (mrow) x += ggml_fp16_to_fp32(mrow[j]);
+        tmp[j] = x;
+        mx = std::max(mx, x);
+    }
+    if (mx == -INFINITY) {
+        memset(out, 0, n * sizeof(uint16_t));
+        return;
+    }
+    float sum = 0.0f;
+    j = 0;
+#ifdef __ARM_NEON
+    float32x4_t vsum = vdupq_n_f32(0.0f);
+    const float32x4_t vm = vdupq_n_f32(mx);
+    for (; j + 4 <= n; j += 4) {
+        const float32x4_t e = rknpu_v_expf(vsubq_f32(vld1q_f32(tmp + j), vm));   // -inf -> 0
+        vst1q_f32(tmp + j, e);
+        vsum = vaddq_f32(vsum, e);
+    }
+    sum = vaddvq_f32(vsum);
+#endif
+    for (; j < n; ++j) {
+        const float e = tmp[j] == -INFINITY ? 0.0f : expf(tmp[j] - mx);
+        tmp[j] = e;
+        sum += e;
+    }
+    const float inv = sum == 0.0f ? 0.0f : 1.0f / sum;
+    j = 0;
+#ifdef __ARM_NEON
+    const float32x4_t vinv = vdupq_n_f32(inv);
+    for (; j + 4 <= n; j += 4) vst1q_f32(tmp + j, vmulq_f32(vld1q_f32(tmp + j), vinv));
+#endif
+    for (; j < n; ++j) tmp[j] *= inv;
+    rknpu_fp32_to_fp16(tmp, out, n);
+}
+
 static bool rknpu_fa_supported(const struct ggml_tensor* op) {
     const struct ggml_tensor *q = op->src[0], *k = op->src[1], *v = op->src[2], *mask = op->src[3], *sinks = op->src[4];
     if (!q || !k || !v || sinks) return false;
@@ -773,25 +859,7 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
             if ((int64_t)row.size() < n_kv) row.resize(n_kv);
             const float* s_row = S + r * n_kv;
             const ggml_fp16_t* mrow = mask ? (const ggml_fp16_t*)(m_seq + i * mask->nb[1]) : nullptr;
-            float mx = -INFINITY;
-            for (int64_t j = 0; j < n_kv; ++j) {
-                float x = s_row[j] * scale;
-                if (softcap != 0.0f) x = softcap * tanhf(x);
-                if (mrow) x += ggml_fp16_to_fp32(mrow[j]);
-                row[j] = x;
-                mx = std::max(mx, x);
-            }
-            float sum = 0.0f;
-            if (mx != -INFINITY) {
-                for (int64_t j = 0; j < n_kv; ++j) {
-                    const float e = row[j] == -INFINITY ? 0.0f : expf(row[j] - mx);
-                    row[j] = e;
-                    sum += e;
-                }
-            }
-            const float inv = sum == 0.0f ? 0.0f : 1.0f / sum;
-            for (int64_t j = 0; j < n_kv; ++j) row[j] = (mx == -INFINITY) ? 0.0f : row[j] * inv;
-            rknpu_fp32_to_fp16(row.data(), P + r * n_kv, n_kv);
+            rknpu_softmax_row(s_row, mrow, n_kv, scale, softcap, row.data(), P + r * n_kv);
         }
         rknn_mem_sync(pv->ctx, pv->A, RKNN_MEMORY_SYNC_TO_DEVICE);
         rknn_matmul_run(pv->ctx);
