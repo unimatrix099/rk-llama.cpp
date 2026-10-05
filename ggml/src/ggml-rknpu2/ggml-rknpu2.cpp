@@ -802,7 +802,16 @@ static inline void rknpu_geglu_row(int64_t n, float* y, const float* x, const fl
 #ifdef __ARM_NEON
     const float32x4_t c0 = vdupq_n_f32(0.79788456080286535587989211986876f), c1 = vdupq_n_f32(0.044715f);
     const float32x4_t one = vdupq_n_f32(1.0f), two = vdupq_n_f32(2.0f), half = vdupq_n_f32(0.5f);
+    // never zero output lines that may alias an input (in-place GLU)
+    const bool zva_ok = (y + n <= x || x + n <= y) && (y + n <= g || g + n <= y);
     for (; i + 4 <= n; i += 4) {
+#if defined(__aarch64__)
+        // the output is fully overwritten: zero-allocate each aligned 64-byte
+        // line instead of reading it from DRAM first (see the dequant store)
+        if (zva_ok && (i & 15) == 0 && i + 16 <= n && ((uintptr_t)(y + i) & 63) == 0) {
+            __asm__ volatile("dc zva, %0" : : "r"(y + i) : "memory");
+        }
+#endif
         const float32x4_t xv = vld1q_f32(x + i);
         const float32x4_t z  = vmulq_f32(vmulq_f32(c0, xv), vfmaq_f32(one, vmulq_f32(c1, xv), xv));
         const float32x4_t th = vsubq_f32(one, vdivq_f32(two, vaddq_f32(rknpu_v_expf(vmulq_f32(two, z)), one)));
