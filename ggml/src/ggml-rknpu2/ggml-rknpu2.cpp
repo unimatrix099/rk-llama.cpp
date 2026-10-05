@@ -847,147 +847,138 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 // ==========================================
                 // ========== 4. Running operation ==========
                 // ==========================================
-                {
-                    // Persistent pool, not an OpenMP team: a num_threads(3)
-                    // region here alternates team sizes with the M-row regions
-                    // and libgomp respawns its workers on every node (see
-                    // rknpu_dispatch_pool)
-                    const auto t_run = g_rknpu_profile.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                    // On ggml's own OpenMP team when it is wide enough: with
-                    // the team size matched to ggml's (set_n_threads), libgomp
-                    // keeps the team hot, so the segments start on workers
-                    // that are already spinning instead of waking pool threads
-                    // that compete with those spinners for the same cores.
-                    static const bool use_pool = std::getenv("RKNPU_DISPATCH_POOL") != nullptr;
-                    const int n_seg = (int)matmul_ctxs.size();
-                    if (!use_pool && n_seg > 1 && n_omp >= n_seg) {
-                        #pragma omp parallel for num_threads(n_omp) schedule(static, 1)
-                        for (int i = 0; i < n_seg; ++i) {
-                            matmul_ctxs[i]->run();
-                        }
-                    } else {
-                        backend_ctx->dispatch_pool.run_all(matmul_ctxs);
+
+                // H*H^T = block_len * I per FWHT block (legacy: block = K_op)
+                const float hadamard_divisor = pipeline->use_hadamard ? (float)rknpu2_calibration::hadamard_block_len(K) : 1.0f;
+
+                // Native C layout: each segment's C comes back as
+                // [N_seg/sub, M, sub] cells and is untiled inside the
+                // dequantization pass below (address arithmetic only)
+                std::vector<rknpu2_native_geom> c_geoms(num_active_segments);
+                std::vector<uint8_t> c_native(num_active_segments, 0);
+                if (pipeline->ac_layout == RKNN_MM_LAYOUT_NATIVE) {
+                    for (size_t idx = 0; idx < num_active_segments; idx++) {
+                        c_native[idx] = rknpu2_native_geom_from_dims(
+                            matmul_ctxs[idx]->io_attr.C.dims,
+                            matmul_ctxs[idx]->io_attr.C.n_dims, &c_geoms[idx]) == 0;
+                        // As for A above: reading a NATIVE-layout C as
+                        // row-major is silent corruption, not a fallback.
+                        GGML_ASSERT(c_native[idx] &&
+                            "RKNPU2: native C layout requested but io_attr.C geometry did not parse");
                     }
-                    if (g_rknpu_profile.on) g_rknpu_profile.run_ns += rknpu_profile::ns(t_run, std::chrono::steady_clock::now());
                 }
+
+                // Dequantizes segment idx of row m into dst. Segments own
+                // disjoint dst columns, so segments can be done in any order
+                // or concurrently without changing any result.
+                auto dequant_seg = [&](int m, size_t idx) {
+                    const int N_offset = active_n_segments[idx].offset_n;
+                    const int N_segment = active_n_segments[idx].size_n;
+                    float* dst_ptr = dst_batch + (size_t)m * N + N_offset;
+                    switch (pipeline->npu_type_c) {
+                        case rknpu2_configuration::NPU_TYPE_FP32: {
+                            float scale_B = scales_B_grid == nullptr ? 1.0f : (*scales_B_grid)[k_idx * num_active_segments + idx];
+                            float dequant_scale = (scales_A[m] * scale_B) / hadamard_divisor;
+                            float* src_ptr = (float*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
+                            for (int n = 0; n < N_segment; ++n) {
+                                dst_ptr[n] += src_ptr[n] * dequant_scale;
+                            }
+                            break;
+                        }
+                        case rknpu2_configuration::NPU_TYPE_INT32: {
+                            int32_t* src_ptr = (int32_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
+                            if (b_per_channel) {
+                                // grid layout [k_idx * N + global_n]
+                                rknpu2_quantization::dequant_acc_int32_to_fp32_perchan(
+                                    dst_ptr, src_ptr, N_segment,
+                                    scales_A[m] / hadamard_divisor,
+                                    scales_B_grid->data() + k_idx * (size_t)N + N_offset);
+                                break;
+                            }
+                            float scale_B = scales_B_grid == nullptr ? 1.0f : (*scales_B_grid)[k_idx * num_active_segments + idx];
+                            float dequant_scale = (scales_A[m] * scale_B) / hadamard_divisor;
+                            for (int n = 0; n < N_segment; ++n) {
+                                dst_ptr[n] += (float)src_ptr[n] * dequant_scale;
+                            }
+                            break;
+                        }
+                        case rknpu2_configuration::NPU_TYPE_INT16: {
+                            if (b_per_channel) {
+                                // grid layout [k_idx * N + global_n]
+                                const float common = scales_A[m] / hadamard_divisor;
+                                const float* chan = scales_B_grid->data() + k_idx * (size_t)N + N_offset;
+                                if (c_native[idx]) {
+                                    rknpu2_quantization::dequant_acc_int16_tiled_perchan(
+                                        dst_ptr, (const int16_t*)mem_C_segments[idx]->virt_addr,
+                                        m, c_geoms[idx].m_stride, c_geoms[idx].outer, c_geoms[idx].sub,
+                                        N_segment, common, chan);
+                                } else {
+                                    const int16_t* src_ptr = (const int16_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
+                                    rknpu2_quantization::dequant_acc_int16_to_fp32_perchan(dst_ptr, src_ptr, N_segment, common, chan);
+                                }
+                                break;
+                            }
+                            float scale_B = scales_B_grid == nullptr ? 1.0f : (*scales_B_grid)[k_idx * num_active_segments + idx];
+                            float dequant_scale = (scales_A[m] * scale_B) / hadamard_divisor;
+                            if (c_native[idx]) {
+                                rknpu2_quantization::dequant_acc_int16_tiled(
+                                    dst_ptr, (const int16_t*)mem_C_segments[idx]->virt_addr,
+                                    m, c_geoms[idx].m_stride, c_geoms[idx].outer, c_geoms[idx].sub,
+                                    N_segment, dequant_scale);
+                            } else {
+                                const int16_t* src_ptr = (const int16_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
+                                rknpu2_quantization::dequant_acc_int16_to_fp32(dst_ptr, src_ptr, N_segment, dequant_scale);
+                            }
+                            break;
+                        }
+                        default:
+                            // This should not be reached if config is correct
+                            break;
+                    }
+                };
+
+                const auto t_run = g_rknpu_profile.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                // On ggml's own OpenMP team when it is wide enough: with the
+                // team size matched to ggml's (set_n_threads), libgomp keeps
+                // the team hot, so the segments start on workers that are
+                // already spinning instead of waking dispatch-pool threads
+                // that compete with those spinners for the same cores.
+                static const bool use_pool = std::getenv("RKNPU_DISPATCH_POOL") != nullptr;
+                const int n_seg = (int)matmul_ctxs.size();
+                const bool on_team = !use_pool && n_seg > 1 && n_omp >= n_seg;
+                // At decode (M == 1) each thread also collects its own segment
+                // right after its run returns, overlapping the dequant with
+                // the other segments' NPU time
+                const bool collect_on_team = on_team && M == 1;
+                if (collect_on_team) {
+                    #pragma omp parallel for num_threads(n_omp) schedule(static, 1)
+                    for (int i = 0; i < n_seg; ++i) {
+                        matmul_ctxs[i]->run();
+                        RKNN_CHECK(rknn_mem_sync(matmul_ctxs[i]->ctx, mem_C_segments[i].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
+                        dequant_seg(0, (size_t)i);
+                    }
+                } else if (on_team) {
+                    #pragma omp parallel for num_threads(n_omp) schedule(static, 1)
+                    for (int i = 0; i < n_seg; ++i) {
+                        matmul_ctxs[i]->run();
+                    }
+                } else {
+                    backend_ctx->dispatch_pool.run_all(matmul_ctxs);
+                }
+                if (g_rknpu_profile.on) g_rknpu_profile.run_ns += rknpu_profile::ns(t_run, std::chrono::steady_clock::now());
 
                 // ===========================================
                 // ========== 5. Collecting results ==========
                 // ===========================================
-                {
+                if (!collect_on_team) {
                     for (size_t idx = 0; idx < num_active_segments; idx++) {
                         RKNN_CHECK(rknn_mem_sync(matmul_ctxs[idx]->ctx, mem_C_segments[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
                     }
 
-                    // H*H^T = block_len * I per FWHT block (legacy: block = K_op)
-                    const float hadamard_divisor = pipeline->use_hadamard ? (float)rknpu2_calibration::hadamard_block_len(K) : 1.0f;
-
-                    // Native C layout: each segment's C comes back as
-                    // [N_seg/sub, M, sub] cells and is untiled inside the
-                    // dequantization pass below (address arithmetic only)
-                    std::vector<rknpu2_native_geom> c_geoms(num_active_segments);
-                    std::vector<uint8_t> c_native(num_active_segments, 0);
-                    if (pipeline->ac_layout == RKNN_MM_LAYOUT_NATIVE) {
-                        for (size_t idx = 0; idx < num_active_segments; idx++) {
-                            c_native[idx] = rknpu2_native_geom_from_dims(
-                                matmul_ctxs[idx]->io_attr.C.dims,
-                                matmul_ctxs[idx]->io_attr.C.n_dims, &c_geoms[idx]) == 0;
-                            // As for A above: reading a NATIVE-layout C as
-                            // row-major is silent corruption, not a fallback.
-                            GGML_ASSERT(c_native[idx] &&
-                                "RKNPU2: native C layout requested but io_attr.C geometry did not parse");
-                        }
-                    }
-
                     #pragma omp parallel for if(M > 1) num_threads(n_omp)
                     for (int m = 0; m < M; m++) {
-                        // Handling types and quantizations
-                        switch (pipeline->npu_type_c) {
-                            case rknpu2_configuration::NPU_TYPE_FP32: {
-                                for (size_t idx = 0; idx < num_active_segments; idx++) {
-                                    float scale_B = scales_B_grid == nullptr ? 1.0f : (*scales_B_grid)[k_idx * num_active_segments + idx];
-                                    float dequant_scale = (scales_A[m] * scale_B) / hadamard_divisor;
-
-                                    int N_offset = active_n_segments[idx].offset_n;
-                                    int N_segment = active_n_segments[idx].size_n;
-                                    float* src_segment_base = (float*)mem_C_segments[idx]->virt_addr;
-                                    float* dst_ptr = dst_batch + (size_t)m * N + N_offset;
-                                    float* src_ptr = src_segment_base + (size_t)m * N_segment;
-
-                                    for(int n=0; n<N_segment; ++n) {
-                                        dst_ptr[n] += src_ptr[n] * dequant_scale;
-                                    }
-                                }
-                                break;
-                            }
-
-                            case rknpu2_configuration::NPU_TYPE_INT32: {
-                                for (size_t idx = 0; idx < num_active_segments; idx++) {
-                                    int N_offset = active_n_segments[idx].offset_n;
-                                    int N_segment = active_n_segments[idx].size_n;
-                                    float* dst_ptr = dst_batch + (size_t)m * N + N_offset;
-                                    int32_t* src_ptr = (int32_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
-
-                                    if (b_per_channel) {
-                                        // grid layout [k_idx * N + global_n]
-                                        rknpu2_quantization::dequant_acc_int32_to_fp32_perchan(
-                                            dst_ptr, src_ptr, N_segment,
-                                            scales_A[m] / hadamard_divisor,
-                                            scales_B_grid->data() + k_idx * (size_t)N + N_offset);
-                                        continue;
-                                    }
-
-                                    float scale_B = scales_B_grid == nullptr ? 1.0f : (*scales_B_grid)[k_idx * num_active_segments + idx];
-                                    float dequant_scale = (scales_A[m] * scale_B) / hadamard_divisor;
-
-                                    for(int n=0; n<N_segment; ++n) {
-                                        dst_ptr[n] += (float)src_ptr[n] * dequant_scale;
-                                    }
-                                }
-                                break;
-                            }
-
-                            case rknpu2_configuration::NPU_TYPE_INT16: {
-                                for (size_t idx = 0; idx < num_active_segments; idx++) {
-                                    int N_offset = active_n_segments[idx].offset_n;
-                                    int N_segment = active_n_segments[idx].size_n;
-                                    float* dst_ptr = dst_batch + (size_t)m * N + N_offset;
-
-                                    if (b_per_channel) {
-                                        // grid layout [k_idx * N + global_n]
-                                        const float common = scales_A[m] / hadamard_divisor;
-                                        const float* chan = scales_B_grid->data() + k_idx * (size_t)N + N_offset;
-                                        if (c_native[idx]) {
-                                            rknpu2_quantization::dequant_acc_int16_tiled_perchan(
-                                                dst_ptr, (const int16_t*)mem_C_segments[idx]->virt_addr,
-                                                m, c_geoms[idx].m_stride, c_geoms[idx].outer, c_geoms[idx].sub,
-                                                N_segment, common, chan);
-                                        } else {
-                                            const int16_t* src_ptr = (const int16_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
-                                            rknpu2_quantization::dequant_acc_int16_to_fp32_perchan(dst_ptr, src_ptr, N_segment, common, chan);
-                                        }
-                                        continue;
-                                    }
-
-                                    float scale_B = scales_B_grid == nullptr ? 1.0f : (*scales_B_grid)[k_idx * num_active_segments + idx];
-                                    float dequant_scale = (scales_A[m] * scale_B) / hadamard_divisor;
-
-                                    if (c_native[idx]) {
-                                        rknpu2_quantization::dequant_acc_int16_tiled(
-                                            dst_ptr, (const int16_t*)mem_C_segments[idx]->virt_addr,
-                                            m, c_geoms[idx].m_stride, c_geoms[idx].outer, c_geoms[idx].sub,
-                                            N_segment, dequant_scale);
-                                    } else {
-                                        const int16_t* src_ptr = (const int16_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
-                                        rknpu2_quantization::dequant_acc_int16_to_fp32(dst_ptr, src_ptr, N_segment, dequant_scale);
-                                    }
-                                }
-                                break;
-                            }
-
-                            default:
-                                // This should not be reached if config is correct
-                                break;
+                        for (size_t idx = 0; idx < num_active_segments; idx++) {
+                            dequant_seg(m, idx);
                         }
                     }
                 }
