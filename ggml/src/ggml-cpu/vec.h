@@ -75,10 +75,6 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
 // ggml_vec_dot_bf16 on row r. Four independent double chains, each summed in
 // index order, so the add latency that bounds the one-row kernel overlaps.
 void ggml_vec_dot_bf16_x4(int n, float * GGML_RESTRICT s, const ggml_bf16_t * GGML_RESTRICT x, size_t bx, const ggml_bf16_t * GGML_RESTRICT y);
-// 4 rows of x (row stride bx bytes) times 4 columns y[0..3], fp32 accumulation
-// (vectorized over k, so the sum order differs from ggml_vec_dot_bf16):
-// s[c*ldc + r] = dot(x_r, y_c). For multi-column (prefill) bf16 mul_mats.
-void ggml_gemm_bf16_4x4(int n, float * GGML_RESTRICT s, size_t ldc, const ggml_bf16_t * GGML_RESTRICT x, size_t bx, const ggml_bf16_t * const * GGML_RESTRICT y);
 #endif
 void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc);
 
