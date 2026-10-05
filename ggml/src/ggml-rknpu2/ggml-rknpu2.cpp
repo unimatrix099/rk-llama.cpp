@@ -1532,6 +1532,15 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
     std::lock_guard<std::mutex> lock(ctx->mutex);
     auto it = ctx->tensor_allocs.find(tensor_offset_in_virtual);
     if (it != ctx->tensor_allocs.end()) {
+        // A packed weight holds the NPU layout, not the tensor's own bytes,
+        // and is usually smaller than ggml_nbytes: a read-back can only
+        // return wrong data, and a full-size one runs off the allocation.
+        // Fail loudly rather than corrupt or fault later.
+        if (offset + size > it->second.size) {
+            GGML_ABORT("RKNPU2: get_tensor on NPU-packed weight '%s' (%zu bytes requested at offset %zu, %zu packed) - "
+                       "packed weights cannot be read back; an op on this weight was probably rejected by supports_op",
+                       tensor->name, size, offset, it->second.size);
+        }
         memcpy(data, (uint8_t*)it->second.mem->virt_addr + offset, size);
     } else {
         memcpy(data, (uint8_t*)tensor->data + offset, size);
@@ -1672,6 +1681,17 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             const auto* pipeline = config.resolve_op_support(src0);
             if (!pipeline) {
                 return false;
+            }
+
+            // Empty activations (llama-server emits output mul_mats with
+            // zero rows when a ubatch produces no logits) are a no-op that
+            // graph_compute skips. Accept them: rejecting sends the op to
+            // the CPU, and the scheduler then copies the whole weight out of
+            // this buffer through get_tensor — for E4B's tied output that is
+            // 713 MB of NPU-packed bytes, which overran the smaller packed
+            // allocation and segfaulted the server intermittently.
+            if (src0->ne[0] > 0 && src0->ne[1] > 0 && ggml_nelements(src1) == 0) {
+                return true;
             }
 
             // M-dependent routing: reject small-M (token generation) mul_mats
