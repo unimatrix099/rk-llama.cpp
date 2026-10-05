@@ -4138,8 +4138,23 @@ static void ggml_compute_forward_rms_norm_f32(
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
                 ggml_float sum = 0.0;
-                // worth switching to explicit SIMD?
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                int64_t i00 = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+                // fp32 products as below, accumulated in double over four
+                // independent 2-lane accumulators (the scalar loop is one
+                // dependent double-add chain)
+                float64x2_t s0 = vdupq_n_f64(0.0), s1 = s0, s2 = s0, s3 = s0;
+                for (; i00 + 8 <= ne00; i00 += 8) {
+                    const float32x4_t a = vld1q_f32(x + i00), b = vld1q_f32(x + i00 + 4);
+                    const float32x4_t pa = vmulq_f32(a, a), pb = vmulq_f32(b, b);
+                    s0 = vaddq_f64(s0, vcvt_f64_f32(vget_low_f32(pa)));
+                    s1 = vaddq_f64(s1, vcvt_high_f64_f32(pa));
+                    s2 = vaddq_f64(s2, vcvt_f64_f32(vget_low_f32(pb)));
+                    s3 = vaddq_f64(s3, vcvt_high_f64_f32(pb));
+                }
+                sum = vaddvq_f64(vaddq_f64(vaddq_f64(s0, s1), vaddq_f64(s2, s3)));
+#endif
+                for (; i00 < ne00; i00++) {
                     sum += (ggml_float)(x[i00] * x[i00]);
                 }
 
@@ -4157,8 +4172,15 @@ static void ggml_compute_forward_rms_norm_f32(
                     const int64_t i13 = i03 % ne13;
                     const float * w = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
 
-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        y[i00] = x[i00] * scale * w[i00];
+                    int64_t j = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+                    const float32x4_t vs = vdupq_n_f32(scale);
+                    for (; j + 4 <= ne00; j += 4) {   // (x*scale)*w, same order as below
+                        vst1q_f32(y + j, vmulq_f32(vmulq_f32(vld1q_f32(x + j), vs), vld1q_f32(w + j)));
+                    }
+#endif
+                    for (; j < ne00; j++) {
+                        y[j] = x[j] * scale * w[j];
                     }
                 } else {
                     memcpy(y, x, ne00 * sizeof(float));
