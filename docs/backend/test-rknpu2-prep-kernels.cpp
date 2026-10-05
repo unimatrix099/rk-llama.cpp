@@ -418,6 +418,17 @@ static void test_prep_split(void) {
             rknpu2_calibration::hadamard_transform(ref.data(), tmp.data(), K, K_op);
             rknpu2_calibration::hadamard_transform_signed(fused.data(), src.data(), signs.data(), K, K_op);
             CHECK(memcmp(ref.data(), fused.data(), K_op * 4) == 0, "hadamard signed K=%d", K);
+            // per-segment range on block boundaries == the slice of the full transform
+            if (K == K_op) {
+                const int blk = rknpu2_calibration::hadamard_block_len(K);
+                for (int k0 = 0; k0 < K; k0 += blk) {
+                    for (int len = blk; k0 + len <= K; len += blk) {
+                        std::vector<float> part(len, -3.0f);
+                        rknpu2_calibration::hadamard_transform_signed_range(part.data(), src.data(), signs.data(), K, k0, len);
+                        CHECK(memcmp(part.data(), fused.data() + k0, len * 4) == 0, "hadamard range K=%d k0=%d len=%d", K, k0, len);
+                    }
+                }
+            }
         }
 
         // chunked amax + quantize, as split across T threads

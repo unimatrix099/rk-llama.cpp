@@ -3,6 +3,7 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <cassert>
 #include <cstdlib>
 #include <limits>
 #include <cstring>
@@ -413,6 +414,27 @@ void hadamard_transform_signed(float* dst, const float* src, const float* signs,
     }
     const int block = hadamard_block_len(K);
     for (int off = 0; off < padded_size; off += block) {
+        fwht_iterative(dst + off, block);
+    }
+}
+
+void hadamard_transform_signed_range(float* dst, const float* src, const float* signs, int K, int k_begin, int k_len) {
+    // The blocks covering [k_begin, k_begin + k_len) of the natural
+    // block-diagonal transform of a K-wide row, written to dst[0, k_len):
+    // identical to the same slice of hadamard_transform_signed, since blocks
+    // are independent. Requires the range to start and end on block bounds.
+    const int block = hadamard_block_len(K);
+    assert(k_begin % block == 0 && k_len % block == 0 && k_begin + k_len <= K);
+    int i = 0;
+#ifdef __ARM_NEON
+    for (; i + 4 <= k_len; i += 4) {
+        vst1q_f32(dst + i, vmulq_f32(vld1q_f32(src + k_begin + i), vld1q_f32(signs + k_begin + i)));
+    }
+#endif
+    for (; i < k_len; ++i) {
+        dst[i] = src[k_begin + i] * signs[k_begin + i];
+    }
+    for (int off = 0; off < k_len; off += block) {
         fwht_iterative(dst + off, block);
     }
 }

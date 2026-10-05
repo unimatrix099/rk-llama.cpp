@@ -1265,6 +1265,9 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     const float hadamard_divisor = is_hadamard ? (float)rknpu2_calibration::hadamard_block_len(K) : 1.0f;
                     const int row_stride = (int)(src1->nb[1] / sizeof(float));
                     std::vector<float> scales_A(M, 1.0f);
+                    const int h_block = is_hadamard ? rknpu2_calibration::hadamard_block_len(K) : 1;
+                    const bool seg_on_blocks = is_hadamard && all_k_segments.size() > 1 && K_op == K &&
+                                               k_seg.offset_k % h_block == 0 && K_seg_op % h_block == 0;
 
                     auto prep = [&](int c) {
                         const int m0 = c * MC, rows = std::min(MC, M - m0);
@@ -1277,7 +1280,12 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                             static thread_local std::vector<uint8_t> packed_row;
                             auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
                             const float* ready_row;
-                            if (is_hadamard) {
+                            if (is_hadamard && seg_on_blocks) {
+                                // K-segmented weight: transform only this segment's blocks
+                                grow(full_row, (size_t)K_seg_op);
+                                rknpu2_calibration::hadamard_transform_signed_range(full_row.data(), src_row, s_vec.data(), K, k_seg.offset_k, K_seg_op);
+                                ready_row = full_row.data();
+                            } else if (is_hadamard) {
                                 grow(full_row, (size_t)K_op);
                                 rknpu2_calibration::hadamard_transform_signed(full_row.data(), src_row, s_vec.data(), K, K_op);
                                 ready_row = full_row.data() + k_seg.offset_k;

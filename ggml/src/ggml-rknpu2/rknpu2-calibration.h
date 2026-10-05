@@ -62,6 +62,12 @@ void hadamard_transform(float* dst, const float* src, int K, int padded_size);
 // padded_size), fused: identical results, one pass and one buffer fewer.
 void hadamard_transform_signed(float* dst, const float* src, const float* signs, int K, int padded_size);
 
+// Only the blocks of [k_begin, k_begin + k_len) of hadamard_transform_signed
+// over a K-wide row (natural, unpadded case; range on block boundaries),
+// written to dst[0, k_len). For K-segmented weights: each segment needs only
+// its own blocks.
+void hadamard_transform_signed_range(float* dst, const float* src, const float* signs, int K, int k_begin, int k_len);
+
 // One block of hadamard_transform: writes dst[b*block, (b+1)*block) exactly
 // as hadamard_transform would (copy of src over [0, K), zero padding up to
 // padded_size, then the in-place FWHT of that block). Blocks are
