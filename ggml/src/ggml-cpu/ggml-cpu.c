@@ -1209,6 +1209,71 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     // 16 * 2, accounting for mmla kernels
     float tmp[32];
 
+#if defined(__ARM_NEON)
+    // bf16 with several src1 columns (prefill): ggml has no SIMD bf16 GEMM on
+    // ARM, and one column at a time re-reads every weight row per column.
+    // 4x4 register tiles (ggml_gemm_bf16_4x4) load each weight row once per
+    // four columns and accumulate in fp32 lanes. Single columns (decode) keep
+    // the bit-exact ggml_vec_dot_bf16(_x4) path below.
+    if (type == GGML_TYPE_BF16 && num_rows_per_vec_dot == 1 && ir1_end - ir1_start >= 4) {
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+            for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+                const int64_t ir0_lim = MIN(iir0 + blck_0, ir0_end);
+                const int64_t ir1_lim = MIN(iir1 + blck_1, ir1_end);
+                for (int64_t ir1 = iir1; ir1 < ir1_lim; ) {
+                    const int64_t ncols = (ir1 + 4 <= ir1_lim) ? 4 : 1;
+                    const ggml_bf16_t * ycol[4];
+                    float * dcol[4];
+                    const char * s0row = NULL;
+                    bool same_src0 = true;
+                    for (int64_t c = 0; c < ncols; ++c) {
+                        const int64_t j   = ir1 + c;
+                        const int64_t i13 = (j / (ne12 * ne1));
+                        const int64_t i12 = (j - i13 * ne12 * ne1) / ne1;
+                        const int64_t i11 = (j - i13 * ne12 * ne1 - i12 * ne1);
+                        const char * row = (const char*)src0->data + ((i12 / r2) * nb02 + (i13 / r3) * nb03);
+                        if (c == 0) s0row = row; else same_src0 &= (row == s0row);
+                        ycol[c] = (const ggml_bf16_t *)((const char*)wdata +
+                            (src1_cont || src1->type != vec_dot_type
+                                ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                                : (i11 * nb11 + i12 * nb12 + i13 * nb13)));
+                        dcol[c] = (float*)((char*)dst->data + (i11 * nb1 + i12 * nb2 + i13 * nb3));
+                    }
+                    if (ncols == 4 && same_src0) {
+                        float t4[16];
+                        int64_t ir0 = iir0;
+                        for (; ir0 + 4 <= ir0_lim; ir0 += 4) {
+                            ggml_gemm_bf16_4x4(ne00, t4, 4, (const ggml_bf16_t *)(s0row + ir0 * nb01), nb01, ycol);
+                            for (int c = 0; c < 4; ++c) {
+                                for (int r = 0; r < 4; ++r) {
+                                    dcol[c][ir0 + r] = t4[c*4 + r];
+                                }
+                            }
+                        }
+                        for (; ir0 < ir0_lim; ++ir0) {
+                            for (int c = 0; c < 4; ++c) {
+                                vec_dot(ne00, &dcol[c][ir0], 0, s0row + ir0 * nb01, 0, ycol[c], 0, 1);
+                            }
+                        }
+                        ir1 += 4;
+                    } else {
+                        // one column: the bit-exact path
+                        int64_t ir0 = iir0;
+                        for (; ir0 + 4 <= ir0_lim; ir0 += 4) {
+                            ggml_vec_dot_bf16_x4(ne00, &dcol[0][ir0], (const ggml_bf16_t *)(s0row + ir0 * nb01), nb01, ycol[0]);
+                        }
+                        for (; ir0 < ir0_lim; ++ir0) {
+                            vec_dot(ne00, &dcol[0][ir0], 0, s0row + ir0 * nb01, 0, ycol[0], 0, 1);
+                        }
+                        ir1 += 1;
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
+
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {

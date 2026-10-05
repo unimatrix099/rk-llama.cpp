@@ -284,6 +284,55 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
 }
 
 #if defined(__ARM_NEON)
+void ggml_gemm_bf16_4x4(int n, float * GGML_RESTRICT s, size_t ldc, const ggml_bf16_t * GGML_RESTRICT x, size_t bx, const ggml_bf16_t * const * GGML_RESTRICT y) {
+    const uint16_t * x0 = (const uint16_t *)x;
+    const uint16_t * x1 = (const uint16_t *)((const char *)x + bx);
+    const uint16_t * x2 = (const uint16_t *)((const char *)x + 2*bx);
+    const uint16_t * x3 = (const uint16_t *)((const char *)x + 3*bx);
+    const uint16_t * y0 = (const uint16_t *)y[0];
+    const uint16_t * y1 = (const uint16_t *)y[1];
+    const uint16_t * y2 = (const uint16_t *)y[2];
+    const uint16_t * y3 = (const uint16_t *)y[3];
+#define BF16_LD4(p) vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(p), 16))
+    float32x4_t a00 = vdupq_n_f32(0), a01 = a00, a02 = a00, a03 = a00;
+    float32x4_t a10 = a00, a11 = a00, a12 = a00, a13 = a00;
+    float32x4_t a20 = a00, a21 = a00, a22 = a00, a23 = a00;
+    float32x4_t a30 = a00, a31 = a00, a32 = a00, a33 = a00;
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t v0 = BF16_LD4(y0 + i), v1 = BF16_LD4(y1 + i), v2 = BF16_LD4(y2 + i), v3 = BF16_LD4(y3 + i);
+        float32x4_t u = BF16_LD4(x0 + i);
+        a00 = vfmaq_f32(a00, u, v0); a01 = vfmaq_f32(a01, u, v1); a02 = vfmaq_f32(a02, u, v2); a03 = vfmaq_f32(a03, u, v3);
+        u = BF16_LD4(x1 + i);
+        a10 = vfmaq_f32(a10, u, v0); a11 = vfmaq_f32(a11, u, v1); a12 = vfmaq_f32(a12, u, v2); a13 = vfmaq_f32(a13, u, v3);
+        u = BF16_LD4(x2 + i);
+        a20 = vfmaq_f32(a20, u, v0); a21 = vfmaq_f32(a21, u, v1); a22 = vfmaq_f32(a22, u, v2); a23 = vfmaq_f32(a23, u, v3);
+        u = BF16_LD4(x3 + i);
+        a30 = vfmaq_f32(a30, u, v0); a31 = vfmaq_f32(a31, u, v1); a32 = vfmaq_f32(a32, u, v2); a33 = vfmaq_f32(a33, u, v3);
+    }
+#undef BF16_LD4
+    float r[4][4] = {
+        { vaddvq_f32(a00), vaddvq_f32(a01), vaddvq_f32(a02), vaddvq_f32(a03) },
+        { vaddvq_f32(a10), vaddvq_f32(a11), vaddvq_f32(a12), vaddvq_f32(a13) },
+        { vaddvq_f32(a20), vaddvq_f32(a21), vaddvq_f32(a22), vaddvq_f32(a23) },
+        { vaddvq_f32(a30), vaddvq_f32(a31), vaddvq_f32(a32), vaddvq_f32(a33) },
+    };
+    const uint16_t * xr[4] = { x0, x1, x2, x3 };
+    const uint16_t * yc[4] = { y0, y1, y2, y3 };
+    for (; i < n; ++i) {
+        for (int rr = 0; rr < 4; ++rr) {
+            for (int cc = 0; cc < 4; ++cc) {
+                r[rr][cc] += GGML_BF16_TO_FP32(((const ggml_bf16_t *)xr[rr])[i]) * GGML_BF16_TO_FP32(((const ggml_bf16_t *)yc[cc])[i]);
+            }
+        }
+    }
+    for (int cc = 0; cc < 4; ++cc) {
+        for (int rr = 0; rr < 4; ++rr) {
+            s[cc*ldc + rr] = r[rr][cc];
+        }
+    }
+}
+
 void ggml_vec_dot_bf16_x4(int n, float * GGML_RESTRICT s, const ggml_bf16_t * GGML_RESTRICT x, size_t bx, const ggml_bf16_t * GGML_RESTRICT y) {
     const ggml_bf16_t * xr[4] = {
         x, (const ggml_bf16_t *)((const char *)x + bx),
