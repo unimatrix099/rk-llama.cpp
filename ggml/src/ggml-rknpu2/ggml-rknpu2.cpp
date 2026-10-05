@@ -353,6 +353,13 @@ struct rknpu_matmul_context {
     bool b_bound = false;
     std::shared_ptr<rknn_tensor_mem> mem_B;
 
+    // A/C buffers currently bound with rknn_matmul_set_io_mem. Both come from
+    // shape-keyed caches whose entries live as long as the backend, so a
+    // pointer match means the binding is already in place and the driver
+    // call can be skipped (it was ~2,300 calls per decoded token).
+    const rknn_tensor_mem* bound_A = nullptr;
+    const rknn_tensor_mem* bound_C = nullptr;
+
     rknpu_matmul_context(int M, int K, int N, rknn_matmul_type type, rknn_matmul_layout ac_layout, int32_t domain_id) {
         memset(&info, 0, sizeof(info));
         info.M = M;
@@ -879,7 +886,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
 
                     // Assigning A-matrix to all contexts for the parallel execution
                     for (size_t idx = 0; idx < num_active_segments; idx++) {
-                        RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctxs[idx]->ctx, mem_A_shared.get(), &matmul_ctxs[idx]->io_attr.A), "set_io_mem A for core");
+                        if (matmul_ctxs[idx]->bound_A != mem_A_shared.get()) {
+                            RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctxs[idx]->ctx, mem_A_shared.get(), &matmul_ctxs[idx]->io_attr.A), "set_io_mem A for core");
+                            matmul_ctxs[idx]->bound_A = mem_A_shared.get();
+                        }
                     }
 
                     RKNN_CHECK(rknn_mem_sync(matmul_ctxs[0]->ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
@@ -898,7 +908,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         if (!mem_C_segments[idx]) return GGML_STATUS_FAILED;
 
                         // Assigning C-matrix to current context for the parallel execution
-                        RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_C_segments[idx].get(), &matmul_ctx->io_attr.C), "set_io_mem C");
+                        if (matmul_ctx->bound_C != mem_C_segments[idx].get()) {
+                            RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_C_segments[idx].get(), &matmul_ctx->io_attr.C), "set_io_mem C");
+                            matmul_ctx->bound_C = mem_C_segments[idx].get();
+                        }
                     }
                 }
 
