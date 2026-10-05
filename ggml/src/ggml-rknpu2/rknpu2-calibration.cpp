@@ -217,6 +217,36 @@ static void fwht_iterative(float* data, int size) {
         // stage 2h combines them — so results are bit-identical, with half
         // the load/store passes.
         int h = 4;
+        // three stages (h, 2h, 4h) per pass while they fit (radix-8)
+        for (; h * 4 < size; h <<= 3) {
+            for (int i = 0; i < size; i += h * 8) {
+                for (int j = i; j < i + h; j += 4) {
+                    float32x4_t v0 = vld1q_f32(data + j),         v1 = vld1q_f32(data + j + h);
+                    float32x4_t v2 = vld1q_f32(data + j + 2 * h), v3 = vld1q_f32(data + j + 3 * h);
+                    float32x4_t v4 = vld1q_f32(data + j + 4 * h), v5 = vld1q_f32(data + j + 5 * h);
+                    float32x4_t v6 = vld1q_f32(data + j + 6 * h), v7 = vld1q_f32(data + j + 7 * h);
+                    // stage h
+                    float32x4_t t0 = vaddq_f32(v0, v1), t1 = vsubq_f32(v0, v1);
+                    float32x4_t t2 = vaddq_f32(v2, v3), t3 = vsubq_f32(v2, v3);
+                    float32x4_t t4 = vaddq_f32(v4, v5), t5 = vsubq_f32(v4, v5);
+                    float32x4_t t6 = vaddq_f32(v6, v7), t7 = vsubq_f32(v6, v7);
+                    // stage 2h
+                    v0 = vaddq_f32(t0, t2); v2 = vsubq_f32(t0, t2);
+                    v1 = vaddq_f32(t1, t3); v3 = vsubq_f32(t1, t3);
+                    v4 = vaddq_f32(t4, t6); v6 = vsubq_f32(t4, t6);
+                    v5 = vaddq_f32(t5, t7); v7 = vsubq_f32(t5, t7);
+                    // stage 4h
+                    vst1q_f32(data + j,         vaddq_f32(v0, v4));
+                    vst1q_f32(data + j + 4 * h, vsubq_f32(v0, v4));
+                    vst1q_f32(data + j + h,     vaddq_f32(v1, v5));
+                    vst1q_f32(data + j + 5 * h, vsubq_f32(v1, v5));
+                    vst1q_f32(data + j + 2 * h, vaddq_f32(v2, v6));
+                    vst1q_f32(data + j + 6 * h, vsubq_f32(v2, v6));
+                    vst1q_f32(data + j + 3 * h, vaddq_f32(v3, v7));
+                    vst1q_f32(data + j + 7 * h, vsubq_f32(v3, v7));
+                }
+            }
+        }
         for (; h * 2 < size; h <<= 2) {
             for (int i = 0; i < size; i += h * 4) {
                 for (int j = i; j < i + h; j += 4) {
