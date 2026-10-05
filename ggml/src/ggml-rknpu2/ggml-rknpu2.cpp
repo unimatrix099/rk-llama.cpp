@@ -2296,7 +2296,16 @@ static bool ggml_backend_rknpu_buffer_type_is_host(ggml_backend_buffer_type_t bu
     // original bytes the CPU backend can read in place. NOTE: this path
     // requires mmap model loading (the default); --no-mmap bypasses
     // set_tensor for host buffers and the NPU copy would never be built.
-    return rknpu_cpu_decode_threshold() > 0;
+    // Also always since compute buffers are plain host memory: the CPU
+    // backend then reads NPU outputs in place instead of the scheduler
+    // copying them across at every split. Packed weights are never read by
+    // the CPU because supports_op accepts every op on them (see get_tensor's
+    // abort for the one historical exception, empty mul_mats).
+    static const bool host_compute = []() {
+        const char* env = std::getenv("RKNPU_HOST_BUFFERS");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return host_compute || rknpu_cpu_decode_threshold() > 0;
 }
 
 
