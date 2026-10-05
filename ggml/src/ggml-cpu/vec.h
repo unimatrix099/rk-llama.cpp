@@ -1452,7 +1452,25 @@ inline static void ggml_vec_reglu_bf16(const int n, ggml_bf16_t * y, const ggml_
 #ifdef GGML_GELU_FP16
 inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, const float * g) {
     uint16_t t;
-    for (int i = 0; i < n; ++i) {
+    int i = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    // The fp16 table needs one scalar gather per element; on ARM compute the
+    // tanh GELU directly, four lanes at a time (tanh(z) = 1 - 2/(e^{2z}+1)
+    // via ggml_v_expf), keeping the table path's +-10 cut-offs. Slightly
+    // different rounding from the table, which first rounds x to fp16.
+    const float32x4_t c0 = vdupq_n_f32(SQRT_2_OVER_PI), c1 = vdupq_n_f32(GELU_COEF_A);
+    const float32x4_t one = vdupq_n_f32(1.0f), two = vdupq_n_f32(2.0f), half = vdupq_n_f32(0.5f);
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t xv = vld1q_f32(x + i);
+        const float32x4_t z  = vmulq_f32(vmulq_f32(c0, xv), vfmaq_f32(one, vmulq_f32(c1, xv), xv));
+        const float32x4_t th = vsubq_f32(one, vdivq_f32(two, vaddq_f32(ggml_v_expf(vmulq_f32(two, z)), one)));
+        float32x4_t gel = vmulq_f32(vmulq_f32(half, xv), vaddq_f32(one, th));
+        gel = vbslq_f32(vcleq_f32(xv, vdupq_n_f32(-10.0f)), vdupq_n_f32(0.0f), gel);
+        gel = vbslq_f32(vcgeq_f32(xv, vdupq_n_f32(10.0f)), xv, gel);
+        vst1q_f32(y + i, vmulq_f32(gel, vld1q_f32(g + i)));
+    }
+#endif
+    for (; i < n; ++i) {
         if (x[i] <= -10.0f) {
             y[i] = 0.0f;
         } else if (x[i] >= 10.0f) {
