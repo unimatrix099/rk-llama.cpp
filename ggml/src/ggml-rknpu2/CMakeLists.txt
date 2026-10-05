@@ -33,3 +33,9 @@ if(OpenMP_FOUND)
     target_compile_options(ggml-rknpu2 PRIVATE ${OpenMP_CXX_FLAGS})
     target_link_libraries(ggml-rknpu2 PRIVATE ${OpenMP_CXX_FLAGS})
 endif()
+
+# Pin function and loop alignment: the dequant kernel's hot loop measured
+# ~10% slower when unrelated code elsewhere in the library shifted it onto a
+# bad alignment (NPU prefill loop 3, #5); 64-byte alignment makes the speed
+# independent of layout.
+target_compile_options(ggml-rknpu2 PRIVATE -falign-functions=64 -falign-loops=64)
