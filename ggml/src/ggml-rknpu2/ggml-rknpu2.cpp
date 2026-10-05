@@ -24,6 +24,7 @@
 #include <cstring>
 #include <chrono>
 #include <map>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -507,6 +508,22 @@ struct ggml_backend_rknpu_context {
     rknpu_dispatch_pool dispatch_pool;
     rknpu_async_runner async_runner;
 
+    // Last-chunk dequant of a pipelined node, deferred so the next pipelined
+    // matmul on the same input (gate -> up) can prep its first chunk while
+    // that chunk still runs on the NPU, and run this dequant while its own
+    // first chunk runs. Owns copies of everything it needs.
+    std::function<void()> deferred_collect;
+    const struct ggml_tensor* deferred_src1 = nullptr;
+    void flush_deferred() {
+        if (deferred_collect) {
+            async_runner.wait();
+            auto f = std::move(deferred_collect);
+            deferred_collect = nullptr;
+            deferred_src1 = nullptr;
+            f();
+        }
+    }
+
     // (M, K, N, B layout, core) -> attention matmul context
     std::map<std::tuple<int, int, int, int, int>, std::unique_ptr<rknpu_attn_context>> attn_ctx_cache;
     rknpu_attn_context* get_attn_ctx(int M, int K, int N, int b_layout, int core_id) {
@@ -982,6 +999,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
 
     for (int node_i = 0; node_i < cgraph->n_nodes; node_i++) {
         struct ggml_tensor* node = cgraph->nodes[node_i];
+        if (backend_ctx->deferred_collect &&
+            !(node->op == GGML_OP_MUL_MAT && node->src[1] == backend_ctx->deferred_src1)) {
+            backend_ctx->flush_deferred();
+        }
         if (node->op == GGML_OP_FLASH_ATTN_EXT) {
             rknpu_flash_attn(backend_ctx, node, n_omp);
             continue;
@@ -1352,16 +1373,66 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
 
 
                     const auto t_run = g_rknpu_profile.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                    prep(0);
-                    start(0);
+                    prep(0);                             // overlaps a deferred previous chunk, if any
+                    if (backend_ctx->deferred_collect) {
+                        backend_ctx->async_runner.wait();
+                        start(0);
+                        auto f = std::move(backend_ctx->deferred_collect);
+                        backend_ctx->deferred_collect = nullptr;
+                        backend_ctx->deferred_src1 = nullptr;
+                        f();                             // overlaps this node's chunk 0
+                    } else {
+                        start(0);
+                    }
                     for (int c = 1; c < n_chunks; ++c) {
                         prep(c);                         // overlaps NPU chunk c-1
                         backend_ctx->async_runner.wait();
                         start(c);
                         if (fused_now) collect_fused(c - 1); else collect(c - 1);   // overlaps NPU chunk c
                     }
-                    backend_ctx->async_runner.wait();
-                    if (fused_now) collect_fused(n_chunks - 1); else collect(n_chunks - 1);
+                    // Defer the last dequant when the next node is a matmul on
+                    // the same input (its prep cannot depend on our output).
+                    // Even chunk count: our last chunk then uses A/C slot 1
+                    // while the next node's chunk 0 uses slot 0.
+                    struct ggml_tensor* nxt = node_i + 1 < cgraph->n_nodes ? cgraph->nodes[node_i + 1] : nullptr;
+                    static const bool defer_enabled = []() {
+                        const char* env = std::getenv("RKNPU_DEFER_COLLECT");
+                        return env == nullptr || std::atoi(env) != 0;
+                    }();
+                    const bool defer = defer_enabled && !fused_now && n_chunks % 2 == 0 && nbatch == 1 &&
+                                       all_k_segments.size() == 1 && nxt && nxt->op == GGML_OP_MUL_MAT &&
+                                       nxt->src[1] == src1 && fuse_glu == nullptr;
+                    if (defer) {
+                        const int c = n_chunks - 1, m0 = c * MC, rows = std::min(MC, M - m0);
+                        backend_ctx->deferred_src1 = src1;
+                        backend_ctx->deferred_collect =
+                            [cctx, cs = c_slot[c & 1], sA = std::vector<float>(scales_A.begin() + m0, scales_A.begin() + m0 + rows),
+                             rows, n_omp, segs = active_n_segments, geom = c_geom, hadamard_divisor,
+                             dst_rows = dst_batch + (size_t)m0 * N, N, chan = scales_B_grid->data() + k_idx * (size_t)N]() {
+                                for (size_t idx = 0; idx < segs.size(); ++idx) {
+                                    RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, cs[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C deferred");
+                                }
+                                const int n_blocks = (rows + 3) / 4;
+                                #pragma omp parallel for num_threads(n_omp)
+                                for (int blk = 0; blk < n_blocks; ++blk) {
+                                    const int r0 = blk * 4;
+                                    const int nr = std::min(4, rows - r0);
+                                    float common[4];
+                                    for (int r = 0; r < nr; ++r) common[r] = sA[r0 + r] / hadamard_divisor;
+                                    for (size_t idx = 0; idx < segs.size(); ++idx) {
+                                        const int N_offset = segs[idx].offset_n;
+                                        rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
+                                            dst_rows + (size_t)r0 * N + N_offset, (size_t)N,
+                                            (const int16_t*)cs[idx]->virt_addr, r0, nr,
+                                            geom[idx].m_stride, geom[idx].outer, geom[idx].sub,
+                                            segs[idx].size_n, common, chan + N_offset, /*store=*/ true);
+                                    }
+                                }
+                            };
+                    } else {
+                        backend_ctx->async_runner.wait();
+                        if (fused_now) collect_fused(n_chunks - 1); else collect(n_chunks - 1);
+                    }
                     if (g_rknpu_profile.on) g_rknpu_profile.run_ns += rknpu_profile::ns(t_run, std::chrono::steady_clock::now());
                     continue;
                 }
@@ -1723,6 +1794,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
             ++node_i;   // the GLU was computed inside this node's dequant
         }
     }
+    backend_ctx->flush_deferred();
 
     return GGML_STATUS_SUCCESS;
 }
