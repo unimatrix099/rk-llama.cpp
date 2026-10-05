@@ -193,6 +193,47 @@ void dequant_acc_int16_tiled_perchan(float * dst, const int16_t * src_native,
     }
 }
 
+// Same arithmetic as dequant_acc_int16_tiled_perchan, row block at a time:
+// rows m0 .. m0+nrows-1 of the native [outer, m_stride, sub] C, written to
+// dst rows spaced dst_stride floats apart, each with its own common scale.
+// Consecutive rows of one tile are adjacent in the native layout, so walking
+// tile-major over a row block reads C sequentially instead of one cell per
+// cache line, and the per-cell body is inlined instead of a call per cell.
+// Per element it is exactly dequant_acc_int16_to_fp32_perchan (same vector
+// body for full 8-groups, same mul-then-fma tail), so results are identical.
+void dequant_acc_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const int16_t * src_native,
+                                          int32_t m0, int32_t nrows, int32_t m_stride, int32_t outer, int32_t sub,
+                                          int32_t n_limit, const float * common, const float * chan_scales) {
+    for (int32_t t = 0; t < outer; ++t) {
+        const int32_t n0 = t * sub;
+        const int32_t lim = std::min(sub, n_limit - n0);
+        if (lim <= 0) {
+            break;
+        }
+        for (int32_t r = 0; r < nrows; ++r) {
+            const int16_t * cell = src_native + ((size_t)t * m_stride + m0 + r) * sub;
+            float * d = dst + (size_t)r * dst_stride + n0;
+            const float * cs = chan_scales + n0;
+            size_t i = 0;
+#ifdef __ARM_NEON
+            const float32x4_t vc = vdupq_n_f32(common[r]);
+            for (; i + 8 <= (size_t)lim; i += 8) {
+                int16x8_t s16 = vld1q_s16(cell + i);
+                float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16)));
+                float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16)));
+                float32x4_t sc0 = vmulq_f32(vld1q_f32(cs + i),     vc);
+                float32x4_t sc1 = vmulq_f32(vld1q_f32(cs + i + 4), vc);
+                vst1q_f32(d + i,     vfmaq_f32(vld1q_f32(d + i),     f0, sc0));
+                vst1q_f32(d + i + 4, vfmaq_f32(vld1q_f32(d + i + 4), f1, sc1));
+            }
+#endif
+            for (; i < (size_t)lim; ++i) {
+                d[i] = fmaf((float)cell[i], cs[i] * common[r], d[i]);
+            }
+        }
+    }
+}
+
 // --- Dequantization to FP32 ---
 
 void dequantize_int16_to_fp32(const int16_t * src, float * dst, size_t n_elements, float scale) {

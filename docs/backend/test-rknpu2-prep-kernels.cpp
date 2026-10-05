@@ -432,6 +432,41 @@ static void test_prep_split(void) {
     }
 }
 
+// Row-block native dequant (prefill) must equal the per-row tiled call.
+static void test_dequant_tiled_rows(void) {
+    for (int sub : {4, 8, 16}) {
+        for (int n_limit : {sub, 3 * sub, 5 * sub - 3, 64}) {
+            const int outer = (n_limit + sub - 1) / sub;
+            for (int m_stride : {4, 7, 32}) {
+                std::vector<int16_t> C((size_t)outer * m_stride * sub);
+                for (auto& v : C) v = (int16_t)((int)(prng() % 4001) - 2000);
+                std::vector<float> chan(outer * sub);
+                for (auto& v : chan) v = frand() * 0.01f;
+                std::vector<float> common(m_stride);
+                for (auto& v : common) v = frand();
+                const size_t stride = (size_t)outer * sub + 5;
+                std::vector<float> init((size_t)m_stride * stride);
+                for (auto& v : init) v = frand();
+                for (int m0 = 0; m0 < m_stride; m0 += 3) {
+                    for (int nrows = 1; nrows <= 4 && m0 + nrows <= m_stride; ++nrows) {
+                        std::vector<float> a = init, b = init;
+                        for (int r = 0; r < nrows; ++r) {
+                            rknpu2_quantization::dequant_acc_int16_tiled_perchan(
+                                a.data() + (size_t)(m0 + r) * stride, C.data(), m0 + r, m_stride, outer, sub,
+                                n_limit, common[m0 + r], chan.data());
+                        }
+                        rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
+                            b.data() + (size_t)m0 * stride, stride, C.data(), m0, nrows, m_stride, outer, sub,
+                            n_limit, common.data() + m0, chan.data());
+                        CHECK(memcmp(a.data(), b.data(), a.size() * 4) == 0,
+                              "tiled rows sub=%d n=%d ms=%d m0=%d nr=%d", sub, n_limit, m_stride, m0, nrows);
+                    }
+                }
+            }
+        }
+    }
+}
+
 int main(void) {
     test_quantize_int8();
     test_quantize_int4();
@@ -446,6 +481,7 @@ int main(void) {
     test_hadamard();
     test_hadamard_blocked();
     test_prep_split();
+    test_dequant_tiled_rows();
     CHECK(rknpu2_calibration::next_power_of_two(0) == 1, "npot 0");
     CHECK(rknpu2_calibration::next_power_of_two(1) == 1, "npot 1");
     CHECK(rknpu2_calibration::next_power_of_two(3) == 4, "npot 3");

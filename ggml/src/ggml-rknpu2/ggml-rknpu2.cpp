@@ -1046,10 +1046,40 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         RKNN_CHECK(rknn_mem_sync(matmul_ctxs[idx]->ctx, mem_C_segments[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
                     }
 
-                    #pragma omp parallel for if(M > 1) num_threads(n_omp)
-                    for (int m = 0; m < M; m++) {
-                        for (size_t idx = 0; idx < num_active_segments; idx++) {
-                            dequant_seg(m, idx);
+                    // Native INT16 C with per-channel scales (W4A4 prefill):
+                    // four rows per tile, so the tiled C is read sequentially
+                    // (dequant_acc_int16_tiled_perchan_rows; element-exact vs
+                    // dequant_seg, test_dequant_tiled_rows)
+                    bool rows_path = M > 1 && pipeline->npu_type_c == rknpu2_configuration::NPU_TYPE_INT16 && b_per_channel;
+                    for (size_t idx = 0; idx < num_active_segments && rows_path; idx++) {
+                        rows_path = c_native[idx] != 0;
+                    }
+                    if (rows_path) {
+                        const int n_blocks = (M + 3) / 4;
+                        #pragma omp parallel for num_threads(n_omp)
+                        for (int blk = 0; blk < n_blocks; ++blk) {
+                            const int m0 = blk * 4;
+                            const int nr = std::min(4, M - m0);
+                            float common[4];
+                            for (int r = 0; r < nr; ++r) {
+                                common[r] = scales_A[m0 + r] / hadamard_divisor;
+                            }
+                            for (size_t idx = 0; idx < num_active_segments; idx++) {
+                                const int N_offset = active_n_segments[idx].offset_n;
+                                rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
+                                    dst_batch + (size_t)m0 * N + N_offset, (size_t)N,
+                                    (const int16_t*)mem_C_segments[idx]->virt_addr, m0, nr,
+                                    c_geoms[idx].m_stride, c_geoms[idx].outer, c_geoms[idx].sub,
+                                    active_n_segments[idx].size_n, common,
+                                    scales_B_grid->data() + k_idx * (size_t)N + N_offset);
+                            }
+                        }
+                    } else {
+                        #pragma omp parallel for if(M > 1) num_threads(n_omp)
+                        for (int m = 0; m < M; m++) {
+                            for (size_t idx = 0; idx < num_active_segments; idx++) {
+                                dequant_seg(m, idx);
+                            }
                         }
                     }
                 }
