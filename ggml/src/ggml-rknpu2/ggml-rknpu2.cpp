@@ -1059,6 +1059,21 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
             pipeline->ac_layout == RKNN_MM_LAYOUT_NATIVE &&
             (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4 || pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8) &&
             rknpu2_calibration::per_channel_b_scales() && n_omp > 1;
+        // Fuse the following GEGLU into this (gate) matmul's dequant when it
+        // is the GLU's src0, up (src1) is already computed, and nothing else
+        // can need the gate values (single K-segment, not a graph output)
+        struct ggml_tensor* fuse_glu = nullptr;
+        static const bool fuse_enabled = []() {
+            const char* env = std::getenv("RKNPU_FUSE_GLU");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        if (fuse_enabled && pipelined_node && node_i + 1 < cgraph->n_nodes) {
+            struct ggml_tensor* nx = cgraph->nodes[node_i + 1];
+            if (nx->op == GGML_OP_GLU && nx->src[0] == node && nx->src[1] != node && rknpu_glu_supported(nx) &&
+                nx->ne[0] == N && ggml_nrows(nx) == M && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                fuse_glu = nx;
+            }
+        }
         for (int64_t ib = 0; ib < nbatch && !pipelined_node; ++ib) {
             memset((char*)dst_data + ib * dst_batch_nb, 0, (size_t)M * N * sizeof(float));
         }
@@ -1173,6 +1188,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 // disables it.
                 const int MC = 256;
                 static_assert(MC == 256, "pipelined_node uses M > 256");
+                const bool fused_now = fuse_glu != nullptr && all_k_segments.size() == 1;
                 if (pipelined_node) {
                     const int n_chunks = (M + MC - 1) / MC;
                     // chunk contexts (M_op = MC), B bound once per context
@@ -1273,6 +1289,31 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                             const int nr = std::min(4, rows - r0);
                             float common[4];
                             for (int r = 0; r < nr; ++r) common[r] = scales_A[m0 + r0 + r] / hadamard_divisor;
+                            if (fused_now) {
+                                // gate rows of this block -> a per-thread contiguous
+                                // buffer (cache-resident), then GEGLU over whole rows
+                                const struct ggml_tensor* up_t = fuse_glu->src[1];
+                                float* y_base = (float*)get_tensor_real_ptr(fuse_glu);
+                                const float* up_base = (const float*)get_tensor_real_ptr(up_t);
+                                const size_t ys = fuse_glu->nb[1] / sizeof(float), us = up_t->nb[1] / sizeof(float);
+                                static thread_local std::vector<float> gbuf;
+                                if (gbuf.size() < (size_t)4 * N) gbuf.resize((size_t)4 * N);
+                                for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                                    const int N_offset = active_n_segments[idx].offset_n;
+                                    rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
+                                        gbuf.data() + N_offset, (size_t)N,
+                                        (const int16_t*)c_slot[c & 1][idx]->virt_addr, r0, nr,
+                                        c_geom[idx].m_stride, c_geom[idx].outer, c_geom[idx].sub,
+                                        active_n_segments[idx].size_n, common,
+                                        scales_B_grid->data() + k_idx * (size_t)N + N_offset,
+                                        /*store=*/ true);
+                                }
+                                for (int r = 0; r < nr; ++r) {
+                                    rknpu_geglu_row(N, y_base + (size_t)(m0 + r0 + r) * ys, gbuf.data() + (size_t)r * N,
+                                                    up_base + (size_t)(m0 + r0 + r) * us);
+                                }
+                                continue;
+                            }
                             for (size_t idx = 0; idx < num_active_segments; ++idx) {
                                 const int N_offset = active_n_segments[idx].offset_n;
                                 rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
@@ -1655,6 +1696,9 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
             }
         }
         if (g_rknpu_profile.on) g_rknpu_profile.node_ns += rknpu_profile::ns(t_node, std::chrono::steady_clock::now());
+        if (fuse_glu && all_k_segments.size() == 1) {
+            ++node_i;   // the GLU was computed inside this node's dequant
+        }
     }
 
     return GGML_STATUS_SUCCESS;
