@@ -284,6 +284,11 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
     // Defining default quantization sequences for each supported ggml_type
     rk3588_config.default_patterns[(int)GGML_TYPE_F16]  = {"W16A16_STANDARD"};
     rk3588_config.default_patterns[(int)GGML_TYPE_Q8_0] = {"W8A8_STANDARD"};
+    // BF16 weights (Gemma-4's per_layer_model_proj, 2560x10752) otherwise
+    // run on the CPU, where ggml has no SIMD bf16 GEMM: at pp512 that one
+    // tensor was a third of all CPU samples. int8 per-channel is the
+    // pipeline that measures ~2% from CPU quality on every model tried.
+    rk3588_config.default_patterns[(int)GGML_TYPE_BF16] = {"W8A8_STANDARD"};
     rk3588_config.default_patterns[(int)GGML_TYPE_Q6_K] = {"W8A8_STANDARD", "W4A4_HADAMARD"};
     rk3588_config.default_patterns[(int)GGML_TYPE_Q4_0] = {"W4A4_HADAMARD"};
 
