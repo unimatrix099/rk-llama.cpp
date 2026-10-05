@@ -522,44 +522,6 @@ static void test_dequant_rows_store_zva(void) {
     }
 }
 
-// Two K-segments in one pass: must equal a store pass over C0 followed by
-// an accumulate pass over C1, and leave everything outside its rows/columns.
-static void test_dequant2_rows(void) {
-    const int sub = 8, m_stride = 16;
-    for (int n_limit : {8, 13, 16, 64, 72, 256, 248}) {
-        const int outer = (n_limit + sub - 1) / sub;
-        std::vector<int16_t> C0((size_t)outer * m_stride * sub), C1(C0.size());
-        for (auto& v : C0) v = (int16_t)((int)(prng() % 65536) - 32768);
-        for (auto& v : C1) v = (int16_t)((int)(prng() % 65536) - 32768);
-        std::vector<float> chan0(outer * sub), chan1(outer * sub), common0(m_stride), common1(m_stride);
-        for (auto& v : chan0) v = frand() * 0.01f;
-        for (auto& v : chan1) v = frand() * 0.01f;
-        for (auto& v : common0) v = frand();
-        for (auto& v : common1) v = frand();
-        for (size_t stride : {(size_t)256 + 16, (size_t)261}) {   // aligned (ZVA fires) and not
-            float* buf = (float*)aligned_alloc(64, ((size_t)m_stride * stride * sizeof(float) + 63) / 64 * 64);
-            std::vector<float> ref((size_t)m_stride * stride);
-            for (int m0 = 0; m0 + 4 <= m_stride; m0 += 4) {
-                for (int nr : {4, 3}) {
-                    for (size_t q = 0; q < ref.size(); ++q) { ref[q] = 77.0f + (float)(q % 5); buf[q] = ref[q]; }
-                    float* rd = ref.data() + (size_t)m0 * stride;
-                    rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(rd, stride, C0.data(), m0, nr, m_stride, outer, sub,
-                                                                              n_limit, common0.data() + m0, chan0.data(), true);
-                    rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(rd, stride, C1.data(), m0, nr, m_stride, outer, sub,
-                                                                              n_limit, common1.data() + m0, chan1.data(), false);
-                    rknpu2_quantization::dequant2_int16_tiled_perchan_rows(buf + (size_t)m0 * stride, stride, C0.data(), C1.data(),
-                                                                           m0, nr, m_stride, outer, sub, n_limit,
-                                                                           common0.data() + m0, common1.data() + m0,
-                                                                           chan0.data(), chan1.data());
-                    CHECK(memcmp(ref.data(), buf, ref.size() * 4) == 0, "dequant2 n=%d stride=%zu m0=%d nr=%d",
-                          n_limit, stride, m0, nr);
-                }
-            }
-            free(buf);
-        }
-    }
-}
-
 int main(void) {
     test_quantize_int8();
     test_quantize_int4();
@@ -575,7 +537,6 @@ int main(void) {
     test_hadamard_blocked();
     test_prep_split();
     test_dequant_rows_store_zva();
-    test_dequant2_rows();
     test_dequant_tiled_rows();
     CHECK(rknpu2_calibration::next_power_of_two(0) == 1, "npot 0");
     CHECK(rknpu2_calibration::next_power_of_two(1) == 1, "npot 1");

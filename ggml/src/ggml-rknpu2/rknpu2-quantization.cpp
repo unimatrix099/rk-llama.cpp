@@ -252,56 +252,6 @@ void dequant_acc_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const 
     }
 }
 
-void dequant2_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const int16_t * src0, const int16_t * src1,
-                                       int32_t m0, int32_t nrows, int32_t m_stride, int32_t outer, int32_t sub,
-                                       int32_t n_limit, const float * common0, const float * common1,
-                                       const float * chan0, const float * chan1) {
-    for (int32_t t = 0; t < outer; ++t) {
-        const int32_t n0 = t * sub;
-        const int32_t lim = std::min(sub, n_limit - n0);
-        if (lim <= 0) {
-            break;
-        }
-        for (int32_t r = 0; r < nrows; ++r) {
-            const size_t cell_off = ((size_t)t * m_stride + m0 + r) * sub;
-            const int16_t * a = src0 + cell_off;
-            const int16_t * b = src1 + cell_off;
-            float * d = dst + (size_t)r * dst_stride + n0;
-            const float * cs0 = chan0 + n0;
-            const float * cs1 = chan1 + n0;
-            size_t i = 0;
-#if defined(__aarch64__)
-            // see dequant_acc_int16_tiled_perchan_rows (store path)
-            if (sub == 8 && (n0 & 15) == 0 && n0 + 16 <= n_limit && ((uintptr_t)d & 63) == 0) {
-                __asm__ volatile("dc zva, %0" : : "r"(d) : "memory");
-            }
-#endif
-#ifdef __ARM_NEON
-            const float32x4_t vc0 = vdupq_n_f32(common0[r]);
-            const float32x4_t vc1 = vdupq_n_f32(common1[r]);
-            for (; i + 8 <= (size_t)lim; i += 8) {
-                const int16x8_t a16 = vld1q_s16(a + i);
-                const int16x8_t b16 = vld1q_s16(b + i);
-                const float32x4_t fa0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(a16)));
-                const float32x4_t fa1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(a16)));
-                const float32x4_t fb0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(b16)));
-                const float32x4_t fb1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(b16)));
-                const float32x4_t sa0 = vmulq_f32(vld1q_f32(cs0 + i),     vc0);
-                const float32x4_t sa1 = vmulq_f32(vld1q_f32(cs0 + i + 4), vc0);
-                const float32x4_t sb0 = vmulq_f32(vld1q_f32(cs1 + i),     vc1);
-                const float32x4_t sb1 = vmulq_f32(vld1q_f32(cs1 + i + 4), vc1);
-                vst1q_f32(d + i,     vfmaq_f32(vmulq_f32(fa0, sa0), fb0, sb0));
-                vst1q_f32(d + i + 4, vfmaq_f32(vmulq_f32(fa1, sa1), fb1, sb1));
-            }
-#endif
-            for (; i < (size_t)lim; ++i) {
-                const float v = (float)a[i] * (cs0[i] * common0[r]);
-                d[i] = fmaf((float)b[i], cs1[i] * common1[r], v);
-            }
-        }
-    }
-}
-
 // --- Dequantization to FP32 ---
 
 void dequantize_int16_to_fp32(const int16_t * src, float * dst, size_t n_elements, float scale) {
