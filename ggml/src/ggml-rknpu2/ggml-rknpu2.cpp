@@ -22,6 +22,7 @@
 #include <cassert>
 #include <condition_variable>
 #include <cstring>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -507,7 +508,41 @@ static std::shared_ptr<rknn_tensor_mem> get_tensor_buffer(
     return mem_shared;
 }
 
+// RKNPU_PROFILE=1: wall-time split of the backend's per-node work, printed
+// every ~5 s to stderr as cumulative totals (take the slope across a steady
+// decode window and divide by the token rate). perf cannot attribute this:
+// the main thread is off-CPU while it waits in rknn_matmul_run.
+struct rknpu_profile {
+    bool on = std::getenv("RKNPU_PROFILE") != nullptr;
+    uint64_t graph_ns = 0, node_ns = 0, run_ns = 0, nodes = 0, graphs = 0;
+    std::chrono::steady_clock::time_point t_start = std::chrono::steady_clock::now(), t_print = t_start;
+    static uint64_t ns(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
+    }
+    void maybe_print() {
+        auto now = std::chrono::steady_clock::now();
+        if (ns(t_print, now) < 5000000000ull) return;
+        t_print = now;
+        fprintf(stderr, "RKNPU_PROFILE t=%.1fs graphs=%llu nodes=%llu graph=%.1fms node=%.1fms npu_run=%.1fms\n",
+                ns(t_start, now) / 1e9, (unsigned long long)graphs, (unsigned long long)nodes,
+                graph_ns / 1e6, node_ns / 1e6, run_ns / 1e6);
+    }
+};
+static rknpu_profile g_rknpu_profile;
+
+static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t backend, struct ggml_cgraph* cgraph);
+
 static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
+    if (!g_rknpu_profile.on) return ggml_backend_rknpu_graph_compute_impl(backend, cgraph);
+    auto t0 = std::chrono::steady_clock::now();
+    auto st = ggml_backend_rknpu_graph_compute_impl(backend, cgraph);
+    g_rknpu_profile.graph_ns += rknpu_profile::ns(t0, std::chrono::steady_clock::now());
+    g_rknpu_profile.graphs++;
+    g_rknpu_profile.maybe_print();
+    return st;
+}
+
+static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
     auto* backend_ctx = (ggml_backend_rknpu_context*)backend->context;
     const int n_omp = backend_ctx->n_threads > 0 ? backend_ctx->n_threads : omp_get_max_threads();
 
@@ -517,6 +552,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
     for (int node_i = 0; node_i < cgraph->n_nodes; node_i++) {
         struct ggml_tensor* node = cgraph->nodes[node_i];
         if (node->op != GGML_OP_MUL_MAT) continue;
+        const auto t_node = g_rknpu_profile.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (g_rknpu_profile.on) g_rknpu_profile.nodes++;
 
         const struct ggml_tensor* src0 = node->src[0]; // Weights      :  (K x N)
         const struct ggml_tensor* src1 = node->src[1]; // Activations  :  (M x K)
@@ -815,7 +852,9 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     // region here alternates team sizes with the M-row regions
                     // and libgomp respawns its workers on every node (see
                     // rknpu_dispatch_pool)
+                    const auto t_run = g_rknpu_profile.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     backend_ctx->dispatch_pool.run_all(matmul_ctxs);
+                    if (g_rknpu_profile.on) g_rknpu_profile.run_ns += rknpu_profile::ns(t_run, std::chrono::steady_clock::now());
                 }
 
                 // ===========================================
@@ -940,6 +979,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 }
             }
         }
+        if (g_rknpu_profile.on) g_rknpu_profile.node_ns += rknpu_profile::ns(t_node, std::chrono::steady_clock::now());
     }
 
     return GGML_STATUS_SUCCESS;
