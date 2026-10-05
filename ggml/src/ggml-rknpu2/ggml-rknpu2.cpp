@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -388,6 +389,43 @@ struct rknpu_matmul_context {
 
 using rknpu_dispatch_pool = rknpu_dispatch_pool_t<rknpu_matmul_context>;
 
+// FP16 matmul with runtime A, B and C (attention: B is the K or V cache, not a
+// weight), owning its own DMA buffers. B_layout NORM or TP_NORM: the driver
+// takes row-major data directly (checked to fp32 precision, decode research
+// #1e), so K rows feed Q*K^T as TP_NORM and V rows feed P*V as NORM.
+struct rknpu_attn_context {
+    rknn_matmul_info info;
+    rknn_matmul_io_attr io_attr;
+    rknn_matmul_ctx ctx = 0;
+    rknn_tensor_mem *A = nullptr, *B = nullptr, *C = nullptr;
+    rknpu_attn_context(int M, int K, int N, int b_layout, int core_id) {
+        memset(&info, 0, sizeof(info));
+        info.M = M; info.K = K; info.N = N;
+        info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
+        info.B_layout = (int16_t)b_layout;
+        info.AC_layout = RKNN_MM_LAYOUT_NORM;
+        if (rknn_matmul_create(&ctx, &info, &io_attr) < 0) { ctx = 0; return; }
+        rknn_matmul_set_core_mask(ctx, core_id == 0 ? RKNN_NPU_CORE_0 : core_id == 1 ? RKNN_NPU_CORE_1 : RKNN_NPU_CORE_2);
+        A = rknn_create_mem(ctx, io_attr.A.size);
+        B = rknn_create_mem(ctx, io_attr.B.size);
+        C = rknn_create_mem(ctx, io_attr.C.size);
+        if (!A || !B || !C) { release(); return; }
+        rknn_matmul_set_io_mem(ctx, A, &io_attr.A);
+        rknn_matmul_set_io_mem(ctx, B, &io_attr.B);
+        rknn_matmul_set_io_mem(ctx, C, &io_attr.C);
+    }
+    void release() {
+        if (ctx) {
+            if (A) rknn_destroy_mem(ctx, A);
+            if (B) rknn_destroy_mem(ctx, B);
+            if (C) rknn_destroy_mem(ctx, C);
+            rknn_matmul_destroy(ctx);
+        }
+        ctx = 0; A = B = C = nullptr;
+    }
+    ~rknpu_attn_context() { release(); }
+};
+
 // Runs one node's per-core segments on dedicated threads and returns at once,
 // so the caller's OpenMP team can do CPU work (the next chunk's A prep, the
 // previous chunk's dequant) while the NPU computes. The threads spend their
@@ -469,6 +507,17 @@ struct ggml_backend_rknpu_context {
     rknpu_dispatch_pool dispatch_pool;
     rknpu_async_runner async_runner;
 
+    // (M, K, N, B layout, core) -> attention matmul context
+    std::map<std::tuple<int, int, int, int, int>, std::unique_ptr<rknpu_attn_context>> attn_ctx_cache;
+    rknpu_attn_context* get_attn_ctx(int M, int K, int N, int b_layout, int core_id) {
+        auto key = std::make_tuple(M, K, N, b_layout, core_id);
+        auto it = attn_ctx_cache.find(key);
+        if (it != attn_ctx_cache.end()) return it->second.get();
+        auto c = std::make_unique<rknpu_attn_context>(M, K, N, b_layout, core_id);
+        if (c->ctx == 0) return nullptr;
+        return (attn_ctx_cache[key] = std::move(c)).get();
+    }
+
     // Team size for the per-row OpenMP regions, set by llama through
     // ggml_backend_set_n_threads; 0 means libgomp's default. Matching
     // ggml-cpu's team matters whenever M > 1 at decode time (speculative
@@ -529,8 +578,26 @@ static void ggml_backend_rknpu_free(ggml_backend_t backend) {
 static const rknpu2_configuration::Rknpu2HardwarePipeline * resolve_packable_pipeline(const struct ggml_tensor * tensor);
 
 // Function for acquiring a pointer for tensor data
+// Packed NPU copies exist only for weights. Compute buffers (marked COMPUTE
+// by ggml-alloc at allocation) hold plain tensors whatever their dtype, and
+// reuse offsets between tensors, so no packed allocation may be created or
+// looked up for them: an offset-keyed lookup would hit another tensor's
+// allocation. Weight buffers are still ANY during init_tensor (llama marks
+// them WEIGHTS after allocation), hence "not COMPUTE" rather than "WEIGHTS".
+static bool rknpu_buffer_may_pack(ggml_backend_buffer_t buffer) {
+    return buffer && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+           strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(buffer)), "RKNPU") == 0;
+}
+
 static void* get_tensor_real_ptr(const struct ggml_tensor* tensor) {
     if (!tensor || !tensor->data) return nullptr;
+
+    // Packed copies exist only for weights in this backend's own buffers;
+    // compute tensors (incl. F16 KV slices for NPU attention) are plain host
+    // memory whatever their dtype
+    if (!rknpu_buffer_may_pack(tensor->buffer)) {
+        return tensor->data;
+    }
 
     const auto* pipeline = resolve_packable_pipeline(tensor);
 
@@ -601,6 +668,147 @@ struct rknpu_profile {
 };
 static rknpu_profile g_rknpu_profile;
 
+// ===========================================
+// ===== Flash attention on the NPU (prefill) =====
+// ===========================================
+// Per KV head g, the rows of its rk2 query heads are stacked into one matmul:
+//   S = Q_g K_g^T   on the NPU (FP16 in, FP32 out; K rows as TP_NORM B)
+//   P = softmax(softcap(S * scale) + mask)   on the CPU team
+//   O = P V_g       on the NPU (V rows as NORM B)
+// Semantics follow ggml_compute_forward_flash_attn_ext_tiled; P is
+// normalized before the second matmul instead of after (same math, FP16 P).
+// Only the cases supports_op accepts reach here (see rknpu_fa_supported).
+static void rknpu_fp32_to_fp16(const float* src, uint16_t* dst, int64_t n) {
+    int64_t i = 0;
+#ifdef __ARM_NEON
+    for (; i + 8 <= n; i += 8) {
+        float16x8_t h = vcombine_f16(vcvt_f16_f32(vld1q_f32(src + i)), vcvt_f16_f32(vld1q_f32(src + i + 4)));
+        vst1q_u16(dst + i, vreinterpretq_u16_f16(h));
+    }
+#endif
+    for (; i < n; ++i) dst[i] = ggml_fp32_to_fp16(src[i]);
+}
+
+static bool rknpu_fa_supported(const struct ggml_tensor* op) {
+    const struct ggml_tensor *q = op->src[0], *k = op->src[1], *v = op->src[2], *mask = op->src[3], *sinks = op->src[4];
+    if (!q || !k || !v || sinks) return false;
+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || op->type != GGML_TYPE_F32) return false;
+    if (mask && mask->type != GGML_TYPE_F16) return false;
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float*)op->op_params + 1, sizeof(float));
+    if (max_bias != 0.0f) return false;
+    // ne[3] = sequences (llama-perplexity and llama-server batch several);
+    // K/V and the mask may broadcast over it
+    if (q->ne[3] % k->ne[3] != 0 || q->ne[3] % v->ne[3] != 0) return false;
+    if (mask && q->ne[3] % mask->ne[3] != 0) return false;
+    const int64_t DK = k->ne[0], DV = v->ne[0], n_q = q->ne[1], n_kv = k->ne[1];
+    if (n_q < 32) return false;                       // prefill only; decode stays on the CPU kernel
+    if (DK % 32 != 0 || DV % 16 != 0 || n_kv % 32 != 0) return false;
+    if (q->ne[2] % k->ne[2] != 0 || k->ne[2] != v->ne[2]) return false;
+    if (k->nb[0] != 2 || v->nb[0] != 2 || q->nb[0] != 4 || op->nb[0] != 4) return false;
+    return true;
+}
+
+static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tensor* dst, int n_omp) {
+    const struct ggml_tensor *q = dst->src[0], *k = dst->src[1], *v = dst->src[2], *mask = dst->src[3];
+    const int64_t DK = k->ne[0], DV = v->ne[0];
+    const int64_t n_q = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1], n_kvh = k->ne[2];
+    const int64_t rk2 = n_head / n_kvh;
+    const int64_t M = rk2 * n_q;
+    const int64_t n_seq = q->ne[3];
+
+    float scale = 1.0f, softcap = 0.0f;
+    memcpy(&scale,   (const float*)dst->op_params + 0, sizeof(float));
+    memcpy(&softcap, (const float*)dst->op_params + 2, sizeof(float));
+    if (softcap != 0.0f) scale /= softcap;
+
+    const char* q_base = (const char*)get_tensor_real_ptr(q);
+    const char* k_base = (const char*)get_tensor_real_ptr(k);
+    const char* v_base = (const char*)get_tensor_real_ptr(v);
+    const char* m_base = mask ? (const char*)get_tensor_real_ptr(mask) : nullptr;
+    char* d_base = (char*)get_tensor_real_ptr(dst);
+
+    for (int64_t i3 = 0; i3 < n_seq; ++i3) {
+    const int64_t ik3 = i3 / (n_seq / k->ne[3]);
+    const int64_t iv3 = i3 / (n_seq / v->ne[3]);
+    const char* m_seq = mask ? m_base + (i3 % mask->ne[3]) * mask->nb[3] : nullptr;
+    for (int64_t g = 0; g < n_kvh; ++g) {
+        const int core = (int)(g % 3);
+        rknpu_attn_context* qk = bctx->get_attn_ctx((int)M, (int)DK, (int)n_kv, RKNN_MM_LAYOUT_TP_NORM, core);
+        rknpu_attn_context* pv = bctx->get_attn_ctx((int)M, (int)n_kv, (int)DV, RKNN_MM_LAYOUT_NORM, core);
+        GGML_ASSERT(qk && pv && "RKNPU2: attention matmul context creation failed");
+
+        // A = Q rows of the rk2 heads of this group, FP16, row r = hh*n_q + i
+        uint16_t* a = (uint16_t*)qk->A->virt_addr;
+        #pragma omp parallel for num_threads(n_omp)
+        for (int64_t r = 0; r < M; ++r) {
+            const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
+            rknpu_fp32_to_fp16((const float*)(q_base + i * q->nb[1] + h * q->nb[2] + i3 * q->nb[3]), a + r * DK, DK);
+        }
+        // B = K rows (n_kv x DK, TP_NORM) and V rows (n_kv x DV, NORM)
+        uint16_t* bk = (uint16_t*)qk->B->virt_addr;
+        uint16_t* bv = (uint16_t*)pv->B->virt_addr;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            memcpy(bk + j * DK, k_base + j * k->nb[1] + g * k->nb[2] + ik3 * k->nb[3], DK * 2);
+            memcpy(bv + j * DV, v_base + j * v->nb[1] + g * v->nb[2] + iv3 * v->nb[3], DV * 2);
+        }
+        rknn_mem_sync(qk->ctx, qk->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+        rknn_mem_sync(qk->ctx, qk->B, RKNN_MEMORY_SYNC_TO_DEVICE);
+        rknn_mem_sync(pv->ctx, pv->B, RKNN_MEMORY_SYNC_TO_DEVICE);
+        // Re-bind B after writing it: for a non-native B the driver converts
+        // it to its internal layout at set_io_mem time, so data written into
+        // an already-bound buffer is never seen (P*V came back all zeros)
+        RKNN_CHECK(rknn_matmul_set_io_mem(qk->ctx, qk->B, &qk->io_attr.B), "set_io_mem attn K");
+        RKNN_CHECK(rknn_matmul_set_io_mem(pv->ctx, pv->B, &pv->io_attr.B), "set_io_mem attn V");
+        rknn_matmul_run(qk->ctx);
+        rknn_mem_sync(qk->ctx, qk->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+
+        // softmax rows into P (FP16) = A of the second matmul
+        const float* S = (const float*)qk->C->virt_addr;
+        uint16_t* P = (uint16_t*)pv->A->virt_addr;
+        #pragma omp parallel for num_threads(n_omp)
+        for (int64_t r = 0; r < M; ++r) {
+            const int64_t i = r % n_q;
+            static thread_local std::vector<float> row;
+            if ((int64_t)row.size() < n_kv) row.resize(n_kv);
+            const float* s_row = S + r * n_kv;
+            const ggml_fp16_t* mrow = mask ? (const ggml_fp16_t*)(m_seq + i * mask->nb[1]) : nullptr;
+            float mx = -INFINITY;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                float x = s_row[j] * scale;
+                if (softcap != 0.0f) x = softcap * tanhf(x);
+                if (mrow) x += ggml_fp16_to_fp32(mrow[j]);
+                row[j] = x;
+                mx = std::max(mx, x);
+            }
+            float sum = 0.0f;
+            if (mx != -INFINITY) {
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    const float e = row[j] == -INFINITY ? 0.0f : expf(row[j] - mx);
+                    row[j] = e;
+                    sum += e;
+                }
+            }
+            const float inv = sum == 0.0f ? 0.0f : 1.0f / sum;
+            for (int64_t j = 0; j < n_kv; ++j) row[j] = (mx == -INFINITY) ? 0.0f : row[j] * inv;
+            rknpu_fp32_to_fp16(row.data(), P + r * n_kv, n_kv);
+        }
+        rknn_mem_sync(pv->ctx, pv->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+        rknn_matmul_run(pv->ctx);
+        rknn_mem_sync(pv->ctx, pv->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+
+        // O rows -> dst (permuted: row (i*n_head + h))
+        const float* O = (const float*)pv->C->virt_addr;
+        #pragma omp parallel for num_threads(n_omp)
+        for (int64_t r = 0; r < M; ++r) {
+            const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
+            // permute(0, 2, 1, 3): row (i3*n_q*n_head + i*n_head + h)
+            memcpy(d_base + (i3 * n_q * n_head + i * n_head + h) * dst->nb[1], O + r * DV, DV * sizeof(float));
+        }
+    }
+    }
+}
+
 static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t backend, struct ggml_cgraph* cgraph);
 
 static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
@@ -622,6 +830,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
 
     for (int node_i = 0; node_i < cgraph->n_nodes; node_i++) {
         struct ggml_tensor* node = cgraph->nodes[node_i];
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            rknpu_flash_attn(backend_ctx, node, n_omp);
+            continue;
+        }
         if (node->op != GGML_OP_MUL_MAT) continue;
         const auto t_node = g_rknpu_profile.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (g_rknpu_profile.on) g_rknpu_profile.nodes++;
@@ -1406,7 +1618,7 @@ static void * ggml_backend_rknpu_buffer_get_base(ggml_backend_buffer_t buffer) {
 static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
     auto * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
 
-    const auto* pipeline = resolve_packable_pipeline(tensor);
+    const auto* pipeline = rknpu_buffer_may_pack(buffer) ? resolve_packable_pipeline(tensor) : nullptr;
 
     // Initialize tensor only if it is supported by the pipeline
     if (pipeline) {
@@ -1607,7 +1819,10 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     auto * ctx = (ggml_backend_rknpu_buffer_context *) buffer->context;
 
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
-    const auto* pipeline = resolve_packable_pipeline(tensor);
+    // Only weights are packed: a compute buffer also receives F16/F32 copies
+    // (the KV-cache slices consumed by NPU flash attention), which must stay
+    // in their own layout even when their dtype has an NPU pipeline.
+    const auto* pipeline = rknpu_buffer_may_pack(buffer) ? resolve_packable_pipeline(tensor) : nullptr;
 
     size_t tensor_offset_in_virtual = (uintptr_t)tensor->data - (uintptr_t)ctx->virtual_base;
 
@@ -1789,6 +2004,11 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
         return;
     }
 
+    if (!rknpu_buffer_may_pack(buffer)) {
+        memcpy(data, (uint8_t*)tensor->data + offset, size);
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(ctx->mutex);
     auto it = ctx->tensor_allocs.find(tensor_offset_in_virtual);
     if (it != ctx->tensor_allocs.end()) {
@@ -1865,14 +2085,12 @@ static size_t ggml_backend_rknpu_buffer_type_get_alignment(ggml_backend_buffer_t
 
 static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
     UNUSED(buft);
-    size_t size = get_tensor_packed_size(tensor);
-
-    // Dual residency needs room for the original bytes in the host region
-    // (the packed size can be smaller, e.g. INT4 packing of a Q4_0 tensor)
-    if (rknpu_cpu_decode_threshold() > 0) {
-        size = std::max(size, ggml_nbytes(tensor));
-    }
-    return size;
+    // Never less than the tensor's own bytes: this hook cannot tell a weight
+    // from a compute tensor, and a compute tensor is stored unpacked. For
+    // weights the extra is only host-region address space (the packed data
+    // lives in its own DMA allocation); with dual residency the host region
+    // holds the original bytes anyway.
+    return std::max(get_tensor_packed_size(tensor), ggml_nbytes(tensor));
 }
 
 static bool ggml_backend_rknpu_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
@@ -1932,6 +2150,14 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
     switch (op->op) {
         case GGML_OP_NONE:
             return true;
+
+        case GGML_OP_FLASH_ATTN_EXT: {
+            static const bool fa_enabled = []() {
+                const char* env = std::getenv("RKNPU_FLASH_ATTN");
+                return env == nullptr || std::atoi(env) != 0;
+            }();
+            return fa_enabled && rknpu_fa_supported(op);
+        }
 
         case GGML_OP_MUL_MAT: {
             const struct ggml_tensor * src0 = op->src[0]; // Weights
