@@ -283,6 +283,43 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
     *s = sumf;
 }
 
+#if defined(__ARM_NEON)
+void ggml_vec_dot_bf16_x4(int n, float * GGML_RESTRICT s, const ggml_bf16_t * GGML_RESTRICT x, size_t bx, const ggml_bf16_t * GGML_RESTRICT y) {
+    const ggml_bf16_t * xr[4] = {
+        x, (const ggml_bf16_t *)((const char *)x + bx),
+        (const ggml_bf16_t *)((const char *)x + 2*bx), (const ggml_bf16_t *)((const char *)x + 3*bx) };
+    ggml_float sum[4] = {0, 0, 0, 0};
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const uint16x8_t yv = vld1q_u16((const uint16_t *)(y + i));
+        const float32x4_t y_lo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(yv), 16));
+        const float32x4_t y_hi = vreinterpretq_f32_u32(vshll_high_n_u16(yv, 16));
+        for (int r = 0; r < 4; ++r) {
+            const uint16x8_t xv = vld1q_u16((const uint16_t *)(xr[r] + i));
+            const float32x4_t p_lo = vmulq_f32(vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(xv), 16)), y_lo);
+            const float32x4_t p_hi = vmulq_f32(vreinterpretq_f32_u32(vshll_high_n_u16(xv, 16)), y_hi);
+            const float64x2_t d0 = vcvt_f64_f32(vget_low_f32(p_lo));
+            const float64x2_t d1 = vcvt_high_f64_f32(p_lo);
+            const float64x2_t d2 = vcvt_f64_f32(vget_low_f32(p_hi));
+            const float64x2_t d3 = vcvt_high_f64_f32(p_hi);
+            ggml_float acc = sum[r];
+            acc += vgetq_lane_f64(d0, 0); acc += vgetq_lane_f64(d0, 1);
+            acc += vgetq_lane_f64(d1, 0); acc += vgetq_lane_f64(d1, 1);
+            acc += vgetq_lane_f64(d2, 0); acc += vgetq_lane_f64(d2, 1);
+            acc += vgetq_lane_f64(d3, 0); acc += vgetq_lane_f64(d3, 1);
+            sum[r] = acc;
+        }
+    }
+    for (int r = 0; r < 4; ++r) {
+        ggml_float acc = sum[r];
+        for (int j = i; j < n; ++j) {
+            acc += (ggml_float)(GGML_BF16_TO_FP32(xr[r][j]) * GGML_BF16_TO_FP32(y[j]));
+        }
+        s[r] = acc;
+    }
+}
+#endif
+
 void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc) {
     assert(nrc == 1);
     GGML_UNUSED(nrc);
