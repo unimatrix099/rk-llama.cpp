@@ -217,22 +217,6 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         } else {
             Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
         }
-        // K/V projections are created here, right after Q, and the three are
-        // expanded into the graph back to back: otherwise the depth-first
-        // expansion emits Q's norm and rope between them, and a backend that
-        // runs the projections but not those ops gets three graph splits
-        // instead of one. Same operations, only their order in the graph.
-        ggml_tensor * Kmm = nullptr;
-        ggml_tensor * Vmm = nullptr;
-        if (!qkv_fused && hparams.has_kv(il)) {
-            Kmm = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
-            Vmm = model.layers[il].wv ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s) : Kmm;
-            ggml_build_forward_expand(gf, Qcur);
-            ggml_build_forward_expand(gf, Kmm);
-            if (Vmm != Kmm) {
-                ggml_build_forward_expand(gf, Vmm);
-            }
-        }
         {
             cb(Qcur, "Qcur", il);
 
@@ -258,8 +242,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                 Kcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, k_dim, n_tokens, qkv_fused->nb[1], q_dim * esize));
                 Vcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv_fused, v_dim, n_tokens, qkv_fused->nb[1], (q_dim + k_dim) * esize));
             } else {
-                Kcur = Kmm;
-                Vcur = Vmm; // Kcur itself if v_proj is not present
+                Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+                Vcur = model.layers[il].wv
+                       ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s)
+                       : Kcur; // if v_proj is not present, use Kcur as Vcur
             }
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
