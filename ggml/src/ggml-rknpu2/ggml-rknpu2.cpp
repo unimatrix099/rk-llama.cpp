@@ -827,77 +827,59 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
     const int64_t ik3 = i3 / (n_seq / k->ne[3]);
     const int64_t iv3 = i3 / (n_seq / v->ne[3]);
     const char* m_seq = mask ? m_base + (i3 % mask->ne[3]) * mask->nb[3] : nullptr;
-    // Stages per KV head g, software-pipelined across heads: the NPU's
-    // Q*K^T for head g+1 runs on a helper thread while the CPU team does
-    // head g's softmax. The heads' NPU runs stay sequential (the helper is
-    // joined before P*V): running them concurrently measured slower.
-    std::vector<rknpu_attn_context*> qk(n_kvh), pv(n_kvh);
     for (int64_t g = 0; g < n_kvh; ++g) {
         const int core = (int)(g % 3);
-        qk[g] = bctx->get_attn_ctx((int)M, (int)DK, (int)n_kv, RKNN_MM_LAYOUT_TP_NORM, core);
-        pv[g] = bctx->get_attn_ctx((int)M, (int)n_kv, (int)DV, RKNN_MM_LAYOUT_NORM, core);
-        GGML_ASSERT(qk[g] && pv[g] && "RKNPU2: attention matmul context creation failed");
-    }
-    auto prep = [&](int64_t g) {
+        rknpu_attn_context* qk = bctx->get_attn_ctx((int)M, (int)DK, (int)n_kv, RKNN_MM_LAYOUT_TP_NORM, core);
+        rknpu_attn_context* pv = bctx->get_attn_ctx((int)M, (int)n_kv, (int)DV, RKNN_MM_LAYOUT_NORM, core);
+        GGML_ASSERT(qk && pv && "RKNPU2: attention matmul context creation failed");
+
         // A = Q rows of the rk2 heads of this group, FP16, row r = hh*n_q + i
-        uint16_t* a = (uint16_t*)qk[g]->A->virt_addr;
+        uint16_t* a = (uint16_t*)qk->A->virt_addr;
         #pragma omp parallel for num_threads(n_omp)
         for (int64_t r = 0; r < M; ++r) {
             const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
             rknpu_fp32_to_fp16((const float*)(q_base + i * q->nb[1] + h * q->nb[2] + i3 * q->nb[3]), a + r * DK, DK);
         }
         // B = K rows (n_kv x DK, TP_NORM) and V rows (n_kv x DV, NORM)
-        uint16_t* bk = (uint16_t*)qk[g]->B->virt_addr;
-        uint16_t* bv = (uint16_t*)pv[g]->B->virt_addr;
+        uint16_t* bk = (uint16_t*)qk->B->virt_addr;
+        uint16_t* bv = (uint16_t*)pv->B->virt_addr;
         for (int64_t j = 0; j < n_kv; ++j) {
             memcpy(bk + j * DK, k_base + j * k->nb[1] + g * k->nb[2] + ik3 * k->nb[3], DK * 2);
             memcpy(bv + j * DV, v_base + j * v->nb[1] + g * v->nb[2] + iv3 * v->nb[3], DV * 2);
         }
-        rknn_mem_sync(qk[g]->ctx, qk[g]->A, RKNN_MEMORY_SYNC_TO_DEVICE);
-        rknn_mem_sync(qk[g]->ctx, qk[g]->B, RKNN_MEMORY_SYNC_TO_DEVICE);
-        rknn_mem_sync(pv[g]->ctx, pv[g]->B, RKNN_MEMORY_SYNC_TO_DEVICE);
+        rknn_mem_sync(qk->ctx, qk->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+        rknn_mem_sync(qk->ctx, qk->B, RKNN_MEMORY_SYNC_TO_DEVICE);
+        rknn_mem_sync(pv->ctx, pv->B, RKNN_MEMORY_SYNC_TO_DEVICE);
         // Re-bind B after writing it: for a non-native B the driver converts
         // it to its internal layout at set_io_mem time, so data written into
         // an already-bound buffer is never seen (P*V came back all zeros)
-        RKNN_CHECK(rknn_matmul_set_io_mem(qk[g]->ctx, qk[g]->B, &qk[g]->io_attr.B), "set_io_mem attn K");
-        RKNN_CHECK(rknn_matmul_set_io_mem(pv[g]->ctx, pv[g]->B, &pv[g]->io_attr.B), "set_io_mem attn V");
-    };
-    auto run_qk = [&](int64_t g) {
-        rknn_matmul_run(qk[g]->ctx);
-        rknn_mem_sync(qk[g]->ctx, qk[g]->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
-    };
-
-    prep(0);
-    run_qk(0);
-    for (int64_t g = 0; g < n_kvh; ++g) {
-        std::thread next_qk;
-        if (g + 1 < n_kvh) {
-            prep(g + 1);
-            next_qk = std::thread(run_qk, g + 1);   // overlaps this head's softmax
-        }
+        RKNN_CHECK(rknn_matmul_set_io_mem(qk->ctx, qk->B, &qk->io_attr.B), "set_io_mem attn K");
+        RKNN_CHECK(rknn_matmul_set_io_mem(pv->ctx, pv->B, &pv->io_attr.B), "set_io_mem attn V");
+        rknn_matmul_run(qk->ctx);
+        rknn_mem_sync(qk->ctx, qk->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
 
         // softmax rows into P (FP16) = A of the second matmul
-        const float* S = (const float*)qk[g]->C->virt_addr;
-        uint16_t* P = (uint16_t*)pv[g]->A->virt_addr;
+        const float* S = (const float*)qk->C->virt_addr;
+        uint16_t* P = (uint16_t*)pv->A->virt_addr;
         #pragma omp parallel for num_threads(n_omp)
         for (int64_t r = 0; r < M; ++r) {
             const int64_t i = r % n_q;
             static thread_local std::vector<float> row;
             if ((int64_t)row.size() < n_kv) row.resize(n_kv);
+            const float* s_row = S + r * n_kv;
             const ggml_fp16_t* mrow = mask ? (const ggml_fp16_t*)(m_seq + i * mask->nb[1]) : nullptr;
-            rknpu_softmax_row(S + r * n_kv, mrow, n_kv, scale, softcap, row.data(), P + r * n_kv);
+            rknpu_softmax_row(s_row, mrow, n_kv, scale, softcap, row.data(), P + r * n_kv);
         }
-        if (next_qk.joinable()) next_qk.join();
+        rknn_mem_sync(pv->ctx, pv->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+        rknn_matmul_run(pv->ctx);
+        rknn_mem_sync(pv->ctx, pv->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
 
-        rknn_mem_sync(pv[g]->ctx, pv[g]->A, RKNN_MEMORY_SYNC_TO_DEVICE);
-        rknn_matmul_run(pv[g]->ctx);
-        rknn_mem_sync(pv[g]->ctx, pv[g]->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
-
-        // O rows -> dst; permute(0, 2, 1, 3): row (i3*n_q*n_head + i*n_head + h)
-        const float* O = (const float*)pv[g]->C->virt_addr;
+        // O rows -> dst (permuted: row (i*n_head + h))
+        const float* O = (const float*)pv->C->virt_addr;
         #pragma omp parallel for num_threads(n_omp)
         for (int64_t r = 0; r < M; ++r) {
             const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
+            // permute(0, 2, 1, 3): row (i3*n_q*n_head + i*n_head + h)
             memcpy(d_base + (i3 * n_q * n_head + i * n_head + h) * dst->nb[1], O + r * DV, DV * sizeof(float));
         }
     }
