@@ -761,6 +761,31 @@ and that copy is about 1%.
 
 **Steps 1-3 together: ~+5% pp512** (about 277 → 288).
 
+**Step 4 (block-causal attention schedule): stopped at the go/no-go probe.**
+Per pp512 (~1.78 s), the attention section takes ~680 ms (38%):
+
+| Part | Time | Exposed NPU time |
+|---|---|---|
+| Q/K/V projections (with fused norm, RoPE, cache write) | ~290 ms | ~0 |
+| NPU flash attention (fill 43, softmax 116, output 44, QK wait 22, PV wait 32) | ~261 ms | ~53 ms |
+| output projections | ~130 ms | ~0 |
+
+The section is CPU-bound with the NPU mostly idle, so overlap can only hide
+the ~55 ms of exposed NPU time: a ceiling of ~2-3%, not the 5-10% guessed
+before measuring. A full block-causal scheduler (contexts per chunk shape,
+the cache read across chunks, the open core-dependence of NPU attention)
+is not worth that.
+
+Open options, cheapest first:
+1. **A small cross-node overlap** for the measured waits: attention's first
+   QK starts once K is in the cache (during V's projection), and the output
+   projection's prep overlaps the last PV. Most of the ~2-3%.
+2. **Cheaper softmax** (e.g. FP16 exponentials). A numerics change, so it
+   needs the tolerant gate; up to ~3%.
+3. **W8A8 for the attention projections:** no Hadamard prep on the CPU, at
+   twice the NPU work on an idle NPU. Needs per-name pipeline routing and a
+   pipelined INT8 path; unmeasured, maybe ~5%.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
