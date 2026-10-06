@@ -1342,10 +1342,6 @@ static void __attribute__((noinline)) rknpu_gate_up_geglu_tiles(
         return vmulq_f32(gel, g);
     };
     const int outer = n_limit / 8;
-    static const bool gelu_f16 = []() {
-        const char* env = std::getenv("RKNPU_GELU_F16");
-        return env == nullptr || std::atoi(env) != 0;
-    }();
     // prefetch both C streams pf tiles ahead: each tile is one line of this
     // row block, a page-sized stride apart, which the hardware prefetcher
     // does not follow (RKNPU_TILE_PF, 0 = off)
@@ -1371,36 +1367,6 @@ static void __attribute__((noinline)) rknpu_gate_up_geglu_tiles(
             const float32x4_t u0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(u16))),  vmulq_f32(su0, vcu));
             const float32x4_t u1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(u16))), vmulq_f32(su1, vcu));
             float* yr = y + (size_t)r * ys + n0;
-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-            if (gelu_f16) {
-                // tanh-GELU in FP16 (8 lanes): its ~1e-3 error is far below
-                // the INT4 step the result is quantized to; the product
-                // with up and the +-10 cut-offs stay in FP32
-                const float16x8_t xh = vcombine_f16(vcvt_f16_f32(x0), vcvt_f16_f32(x1));
-                const float16x8_t zh = vmulq_f16(vmulq_f16(vdupq_n_f16((__fp16)0.7978845608f), xh),
-                                                 vfmaq_f16(vdupq_n_f16((__fp16)1.0f), vmulq_f16(vdupq_n_f16((__fp16)0.044715f), xh), xh));
-                // e^{2z} = 2^t, t = 2z*log2(e), clamped where tanh is saturated in FP16
-                float16x8_t t = vmulq_f16(zh, vdupq_n_f16((__fp16)2.8853900818f));
-                t = vminq_f16(vmaxq_f16(t, vdupq_n_f16((__fp16)-14.0f)), vdupq_n_f16((__fp16)14.0f));
-                const float16x8_t nh = vrndnq_f16(t);
-                const float16x8_t fh = vsubq_f16(t, nh);
-                float16x8_t p = vfmaq_f16(vdupq_n_f16((__fp16)0.2402265070f), fh, vdupq_n_f16((__fp16)0.0555041087f));
-                p = vfmaq_f16(vdupq_n_f16((__fp16)0.6931471806f), fh, p);
-                p = vfmaq_f16(vdupq_n_f16((__fp16)1.0f), fh, p);
-                const int16x8_t eb = vshlq_n_s16(vaddq_s16(vcvtq_s16_f16(nh), vdupq_n_s16(15)), 10);
-                const float16x8_t e = vmulq_f16(p, vreinterpretq_f16_s16(eb));
-                const float16x8_t th = vsubq_f16(vdupq_n_f16((__fp16)1.0f), vdivq_f16(vdupq_n_f16((__fp16)2.0f), vaddq_f16(e, vdupq_n_f16((__fp16)1.0f))));
-                const float16x8_t gh = vmulq_f16(vmulq_f16(vdupq_n_f16((__fp16)0.5f), xh), vaddq_f16(vdupq_n_f16((__fp16)1.0f), th));
-                float32x4_t g0 = vcvt_f32_f16(vget_low_f16(gh)), g1 = vcvt_f32_f16(vget_high_f16(gh));
-                g0 = vbslq_f32(vcleq_f32(x0, vdupq_n_f32(-10.0f)), vdupq_n_f32(0.0f), g0);
-                g0 = vbslq_f32(vcgeq_f32(x0, vdupq_n_f32(10.0f)), x0, g0);
-                g1 = vbslq_f32(vcleq_f32(x1, vdupq_n_f32(-10.0f)), vdupq_n_f32(0.0f), g1);
-                g1 = vbslq_f32(vcgeq_f32(x1, vdupq_n_f32(10.0f)), x1, g1);
-                vst1q_f32(yr,     vmulq_f32(g0, u0));
-                vst1q_f32(yr + 4, vmulq_f32(g1, u1));
-                continue;
-            }
-#endif
             vst1q_f32(yr,     gelu_mul(x0, u0));
             vst1q_f32(yr + 4, gelu_mul(x1, u1));
         }
