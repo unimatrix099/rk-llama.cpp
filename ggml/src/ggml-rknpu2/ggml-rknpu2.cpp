@@ -23,6 +23,8 @@
 #include <condition_variable>
 #include <cstring>
 #include <chrono>
+#include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -554,6 +556,48 @@ struct rknpu_w4a4_job {
     int started = -1;                                                   // last chunk started
 };
 
+// A few persistent workers for blocking NPU calls that should overlap CPU
+// work (attention runs of different KV-head groups, each on its own core)
+struct rknpu_fn_pool {
+    struct ticket { bool done = false; };
+    void submit(ticket& t, std::function<void()> fn) {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (threads.size() < 2) threads.emplace_back([this] { worker(); });
+        t.done = false;
+        queue.push_back({&t, std::move(fn)});
+        cv.notify_one();
+    }
+    void wait(ticket& t) {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv_done.wait(lock, [&] { return t.done; });
+    }
+    ~rknpu_fn_pool() {
+        { std::lock_guard<std::mutex> lock(mutex); quit = true; cv.notify_all(); }
+        for (auto& th : threads) th.join();
+    }
+  private:
+    void worker() {
+        for (;;) {
+            std::pair<ticket*, std::function<void()>> job;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [&] { return quit || !queue.empty(); });
+                if (quit) return;
+                job = std::move(queue.front());
+                queue.pop_front();
+            }
+            job.second();
+            { std::lock_guard<std::mutex> lock(mutex); job.first->done = true; }
+            cv_done.notify_all();
+        }
+    }
+    std::vector<std::thread> threads;
+    std::deque<std::pair<ticket*, std::function<void()>>> queue;
+    std::mutex mutex;
+    std::condition_variable cv, cv_done;
+    bool quit = false;
+};
+
 // Backend main context
 struct ggml_backend_rknpu_context {
     std::string name;
@@ -573,6 +617,7 @@ struct ggml_backend_rknpu_context {
     rknpu_async_runner async_runner;
     rknpu_deferred_gate deferred_gate;
     rknpu_w4a4_job down_job;
+    rknpu_fn_pool fa_pool;
     // whole-FFN schedule (rknpu_ffn_block): gate, up and down jobs, and
     // gate's and up's chunk contexts as one runner batch
     rknpu_w4a4_job ffn_gate, ffn_up, ffn_down;
@@ -1398,15 +1443,17 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
     const char* m_base = mask ? (const char*)get_tensor_real_ptr(mask) : nullptr;
     char* d_base = (char*)get_tensor_real_ptr(dst);
 
-    for (int64_t i3 = 0; i3 < n_seq; ++i3) {
-    const int64_t ik3 = i3 / (n_seq / k->ne[3]);
-    const int64_t iv3 = i3 / (n_seq / v->ne[3]);
-    const char* m_seq = mask ? m_base + (i3 % mask->ne[3]) * mask->nb[3] : nullptr;
-    for (int64_t g = 0; g < n_kvh; ++g) {
-        const int core = (int)(g % 3);
+    // Stage st of the attention of group g of sequence i3: 0 = fill A (Q) and
+    // B (K, V), 1 = Q*K^T run, 2 = softmax into P, 3 = P*V run, 4 = output.
+    // Groups run on their own NPU core and contexts.
+    auto stage = [&](int64_t i3, int64_t g, int st, int core) {
+        const int64_t ik3 = i3 / (n_seq / k->ne[3]);
+        const int64_t iv3 = i3 / (n_seq / v->ne[3]);
+        const char* m_seq = mask ? m_base + (i3 % mask->ne[3]) * mask->nb[3] : nullptr;
         rknpu_attn_context* qk = bctx->get_attn_ctx((int)M, (int)DK, (int)n_kv, RKNN_MM_LAYOUT_TP_NORM, core);
         rknpu_attn_context* pv = bctx->get_attn_ctx((int)M, (int)n_kv, (int)DV, RKNN_MM_LAYOUT_NORM, core);
         GGML_ASSERT(qk && pv && "RKNPU2: attention matmul context creation failed");
+        (void)ik3; (void)iv3; (void)m_seq;
 
         // A = Q rows of the rk2 heads of this group, FP16, row r = hh*n_q + i
         uint16_t* a = (uint16_t*)qk->A->virt_addr;
@@ -1416,98 +1463,139 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
             const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
             return (const float*)(q_base + i * q->nb[1] + h * q->nb[2] + i3 * q->nb[3]);
         };
-        if (native) {
-            #pragma omp parallel for num_threads(n_omp)
-            for (int64_t r0 = 0; r0 < M; r0 += FR) {
-                static thread_local std::vector<uint16_t> buf;
-                if ((int64_t)buf.size() < FR * DK) buf.resize(FR * DK);
-                uint8_t* rows[512];
-                for (int k = 0; k < FR; ++k) {
-                    rknpu_fp32_to_fp16(q_row(r0 + k), buf.data() + k * DK, DK);
-                    rows[k] = (uint8_t*)(buf.data() + k * DK);
+        if (st == 0) {
+            if (native) {
+                #pragma omp parallel for num_threads(n_omp)
+                for (int64_t r0 = 0; r0 < M; r0 += FR) {
+                    static thread_local std::vector<uint16_t> buf;
+                    if ((int64_t)buf.size() < FR * DK) buf.resize(FR * DK);
+                    uint8_t* rows[512];
+                    for (int k = 0; k < FR; ++k) {
+                        rknpu_fp32_to_fp16(q_row(r0 + k), buf.data() + k * DK, DK);
+                        rows[k] = (uint8_t*)(buf.data() + k * DK);
+                    }
+                    rknpu_native_scatter_rows((uint8_t*)a, rows, FR, (int)r0, qk->a_geom, qk->a_geom.sub * 2);
                 }
-                rknpu_native_scatter_rows((uint8_t*)a, rows, FR, (int)r0, qk->a_geom, qk->a_geom.sub * 2);
+            } else {
+                #pragma omp parallel for num_threads(n_omp)
+                for (int64_t r = 0; r < M; ++r) rknpu_fp32_to_fp16(q_row(r), a + r * DK, DK);
             }
-        } else {
-            #pragma omp parallel for num_threads(n_omp)
-            for (int64_t r = 0; r < M; ++r) rknpu_fp32_to_fp16(q_row(r), a + r * DK, DK);
-        }
-        // B = K rows (n_kv x DK, TP_NORM) and V rows (n_kv x DV, NORM)
-        uint16_t* bk = (uint16_t*)qk->B->virt_addr;
-        uint16_t* bv = (uint16_t*)pv->B->virt_addr;
-        for (int64_t j = 0; j < n_kv; ++j) {
-            memcpy(bk + j * DK, k_base + j * k->nb[1] + g * k->nb[2] + ik3 * k->nb[3], DK * 2);
-            memcpy(bv + j * DV, v_base + j * v->nb[1] + g * v->nb[2] + iv3 * v->nb[3], DV * 2);
-        }
-        rknn_mem_sync(qk->ctx, qk->A, RKNN_MEMORY_SYNC_TO_DEVICE);
-        rknn_mem_sync(qk->ctx, qk->B, RKNN_MEMORY_SYNC_TO_DEVICE);
-        rknn_mem_sync(pv->ctx, pv->B, RKNN_MEMORY_SYNC_TO_DEVICE);
-        // Re-bind B after writing it: for a non-native B the driver converts
-        // it to its internal layout at set_io_mem time, so data written into
-        // an already-bound buffer is never seen (P*V came back all zeros)
-        RKNN_CHECK(rknn_matmul_set_io_mem(qk->ctx, qk->B, &qk->io_attr.B), "set_io_mem attn K");
-        RKNN_CHECK(rknn_matmul_set_io_mem(pv->ctx, pv->B, &pv->io_attr.B), "set_io_mem attn V");
-        rknn_matmul_run(qk->ctx);
-        rknn_mem_sync(qk->ctx, qk->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+            // B = K rows (n_kv x DK, TP_NORM) and V rows (n_kv x DV, NORM)
+            uint16_t* bk = (uint16_t*)qk->B->virt_addr;
+            uint16_t* bv = (uint16_t*)pv->B->virt_addr;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                memcpy(bk + j * DK, k_base + j * k->nb[1] + g * k->nb[2] + ik3 * k->nb[3], DK * 2);
+                memcpy(bv + j * DV, v_base + j * v->nb[1] + g * v->nb[2] + iv3 * v->nb[3], DV * 2);
+            }
+            rknn_mem_sync(qk->ctx, qk->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+            rknn_mem_sync(qk->ctx, qk->B, RKNN_MEMORY_SYNC_TO_DEVICE);
+            rknn_mem_sync(pv->ctx, pv->B, RKNN_MEMORY_SYNC_TO_DEVICE);
+            // Re-bind B after writing it: for a non-native B the driver converts
+            // it to its internal layout at set_io_mem time, so data written into
+            // an already-bound buffer is never seen (P*V came back all zeros)
+            RKNN_CHECK(rknn_matmul_set_io_mem(qk->ctx, qk->B, &qk->io_attr.B), "set_io_mem attn K");
+            RKNN_CHECK(rknn_matmul_set_io_mem(pv->ctx, pv->B, &pv->io_attr.B), "set_io_mem attn V");
+        } else if (st == 1) {
+            rknn_matmul_run(qk->ctx);
+            rknn_mem_sync(qk->ctx, qk->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+        } else if (st == 2) {
 
-        // softmax rows into P (FP16) = A of the second matmul
-        const float* S = (const float*)qk->C->virt_addr;
-        uint16_t* P = (uint16_t*)pv->A->virt_addr;
-        auto m_row = [&](int64_t r) {
-            return mask ? (const ggml_fp16_t*)(m_seq + (r % n_q) * mask->nb[1]) : nullptr;
-        };
-        if (native) {
-            #pragma omp parallel for num_threads(n_omp)
-            for (int64_t r0 = 0; r0 < M; r0 += FR) {
-                static thread_local std::vector<float> row, s_buf;
-                static thread_local std::vector<uint16_t> p_buf;
-                if ((int64_t)row.size() < n_kv) row.resize(n_kv);
-                if ((int64_t)s_buf.size() < FR * n_kv) s_buf.resize(FR * n_kv);
-                if ((int64_t)p_buf.size() < FR * n_kv) p_buf.resize(FR * n_kv);
-                uint8_t* srows[512];
-                uint8_t* prows[512];
-                for (int k = 0; k < FR; ++k) {
-                    srows[k] = (uint8_t*)(s_buf.data() + k * n_kv);
-                    prows[k] = (uint8_t*)(p_buf.data() + k * n_kv);
+            // softmax rows into P (FP16) = A of the second matmul
+            const float* S = (const float*)qk->C->virt_addr;
+            uint16_t* P = (uint16_t*)pv->A->virt_addr;
+            auto m_row = [&](int64_t r) {
+                return mask ? (const ggml_fp16_t*)(m_seq + (r % n_q) * mask->nb[1]) : nullptr;
+            };
+            if (native) {
+                #pragma omp parallel for num_threads(n_omp)
+                for (int64_t r0 = 0; r0 < M; r0 += FR) {
+                    static thread_local std::vector<float> row, s_buf;
+                    static thread_local std::vector<uint16_t> p_buf;
+                    if ((int64_t)row.size() < n_kv) row.resize(n_kv);
+                    if ((int64_t)s_buf.size() < FR * n_kv) s_buf.resize(FR * n_kv);
+                    if ((int64_t)p_buf.size() < FR * n_kv) p_buf.resize(FR * n_kv);
+                    uint8_t* srows[512];
+                    uint8_t* prows[512];
+                    for (int k = 0; k < FR; ++k) {
+                        srows[k] = (uint8_t*)(s_buf.data() + k * n_kv);
+                        prows[k] = (uint8_t*)(p_buf.data() + k * n_kv);
+                    }
+                    rknpu_native_gather_rows(srows, FR, (const uint8_t*)S, (int)r0, qk->c_geom, qk->c_geom.sub * 4);
+                    for (int k = 0; k < FR; ++k) {
+                        rknpu_softmax_row(s_buf.data() + k * n_kv, m_row(r0 + k), n_kv, scale, softcap, row.data(), p_buf.data() + k * n_kv);
+                    }
+                    rknpu_native_scatter_rows((uint8_t*)P, prows, FR, (int)r0, pv->a_geom, pv->a_geom.sub * 2);
                 }
-                rknpu_native_gather_rows(srows, FR, (const uint8_t*)S, (int)r0, qk->c_geom, qk->c_geom.sub * 4);
-                for (int k = 0; k < FR; ++k) {
-                    rknpu_softmax_row(s_buf.data() + k * n_kv, m_row(r0 + k), n_kv, scale, softcap, row.data(), p_buf.data() + k * n_kv);
+            } else {
+                #pragma omp parallel for num_threads(n_omp)
+                for (int64_t r = 0; r < M; ++r) {
+                    static thread_local std::vector<float> row;
+                    if ((int64_t)row.size() < n_kv) row.resize(n_kv);
+                    rknpu_softmax_row(S + r * n_kv, m_row(r), n_kv, scale, softcap, row.data(), P + r * n_kv);
                 }
-                rknpu_native_scatter_rows((uint8_t*)P, prows, FR, (int)r0, pv->a_geom, pv->a_geom.sub * 2);
             }
+        } else if (st == 3) {
+            rknn_mem_sync(pv->ctx, pv->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+            rknn_matmul_run(pv->ctx);
+            rknn_mem_sync(pv->ctx, pv->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
         } else {
-            #pragma omp parallel for num_threads(n_omp)
-            for (int64_t r = 0; r < M; ++r) {
-                static thread_local std::vector<float> row;
-                if ((int64_t)row.size() < n_kv) row.resize(n_kv);
-                rknpu_softmax_row(S + r * n_kv, m_row(r), n_kv, scale, softcap, row.data(), P + r * n_kv);
-            }
-        }
-        rknn_mem_sync(pv->ctx, pv->A, RKNN_MEMORY_SYNC_TO_DEVICE);
-        rknn_matmul_run(pv->ctx);
-        rknn_mem_sync(pv->ctx, pv->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
 
-        // O rows -> dst (permuted: row (i*n_head + h))
-        const float* O = (const float*)pv->C->virt_addr;
-        // permute(0, 2, 1, 3): row (i3*n_q*n_head + i*n_head + h)
-        auto d_row = [&](int64_t r) {
-            const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
-            return d_base + (i3 * n_q * n_head + i * n_head + h) * dst->nb[1];
-        };
-        if (native) {
-            #pragma omp parallel for num_threads(n_omp)
-            for (int64_t r0 = 0; r0 < M; r0 += FR) {
-                uint8_t* rows[512];
-                for (int k = 0; k < FR; ++k) rows[k] = (uint8_t*)d_row(r0 + k);
-                rknpu_native_gather_rows(rows, FR, (const uint8_t*)O, (int)r0, pv->c_geom, pv->c_geom.sub * 4);
+            // O rows -> dst (permuted: row (i*n_head + h))
+            const float* O = (const float*)pv->C->virt_addr;
+            // permute(0, 2, 1, 3): row (i3*n_q*n_head + i*n_head + h)
+            auto d_row = [&](int64_t r) {
+                const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
+                return d_base + (i3 * n_q * n_head + i * n_head + h) * dst->nb[1];
+            };
+            if (native) {
+                #pragma omp parallel for num_threads(n_omp)
+                for (int64_t r0 = 0; r0 < M; r0 += FR) {
+                    uint8_t* rows[512];
+                    for (int k = 0; k < FR; ++k) rows[k] = (uint8_t*)d_row(r0 + k);
+                    rknpu_native_gather_rows(rows, FR, (const uint8_t*)O, (int)r0, pv->c_geom, pv->c_geom.sub * 4);
+                }
+            } else {
+                #pragma omp parallel for num_threads(n_omp)
+                for (int64_t r = 0; r < M; ++r) memcpy(d_row(r), O + r * DV, DV * sizeof(float));
             }
-        } else {
-            #pragma omp parallel for num_threads(n_omp)
-            for (int64_t r = 0; r < M; ++r) memcpy(d_row(r), O + r * DV, DV * sizeof(float));
         }
+    };
+
+    static const bool overlap_enabled = []() {
+        const char* env = std::getenv("RKNPU_FA_OVERLAP");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    const int n = (int)(n_seq * n_kvh);   // items it = (i3, g), i3-major
+    if (!overlap_enabled || n < 2) {
+        for (int64_t i3 = 0; i3 < n_seq; ++i3) {
+            for (int64_t g = 0; g < n_kvh; ++g) {
+                for (int st = 0; st < 5; ++st) stage(i3, g, st, (int)(g % 3));
+            }
+        }
+        return;
     }
+    // Software pipeline over the items: item it runs on core (and contexts)
+    // it % 3, and at most items it-1, it, it+1 are in flight, so they never
+    // share contexts. The NPU runs of one item overlap the CPU stages of
+    // its neighbours.
+    for (int c = 0; c < std::min(n, 3); ++c) {   // create every context here: the workers only look them up
+        GGML_ASSERT(bctx->get_attn_ctx((int)M, (int)DK, (int)n_kv, RKNN_MM_LAYOUT_TP_NORM, c) &&
+                    bctx->get_attn_ctx((int)M, (int)n_kv, (int)DV, RKNN_MM_LAYOUT_NORM, c));
     }
+    auto st_k = [&](int it, int st) { stage(it / n_kvh, it % n_kvh, st, it % 3); };
+    std::vector<rknpu_fn_pool::ticket> t_qk(n), t_pv(n);
+    st_k(0, 0);
+    bctx->fa_pool.submit(t_qk[0], [&] { st_k(0, 1); });
+    for (int it = 0; it < n; ++it) {
+        if (it + 1 < n) st_k(it + 1, 0);                      // overlaps QK(it), PV(it-1)
+        bctx->fa_pool.wait(t_qk[it]);
+        if (it + 1 < n) bctx->fa_pool.submit(t_qk[it + 1], [&, it] { st_k(it + 1, 1); });
+        st_k(it, 2);                                          // overlaps QK(it+1), PV(it-1)
+        if (it >= 1) { bctx->fa_pool.wait(t_pv[it - 1]); st_k(it - 1, 4); }
+        bctx->fa_pool.submit(t_pv[it], [&, it] { st_k(it, 3); });
+    }
+    bctx->fa_pool.wait(t_pv[n - 1]);
+    st_k(n - 1, 4);
 }
 
 static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t backend, struct ggml_cgraph* cgraph);
