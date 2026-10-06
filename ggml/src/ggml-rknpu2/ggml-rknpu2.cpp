@@ -1016,6 +1016,116 @@ static void rknpu_head_norm_op(struct ggml_tensor* norm, struct ggml_tensor* mul
     for (int64_t r = 0; r < nr; ++r) rknpu_head_norm(y + r * hd, x + r * hd, hd, eps, w);
 }
 
+// RoPE of the per-head-normed Q/K (Gemma-4), reproducing ggml-cpu
+// exactly: the same cos/sin cache (no YaRN extrapolation, ext_factor == 0)
+// and the rotation as ggml-cpu's compiled code does it, one rounded product
+// then a fused multiply-add: y0 = fma(-x1, s, x0*c), y1 = fma(x0, s, x1*c).
+// Supported only after a head norm this backend runs (RKNPU_ROPE), or for
+// any F32 RoPE with RKNPU_ROPE_ANY=1 (exactness tests).
+struct rknpu_rope_params {
+    int n_dims = 0, mode = 0, n_offs = 0;
+    float freq_base = 0, freq_scale = 0, ext_factor = 0, attn_factor = 0;
+};
+static rknpu_rope_params rknpu_rope_get(const struct ggml_tensor* op) {
+    rknpu_rope_params p;
+    p.n_dims = ((const int32_t*)op->op_params)[1];
+    p.mode   = ((const int32_t*)op->op_params)[2];
+    memcpy(&p.freq_base,   (const int32_t*)op->op_params + 5, sizeof(float));
+    memcpy(&p.freq_scale,  (const int32_t*)op->op_params + 6, sizeof(float));
+    memcpy(&p.ext_factor,  (const int32_t*)op->op_params + 7, sizeof(float));
+    memcpy(&p.attn_factor, (const int32_t*)op->op_params + 8, sizeof(float));
+    p.n_offs = ((const int32_t*)op->op_params)[15];
+    return p;
+}
+static bool rknpu_rope_enabled() {
+    static const bool v = []() {
+        const char* env = std::getenv("RKNPU_ROPE");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return v;
+}
+static bool rknpu_rope_any() {
+    static const bool v = std::getenv("RKNPU_ROPE_ANY") != nullptr && std::atoi(std::getenv("RKNPU_ROPE_ANY")) != 0;
+    return v;
+}
+static bool rknpu_rope_supported(const struct ggml_tensor* op) {
+    if (op->op != GGML_OP_ROPE) return false;
+    const struct ggml_tensor *a = op->src[0], *pos = op->src[1], *ff = op->src[2];
+    if (!a || !pos || a->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || pos->type != GGML_TYPE_I32) return false;
+    if (ff && ff->type != GGML_TYPE_F32) return false;
+    const rknpu_rope_params p = rknpu_rope_get(op);
+    if ((p.mode != GGML_ROPE_TYPE_NORMAL && p.mode != GGML_ROPE_TYPE_NEOX) || p.ext_factor != 0.0f) return false;
+    if (p.n_dims <= 0 || p.n_dims % 8 != 0 || p.n_offs < 0 || p.n_offs % 2 != 0 || p.n_offs + p.n_dims > a->ne[0]) return false;
+    if (ff && ff->ne[0] < p.n_dims / 2) return false;
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(op) || a->ne[3] != 1 || pos->ne[0] != a->ne[2]) return false;
+    if (rknpu_rope_any()) return true;
+    // after a per-head norm (RMS_NORM, or its weight MUL) of a projection
+    return a->op == GGML_OP_RMS_NORM ? rknpu_head_norm_supported(a) : rknpu_head_norm_weight(a) != nullptr;
+}
+// cos/sin for one position, as ggml_rope_cache_init (ext_factor == 0, forward)
+static void rknpu_rope_cache(float* cache, int64_t p, const rknpu_rope_params& rp, const float* ff, int64_t ne0) {
+    const float theta_scale = powf(rp.freq_base, -2.0f / rp.n_dims);
+    float theta = (float)p;
+    for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
+        const float f = ff ? ff[i0 / 2] : 1.0f;
+        const float theta_interp = rp.freq_scale * (theta / f);
+        cache[i0 + 0] = cosf(theta_interp) * rp.attn_factor;
+        cache[i0 + 1] = sinf(theta_interp) * rp.attn_factor;
+        theta *= theta_scale;
+    }
+}
+// one head row (in place is fine: every pair is read before it is written)
+static inline void rknpu_rope_head(float* y, const float* x, const float* cache, int64_t ne0, const rknpu_rope_params& rp) {
+    const int n_dims = rp.n_dims, n_offs = rp.n_offs;
+    if (rp.mode == GGML_ROPE_TYPE_NEOX) {
+        const int h = n_dims / 2;
+        const float* xa = x + n_offs;
+        float* ya = y + n_offs;
+        int i = 0;
+#ifdef __ARM_NEON
+        for (; i + 4 <= h; i += 4) {
+            const float32x4x2_t cs = vld2q_f32(cache + 2 * i);   // cos, sin
+            const float32x4_t x0 = vld1q_f32(xa + i), x1 = vld1q_f32(xa + i + h);
+            const float32x4_t y0 = vfmsq_f32(vmulq_f32(x0, cs.val[0]), x1, cs.val[1]);
+            const float32x4_t y1 = vfmaq_f32(vmulq_f32(x1, cs.val[0]), x0, cs.val[1]);
+            vst1q_f32(ya + i, y0);
+            vst1q_f32(ya + i + h, y1);
+        }
+#endif
+        for (; i < h; ++i) {
+            const float c = cache[2 * i], sn = cache[2 * i + 1], x0 = xa[i], x1 = xa[i + h];
+            ya[i]     = fmaf(-x1, sn, x0 * c);
+            ya[i + h] = fmaf(x0, sn, x1 * c);
+        }
+    } else {   // NORMAL: adjacent pairs
+        for (int i0 = 0; i0 < n_dims; i0 += 2) {
+            const float c = cache[i0], sn = cache[i0 + 1], x0 = x[n_offs + i0], x1 = x[n_offs + i0 + 1];
+            y[n_offs + i0]     = fmaf(-x1, sn, x0 * c);
+            y[n_offs + i0 + 1] = fmaf(x0, sn, x1 * c);
+        }
+    }
+    if (y != x) {   // channels outside the rotated range are copied
+        for (int64_t i0 = 0; i0 < n_offs; ++i0) y[i0] = x[i0];
+        for (int64_t i0 = n_offs + n_dims; i0 < ne0; ++i0) y[i0] = x[i0];
+    }
+}
+static void rknpu_rope_op(struct ggml_tensor* dst, int n_omp) {
+    const struct ggml_tensor *a = dst->src[0], *pos = dst->src[1], *fft = dst->src[2];
+    const rknpu_rope_params rp = rknpu_rope_get(dst);
+    const float* x = (const float*)get_tensor_real_ptr(a);
+    float* y = (float*)get_tensor_real_ptr(dst);
+    const int32_t* pp = (const int32_t*)get_tensor_real_ptr(pos);
+    const float* ff = fft ? (const float*)get_tensor_real_ptr(fft) : nullptr;
+    const int64_t ne0 = a->ne[0], nh = a->ne[1], nt = a->ne[2];
+    #pragma omp parallel for num_threads(n_omp)
+    for (int64_t t = 0; t < nt; ++t) {
+        static thread_local std::vector<float> cache;
+        if ((int64_t)cache.size() < ne0) cache.resize(ne0);
+        rknpu_rope_cache(cache.data(), pp[t], rp, ff, ne0);
+        for (int64_t h = 0; h < nh; ++h) rknpu_rope_head(y + (t * nh + h) * ne0, x + (t * nh + h) * ne0, cache.data(), ne0, rp);
+    }
+}
+
 static bool rknpu_glu_supported(const struct ggml_tensor* op) {
     if (ggml_get_glu_op(op) != GGML_GLU_OP_GEGLU) return false;
     const struct ggml_tensor *a = op->src[0], *b = op->src[1];
@@ -1895,6 +2005,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 break;
             }
             rknpu_head_norm_op(node, mul, n_omp);
+            continue;
+        }
+        if (node->op == GGML_OP_ROPE) {   // RoPE not fused into a projection's dequant
+            rknpu_rope_op(node, n_omp);
             continue;
         }
         if (node->op == GGML_OP_MUL) {   // a weight MUL whose norm ran separately
@@ -3546,6 +3660,9 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
 
         case GGML_OP_RMS_NORM:
             return rknpu_head_norm_enabled() && rknpu_head_norm_supported(op);
+
+        case GGML_OP_ROPE:
+            return (rknpu_rope_any() || (rknpu_rope_enabled() && rknpu_head_norm_enabled())) && rknpu_rope_supported(op);
 
         case GGML_OP_MUL:
             return rknpu_head_norm_enabled() && rknpu_head_norm_weight(op) != nullptr;
