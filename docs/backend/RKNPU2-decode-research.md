@@ -733,6 +733,34 @@ decode are unchanged.
 between the projections and attention is the two KV-cache writes
 (`SET_ROWS`, CPU), the next step.
 
+**Step 3: KV-cache writes.**
+- The backend takes `SET_ROWS` when its source is a view of a fused K (roped)
+  or V (normed) output, and does the cache write inside the projection's
+  dequant: same F16 conversion as ggml-cpu (round to nearest even), at each
+  token's cell index.
+- In graph order K's cache write comes *after* V's projection. So it is
+  computed early, only if no computing node in between touches that cache,
+  and then marked done; the done-set is cleared after every graph, since
+  tensor pointers are reused.
+- When nothing else reads the FP32 K/V rows they are not written at all
+  (normed and roped in place in the thread-local row).
+- Decode and other non-pipelined cases use a standalone handler.
+
+Same-binary A/B: **288.1 vs 280.3 (+2.8%)**, verify 287.5. pp128 went from
+188.2 to 192.0; decode is unchanged. Bit-identical (PPL32 27.2382, KLD
+0.587297), and graph splits fell another 4%.
+
+The gain is larger than the 0.85% of cycles the CPU cache copy cost. It
+also removed the CPU piece between V's projection and attention, and the
+FP32 K/V write-and-reread. Per layer, attention now runs from the Q/K/V
+projections through the output projection in one NPU-backend piece.
+
+Not done: writing K/V straight into attention's native B layouts. The
+attention fill reads the whole cache range, not just this batch's rows,
+and that copy is about 1%.
+
+**Steps 1-3 together: ~+5% pp512** (about 277 → 288).
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
@@ -1828,6 +1856,7 @@ becomes a server.
 | `RKNPU_ROPE` | 1 | 0 = RoPE stays on ggml-cpu (#1h) |
 | `RKNPU_ROPE_FUSE` | 1 | 0 = RoPE runs as a separate backend op instead of inside the Q/K dequant (#1h) |
 | `RKNPU_ROPE_ANY` | unset | 1 = backend takes any F32 NORMAL/NEOX RoPE (exactness test hook) (#1h) |
+| `RKNPU_KV_WRITE` | 1 | 0 = KV-cache writes (`SET_ROWS`) of K/V stay on ggml-cpu (#1h) |
 | `RKNPU_PROFILE` | unset | Diagnostic: prints cumulative wall time in the backend (graph / per-node / NPU run) every ~5 s to stderr; take the slope over a decode window and divide by the token rate (#1c) |
 | `RKNPU_DISPATCH_POOL` | unset | 1 = old dispatch path: NPU segments on the persistent pool and serial M=1 A-prep instead of ggml's OpenMP team. For A/B comparison only (#1c) |
 | `OMP_NUM_THREADS=4` | unset | no longer required: the #3 fix covers M=1, and since 2026-10-02 the backend takes ggml's thread count for M > 1 too (#1b); still harmless |
