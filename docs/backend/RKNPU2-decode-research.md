@@ -445,6 +445,30 @@ two N = 10240 FFN matmuls hardest. Things that did *not* fix it in place:
 Not writing the gate at all does fix it: about 21 MB less DRAM traffic per
 layer per 256-row chunk.
 
+Microbenchmark data (`rknpu2-dequant-microbench.cpp`, ns per output
+element, 4 threads, best of 15, 4-row blocks unless noted):
+
+| Case | N=10240 | N=2560 | N=2048 | N=512 |
+|---|---|---|---|---|
+| store (first K-segment, with DC ZVA) | 1.14–1.21 | 0.31–0.34 | 0.27–0.30 | 0.27 |
+| store, ZVA removed | 0.97 | 0.29 | 0.27 | 0.24 |
+| store, dst stride N+16 | 0.99 | — | — | — |
+| accumulate (read-modify-write dst) | 0.93 | — | — | — |
+| read C only, same pattern | 0.21 | — | — | — |
+| write dst only, sequential rows | 0.14 | — | — | — |
+| store, 2/16-row blocks | 0.93 / 1.13 | 0.37 (2 rows) | — | — |
+| store, columns split in 4/8 parts | 1.11 / 0.95 | 0.33 | — | — |
+
+ZVA costs in isolation but won in the pipeline (#10), where it removes
+reads that compete with the NPU. No re-blocking gets N=10240 near the
+narrow shapes.
+
+Tools added: `rknpu2-dequant-microbench.cpp` (build line in its header) and
+`rknpu2-autoresearch/cpu-npu/mtp-check.sh` (MTP n=1 output identity plus
+t/s on the board). Profiles came from `perf record -e cycles:u -F 1999
+-D 12000` around `llama-bench -p 512 -r 6`: user-mode sampling needs no
+sudo, and the delay skips model load. `sudo perf` resolved no symbols here.
+
 Discarded, with the reason. Backend RMS_NORM/ADD/MUL (#7, #9, #19): ggml-cpu's
 fused `rms_norm_mul` beats separate passes even with no copies left.
 DC ZVA on the GEGLU output (#11). NEON binary ops in ggml-cpu (#12).

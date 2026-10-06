@@ -29,3 +29,5 @@ unit tests, 32-chunk PPL ≤ 27.41, KLD vs `~/kld-cpu-e4b-4ch.bin` ≤ 0.65 with
 same-top ≥ 68%, the NPU flash-attention hardware test, and 3 `decode-check.sh`
 server runs. Keep threshold: +0.8 t/s over the best build so far.
 `results.tsv` is the log: 161.6 → 207.3 t/s, 6 keeps, all bit-identical.
+`mtp-check.sh` (board) is the end-of-loop MTP sanity check: `decode-check.sh`
+with the E4B drafter at n-max 1, output must match the no-draft reference.
