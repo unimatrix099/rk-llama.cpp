@@ -860,8 +860,29 @@ static inline float32x4_t rknpu_v_expf(float32x4_t x) {
 
 // One attention row: P = softmax(softcap(s*scale) + mask), written as FP16.
 // Masked (-inf) positions give exactly 0; an all-masked row gives zeros.
-static void rknpu_softmax_row(const float* s_row, const ggml_fp16_t* mrow, int64_t n, float scale, float softcap,
-                              float* tmp, uint16_t* out) {
+static void rknpu_softmax_row(const float* s_row, const ggml_fp16_t* mrow, int64_t n_all, float scale, float softcap,
+                              float* tmp, uint16_t* out_all) {
+    // Leading and trailing runs of -inf mask (causal / sliding window) give
+    // exact zeros: work only on [lo, hi), aligned to the 4-lane vectors so
+    // every lane sums the same positions as over the whole row
+    int64_t lo = 0, hi = n_all;
+    if (mrow) {
+        const uint16_t* m16 = (const uint16_t*)mrow;
+        while (hi > 0 && m16[hi - 1] == 0xFC00) --hi;
+        while (lo < hi && m16[lo] == 0xFC00) ++lo;
+        if (hi == 0) {
+            memset(out_all, 0, n_all * sizeof(uint16_t));
+            return;
+        }
+        lo &= ~(int64_t)3;
+        hi = std::min(n_all, (hi + 3) & ~(int64_t)3);
+    }
+    memset(out_all, 0, lo * sizeof(uint16_t));
+    memset(out_all + hi, 0, (n_all - hi) * sizeof(uint16_t));
+    s_row += lo;
+    if (mrow) mrow += lo;
+    uint16_t* out = out_all + lo;
+    const int64_t n = hi - lo;
     int64_t j = 0;
     float mx = -INFINITY;
 #ifdef __ARM_NEON
