@@ -1444,7 +1444,12 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 const char* env = std::getenv("RKNPU_FFN_BLOCK");
                 return env == nullptr || std::atoi(env) != 0;
             }();
-            const int MCf = 256;
+            // chunk rows: smaller chunks shorten the schedule's head and tail
+            static const int MCf = []() {
+                const char* env = std::getenv("RKNPU_FFN_MC");
+                const int v = env ? std::atoi(env) : 128;
+                return (v >= 32 && v <= 512 && v % 32 == 0) ? v : 128;
+            }();
             if (ffn_block_enabled && rknpu_pipeline_enabled() && n_omp > 1 && node_i + 3 < cgraph->n_nodes) {
                 struct ggml_tensor* nu = cgraph->nodes[node_i + 1];
                 struct ggml_tensor* ng = cgraph->nodes[node_i + 2];
