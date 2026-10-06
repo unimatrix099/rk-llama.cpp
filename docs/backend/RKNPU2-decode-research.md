@@ -498,6 +498,171 @@ still fully hidden. Possible next steps:
 - deferring the other single-consumer outputs (q/k → per-head norm);
 - the tile-pass GEGLU (#24) re-tested behind an env A/B.
 
+### 1g. Prefill loop, part 4 — whole-block scheduling: pp512 208.3 -> 275 t/s (2026-10-06)
+
+Goal: cut the CPU share named at the end of #1f (dequant, GEGLU, Hadamard,
+ggml-cpu norms/adds) and keep the NPU busy. Same gate as #1e/#1f; keep
+threshold +0.8 t/s over the best so far, or a same-binary env A/B where
+one exists. 30 of the planned 40 iterations, stopped at a plateau (the
+last ten gave 3 small keeps). 15 kept. Log:
+`rknpu2-autoresearch/cpu-npu-2/results.tsv`.
+
+**What's new in this loop.** The backend no longer runs matmuls strictly
+node by node. Two fixed patterns now run as one schedule each, and that
+cross-node scheduling is where most of the gain came from:
+- The FFN, `[gate, up, GLU, down]`.
+- Attention.
+
+| # | Change | pp512 | Verdict |
+|---|---|---|---|
+| 0 | baseline (end of #1f) | 208.3 | — |
+| 2 | ffn_down as a cross-node job: its A-prep runs inside up's fused GEGLU, so the GLU output is never written; down's first chunk starts before up's last collect; both K-segments run per chunk (two-source dequant) | 216.4 | keep |
+| 3 | **the whole FFN as one block** (`RKNPU_FFN_BLOCK`): gate and up share one prep pass and one NPU batch per chunk; neither gate, up nor GLU is written | 219.9 | keep |
+| 5 | FFN batch c runs gate/up chunk c with down chunk c-2; 128-row chunks (`RKNPU_FFN_MC`) | 222.9 | keep |
+| 7 | **NPU attention with native A/C layout** (`RKNPU_FA_NATIVE`): QK+PV runs went from 331 to 186 ms per pp512 because the runtime no longer converts A/C serially; Q/P/S/O are moved in 64-row blocks (`RKNPU_FA_ROWS`) | 229.7 | keep |
+| 8 | **NPU attention software-pipelined** over (sequence, KV group) items on rotating cores (`RKNPU_FA_OVERLAP`) | 241.5 | keep |
+| 9 | FFN GEGLU straight from the gate/up INT16 tiles, with no row buffers (`RKNPU_GEGLU_TILES`) | 246.7 | keep |
+| 11 | ggml-cpu fuses RMS_NORM + MUL + ADD (post-norm plus residual) | 251.2 | keep |
+| 12 | ... plus a following MUL by a one-element tensor (Gemma-4 layer scale) | 254.4 | keep |
+| 13 | ... plus the next RMS_NORM + MUL of the result, per row (`GGML_CPU_DISABLE_FUSION_CHAIN=1` turns it off) | 257.2 | keep |
+| 14 | software prefetch, 8 tiles ahead, in the GEGLU tile pass (`RKNPU_TILE_PF`) | 261.7 | keep |
+| 16 | NPU attention with native B (`RKNPU_FA_NATIVE_B`): K/V written in the NPU tiling and B bound once; no per-item driver conversion | 261.9 (A/B +2%) | keep |
+| 17 | attention output gathered into a local block, then written as whole rows | 269.2 | keep |
+| 20 | FFN preps 2 gate/up chunks during batch 0 (`RKNPU_FFN_PREP_AHEAD`) | 270.1 | keep |
+| 21 | attention submits PV(it) before finishing item it-1 | 273.7 | keep |
+| 24 | softmax skips leading/trailing -inf mask runs (exact zeros, lane-aligned) | 275.1 | keep |
+
+Every keep except #8 left PPL32, KLD and same-top bit-identical. The
+ggml-cpu fusions needed care (see below).
+
+**Final state** (E4B, default W4A4, `-t 4`, taskset 4-7): pp512 **273.7-276.1**
+(+32% over #1f, 4.0× the pre-#1d 68.4), pp128 **188.7**, tg64 **8.78**.
+NPU + MTP n=1 runs at **9.29 t/s** with output identical to the no-draft
+reference (4/4). Quality: PPL32 27.2382 (was 27.2432, see the core note
+below), KLD 0.587297, same-top 72.06%.
+
+**Why the FFN wanted cross-node scheduling (#1-#5).**
+- Iteration 1 moved down's A-prep into up's collect and lost 2.4%. Down's
+  prep had been what hid down's first NPU chunk; with it gone, nothing
+  overlapped that chunk.
+- A per-node wait profile (`RKNPU_PROFILE` now reports `npu_wait`) then
+  showed the imbalance. gate and down spent 870 and 725 ms blocked on the
+  NPU while up did nearly all the CPU work.
+- The fix is to schedule the three matmuls as one pipeline.
+
+The final FFN schedule, for 4 chunks:
+
+    prep 0,1,2 | G0+U0 || fused 0 (gate+up dequant, GEGLU, down Hadamard+INT4) | G1+U1 ||
+    fused 1 + prep 3 | G2+U2+D0 || fused 2 + collect D0 | G3+U3+D1 || ... | D3 || collect D2 | collect D3
+
+A final per-step measurement put the FFN's NPU work (~850 ms per pp512,
+about 2/3 of the INT8 peak) roughly equal to its CPU work. The FFN is
+now close to balanced. Per-run overhead is small (32.9 us per run); the
+128-row chunks re-stream about 250 ms of weights, but larger chunks
+lengthen the exposed head and tail and measured slower.
+
+**Attention (#7, #8, #16, #17, #21, #24).** A stage profile per pp512
+started at 510 ms:
+- QK run 194 ms, PV run 137 ms;
+- softmax 73 ms;
+- B re-bind 44 ms (the driver converting K/V);
+- copies 60 ms.
+
+With `AC_layout = NORM`, the runtime converts A and C on one thread
+inside every run. Going native helped only after the moves became
+line-friendly:
+- Row-by-row 16-byte gathers were 3x slower than the conversion (32 KB
+  stride, L1 set aliasing). 64-row blocks fixed it.
+- The output stage had 64 scattered destination rows per block, because
+  rows interleave by head. Writing whole rows from a local block gave +2.7%
+  on its own.
+- Pipelining the KV groups gave +5.2%. Groups run on their own core and
+  context; items rotate over cores 0-2, so at most items it-1, it and it+1
+  are in flight and never share contexts.
+
+Native B removes the remaining `rknn_matmul_set_io_mem` calls, the
+driver's serial B conversion. It also stops binding while other runs are
+in flight.
+
+**Open issue, pre-existing: NPU attention output depends on the core.**
+- With the pipeline, PPL32 went from 27.2432 to 27.2382. It is
+  deterministic, run to run.
+- The pipeline is not the cause. Running sequentially with rotated cores
+  gives 27.2382 as well, and even a static shift of which core serves
+  which KV group (old sequential path, `g % 3` → `(g+1) % 3`) moves chunks
+  5-8. The first 4-sequence batch is always identical; later batches
+  differ.
+- The extended `test-rknpu2-flash-attn.cpp` (now 12 cases, two warm
+  rounds, a 4-sequence prefill case) matches the CPU within 1e-3 and is
+  identical across core assignments. So the effect appears only inside the
+  model, after earlier batches have run.
+- Something carries state between calls in a core-specific way, or the
+  cores differ in some edge case (masked or stale cells). Not explained;
+  the magnitude is ±0.02% PPL.
+
+**ggml-cpu fusions (#11-#13): exact only with care.**
+- `ggml_cpu_try_fuse_ops` now fuses RMS_NORM + MUL + ADD (+ MUL by a
+  scalar) and the following RMS_NORM + MUL into one row pass.
+- The first version changed PPL (27.0713, KLD 0.582). GCC contracts the
+  intrinsic `vmulq_f32` + `vaddq_f32` into an FMA (`-ffp-contract=fast` is
+  the GNU default), which rounds differently from a separate ADD node. An
+  empty `asm` register barrier between the multiply and the add (and a
+  `volatile` in the scalar tail) restored bit-identity.
+- The chained second norm reuses one shared sum-of-squares routine, so
+  its accumulation order matches the standalone norm exactly.
+
+**Dequant memory behaviour.** The GEGLU tile pass reads two INT16 C
+streams, one 64-byte line per tile, with tiles 2 KB apart. The hardware
+prefetcher does not follow that, so a software prefetch 8 tiles ahead was
+worth +1.7%. The same prefetch in the plain dequant kernels was slower;
+those are bound by their destination writes. Replacing the GELU math with
+a plain multiply (a diagnostic build) would gain only 5%, so the tile pass
+is mostly memory-bound. An FP16 GELU gained 0.25% and was not worth the
+numerics change.
+
+Discarded, with the reason:
+- **Q/K/V as one shared-input block** (#6): it fired on every layer with
+  no gain; those nodes are CPU-bound and re-reading the row three times
+  hits cache.
+- **Per-layer-input block** `[inp_gate, GELU, MUL, proj]` (#10): +0.4%.
+  The GELU reproduces ggml's fp16 table exactly. Those nodes cost mostly
+  their K=2560 prep.
+- **FWHT h=1,2 merged** (#18): blocks are L1-resident.
+- **Plain pipelined nodes at 128 rows** (#23).
+- **Third attention pool worker** (#22).
+- **INT4 quantizer single clamp** (#27): exact, no speed change.
+- **C invalidation in the runner threads** (#28): +0.6% A/B. The main
+  thread spends about 5% of wall time in `rknn_mem_sync`; moving the C
+  half off it buys too little.
+- **Non-cacheable A buffers** (#29): -5%, because scattered 16-byte
+  uncached writes are slow.
+- **libgomp spin tuning**: the default is best.
+- **Q/K/V sharing one Hadamard sign vector per layer** (#26, quality
+  probe): it would let K and V reuse Q's prepped INT4 rows, but PPL32 is
+  29.88 (+9.7%), KLD 0.607. The shared rotation gives Q, K and V the same
+  quantization error, which correlates the errors in QK^T. This narrows
+  #3h's finding: even within one layer's attention, E4B needs per-tensor
+  signs.
+
+**Where prefill time goes now** (perf, user cycles):
+- GEGLU tile pass 16%;
+- FWHT 11%;
+- dequant 9% + down's dequant2 7%;
+- ggml-cpu norms 10%;
+- INT4 quantize 4.5%, softmax 4%;
+- libgomp waits about 12%, plus 4-5% system time (cache maintenance).
+
+The FFN is near NPU/CPU balance. Attention and the single-matmul nodes
+(Q, K, V, O, inp_gate, proj) are CPU-bound with an idle NPU. The next
+gains need structural moves:
+- Q/K norm and RoPE inside the backend, so attention becomes one block;
+- or W8A8 for the CPU-bound attention projections (no Hadamard prep;
+  double NPU work; needs name-based routing and a pipelined W8A8 path).
+
+Process note: `pkill -f <pattern>` matched the shell running it and killed
+the command (exit 144). Use `pkill -f "^build/bin/..."` or pgrep with an
+anchored pattern.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
@@ -1578,6 +1743,17 @@ becomes a server.
 | `RKNPU_FUSE_GLU` | 1 | 0 = do not fuse GEGLU into the up matmul's dequant (#1f); results identical |
 | `RKNPU_DEFER_GATE` | 1 | 0 = dequantize the FFN gate into its own output instead of deferring it into up's fused GEGLU (#1f); results identical |
 | `RKNPU_HOST_BUFFERS` | 1 | 0 = RKNPU buffer type not reported as host memory, so the scheduler copies NPU outputs back for CPU splits (#1f) |
+| `RKNPU_DOWN_JOB` | 1 | 0 = no cross-node ffn_down job (used when the FFN block does not apply) (#1g) |
+| `RKNPU_FFN_BLOCK` | 1 | 0 = run `[gate, up, GLU, down]` node by node (deferred gate / down job / fused GEGLU paths) (#1g); results identical |
+| `RKNPU_FFN_MC` | 128 | FFN block chunk rows (32..512, multiple of 32) (#1g) |
+| `RKNPU_FFN_PREP_AHEAD` | 2 | gate/up chunks prepped during the FFN block's first NPU batch (#1g) |
+| `RKNPU_GEGLU_TILES` | 1 | 0 = FFN GEGLU via dequantized row buffers instead of straight from the INT16 tiles (#1g); identical |
+| `RKNPU_TILE_PF` | 8 | prefetch distance (tiles) in the GEGLU tile pass, 0 = off (#1g) |
+| `RKNPU_FA_NATIVE` | 1 | 0 = NPU attention with plain A/C layouts (runtime converts per run) (#1g) |
+| `RKNPU_FA_NATIVE_B` | 1 | 0 = plain K/V B layout re-bound per item (driver converts) (#1g) |
+| `RKNPU_FA_ROWS` | 64 | row block for the native-layout attention moves (#1g) |
+| `RKNPU_FA_OVERLAP` | 1 | 0 = attention items run strictly in sequence (#1g); note the core-dependence (±0.02% PPL) in #1g |
+| `GGML_CPU_DISABLE_FUSION_CHAIN` | unset | 1 = ggml-cpu's fused post-norm pass does not also compute the following RMS_NORM + MUL (#1g); identical |
 | `RKNPU_PROFILE` | unset | Diagnostic: prints cumulative wall time in the backend (graph / per-node / NPU run) every ~5 s to stderr; take the slope over a decode window and divide by the token rate (#1c) |
 | `RKNPU_DISPATCH_POOL` | unset | 1 = old dispatch path: NPU segments on the persistent pool and serial M=1 A-prep instead of ggml's OpenMP team. For A/B comparison only (#1c) |
 | `OMP_NUM_THREADS=4` | unset | no longer required: the #3 fix covers M=1, and since 2026-10-02 the backend takes ggml's thread count for M > 1 too (#1b); still harmless |

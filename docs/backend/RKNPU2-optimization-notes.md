@@ -395,6 +395,12 @@ revalidation) to optimize the minor term of the slowdown is not worth it.
 | Host buffer types in `supports_buft`; RKNPU buffers flagged `is_host` | ✅ shipped | +2.6% / +3.3%: no scheduler copies between NPU and CPU splits — #1f |
 | DC ZVA on dequant stores; K-segment-local Hadamard | ✅ shipped | +2.4% / +2.5%, bit-identical — #1f |
 | RMS_NORM/ADD/MUL in the backend; NEON ggml-cpu binary ops; merged K-segment pass; larger dequant row blocks | ❌ no gain | ggml-cpu's fused rms_norm_mul wins; merged K-segment pass is noise; 8-64-row blocks −5..−7% — #1f |
+| Prefill loop part 4: whole-block scheduling (2026-10-06) | ✅ shipped | E4B pp512 208.3→275 (+32%), pp128 169.7→188.7, decode 8.78, MTP 9.29; 15 keeps — decode research #1g |
+| FFN `[gate, up, GLU, down]` as one scheduled block | ✅ shipped | +7% over three steps: shared gate/up prep, gate/up/GLU never written, down chunk c-2 batched with gate/up chunk c — #1g |
+| NPU attention: native A/C/B layouts, KV-group pipeline, row-wise output, mask-run skipping | ✅ shipped | +19% over six steps; native layouts only pay with 64-row line-friendly moves — #1g |
+| ggml-cpu RMS_NORM+MUL+ADD(+scale)(+next norm) fusion | ✅ shipped | +6.6%, bit-identical once FMA contraction is blocked (GCC contracts vmulq+vaddq) — #1g |
+| Q/K/V sharing one sign vector per layer | ❌ quality | PPL +9.7%: shared rotation correlates Q/K quantization errors — #1g |
+| Non-cacheable A buffers; C sync in runner threads; per-layer-input block; FP16 GELU | ❌ no gain | −5% / +0.6% / +0.4% / +0.25% — #1g |
 | 8-chunk PPL as a W4A4 quality gate | ❌ unusable | scatters ±3% for 1e-7 perturbations; W4A4 top-1 agreement with CPU is ~70% (KLD 0.59) despite PPL parity — decode research #1d |
 | Server segfault on empty output mul_mat | ✅ fixed | pre-existing ~50% crash in llama-server: rejected zero-row op → 713 MB packed read-back overrun. Accept empty ops, abort on packed read-back; 0/12 after — decode research #1c |
 | Drafter on CPU (`RKNPU_EXCLUDE_TYPES=f16`) | ❌ no effect | n=3 6.00 vs 5.99; kept as a diagnostic. `--device-draft` cannot do it (ACCEL buffer type) — decode research #1b |

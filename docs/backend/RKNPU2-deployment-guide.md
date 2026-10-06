@@ -265,7 +265,7 @@ have MTP drafters, and which new models are worth testing next:
 
 | Model | Best command prefix | pp128 | tg64 | Quality vs its own CPU |
 |---|---|---|---|---|
-| **Gemma-4 E4B** Q4_0 (7.5 B dense, multimodal) | *(none — defaults)* | 37.0 → **169.7** on `rebase/w4a4-on-upstream` (pp512 203.4) | 6.89 → **8.65** | **parity** (26.88 / 27.01; rebased: PPL32 27.24, KLD vs CPU 0.587 — decode research #1e/#1f) |
+| **Gemma-4 E4B** Q4_0 (7.5 B dense, multimodal) | *(none — defaults)* | 37.0 → **188.7** on `rebase/w4a4-on-upstream` (pp512 275) | 6.89 → **8.78** | **parity** (26.88 / 27.01; rebased: PPL32 27.24, KLD vs CPU 0.587 — decode research #1e-#1g) |
 | **LFM2-8B-A1B** Q4_0 (MoE 8.3 B / 1.5 B) | `RKNPU_CPU_DECODE=999999` | 55.1 | **23.4** | best on CPU (14.77) |
 | **LFM2.5-8B-A1B** Q4_0 (MoE, reasoning) | `RKNPU_HYBRID=W8A8_STANDARD` | **63.7** | 18.0 | **parity** (27.96 / 28.02) |
 | **ERNIE-4.5-21B-A3B** Q4_0 (MoE 21.8 B / 3 B) | `RKNPU_HYBRID=W8A8_STANDARD` | 25.6 | 7.4 | **parity** (6.079 / 6.088) |

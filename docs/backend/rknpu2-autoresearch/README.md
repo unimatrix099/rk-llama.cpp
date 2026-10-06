@@ -31,3 +31,10 @@ server runs. Keep threshold: +0.8 t/s over the best build so far.
 `results.tsv` is the log: 161.6 → 207.3 t/s, 6 keeps, all bit-identical.
 `mtp-check.sh` (board) is the end-of-loop MTP sanity check: `decode-check.sh`
 with the E4B drafter at n-max 1, output must match the no-draft reference.
+
+## `cpu-npu-2/` — prefill loop part 4, whole-block scheduling (2026-10-06)
+
+Loop recorded in decode research #1g. Same `verify.sh` (pp512) as `cpu-npu/`;
+`guard.sh` additionally expects the extended NPU flash-attention test to pass
+12/12 (two rounds over six cases, incl. a 4-sequence prefill case).
+`results.tsv`: 208.3 → 275.1 t/s over 30 iterations, 15 keeps.
