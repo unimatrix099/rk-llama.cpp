@@ -405,15 +405,24 @@ struct rknpu_attn_context {
     // converting both on one thread inside every run
     bool native = false;
     rknpu2_native_geom a_geom = {0, 0, 0}, c_geom = {0, 0, 0};
+    // Native B: the CPU writes K / V in the NPU's (N/subN, K/subK, subN,
+    // subK) tiling and B stays bound, instead of the driver converting a
+    // plain B on one thread at every re-bind
+    bool b_native = false;
+    int b_subN = 0, b_subK = 0;
     rknpu_attn_context(int M, int K, int N, int b_layout, int core_id) {
         static const bool want_native = []() {
             const char* env = std::getenv("RKNPU_FA_NATIVE");
             return env == nullptr || std::atoi(env) != 0;
         }();
+        static const bool want_native_b = []() {
+            const char* env = std::getenv("RKNPU_FA_NATIVE_B");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
         memset(&info, 0, sizeof(info));
         info.M = M; info.K = K; info.N = N;
         info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
-        info.B_layout = (int16_t)b_layout;
+        info.B_layout = (int16_t)(want_native && want_native_b ? RKNN_MM_LAYOUT_NATIVE : b_layout);
         info.AC_layout = want_native ? RKNN_MM_LAYOUT_NATIVE : RKNN_MM_LAYOUT_NORM;
         if (rknn_matmul_create(&ctx, &info, &io_attr) < 0) { ctx = 0; return; }
         if (want_native) {
@@ -421,9 +430,17 @@ struct rknpu_attn_context {
                      rknpu2_native_geom_from_dims(io_attr.C.dims, io_attr.C.n_dims, &c_geom) == 0 &&
                      a_geom.outer * a_geom.sub == K && c_geom.outer * c_geom.sub == N &&
                      a_geom.m_stride == M && c_geom.m_stride == M;
-            if (!native) {   // unexpected geometry: plain layout
+            if (native && info.B_layout == RKNN_MM_LAYOUT_NATIVE) {
+                const auto& d = io_attr.B.dims;
+                b_native = io_attr.B.n_dims == 4 && d[2] > 0 && d[3] > 0 && (int)(d[0] * d[2]) == N &&
+                           (int)(d[1] * d[3]) == K && d[3] <= 64 && io_attr.B.size >= (uint32_t)K * N * 2;
+                b_subN = (int)d[2]; b_subK = (int)d[3];
+            }
+            if (!native || (info.B_layout == RKNN_MM_LAYOUT_NATIVE && !b_native)) {   // unexpected geometry: plain layouts
                 rknn_matmul_destroy(ctx);
+                native = b_native = false;
                 info.AC_layout = RKNN_MM_LAYOUT_NORM;
+                info.B_layout = (int16_t)b_layout;
                 if (rknn_matmul_create(&ctx, &info, &io_attr) < 0) { ctx = 0; return; }
             }
         }
@@ -1571,18 +1588,48 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
             // B = K rows (n_kv x DK, TP_NORM) and V rows (n_kv x DV, NORM)
             uint16_t* bk = (uint16_t*)qk->B->virt_addr;
             uint16_t* bv = (uint16_t*)pv->B->virt_addr;
-            for (int64_t j = 0; j < n_kv; ++j) {
-                memcpy(bk + j * DK, k_base + j * k->nb[1] + g * k->nb[2] + ik3 * k->nb[3], DK * 2);
-                memcpy(bv + j * DV, v_base + j * v->nb[1] + g * v->nb[2] + iv3 * v->nb[3], DV * 2);
+            auto k_row = [&](int64_t j) { return (const uint16_t*)(k_base + j * k->nb[1] + g * k->nb[2] + ik3 * k->nb[3]); };
+            auto v_row = [&](int64_t j) { return (const uint16_t*)(v_base + j * v->nb[1] + g * v->nb[2] + iv3 * v->nb[3]); };
+            const bool nb = qk->b_native && pv->b_native;
+            if (nb) {
+                // Q*K^T: B(k = dim, n = position) -> runs of subK dims of one K row
+                const int sNq = qk->b_subN, sKq = qk->b_subK, kbq = (int)DK / sKq;
+                // P*V: B(k = position, n = dim) -> runs of subK positions of one dim (a transpose of V)
+                const int sNv = pv->b_subN, sKv = pv->b_subK, kbv = (int)n_kv / sKv;
+                #pragma omp parallel num_threads(n_omp)
+                {
+                    #pragma omp for nowait
+                    for (int64_t j = 0; j < n_kv; ++j) {
+                        const uint16_t* kr = k_row(j);
+                        uint16_t* base = bk + ((size_t)(j / sNq) * kbq * sNq + (j % sNq)) * sKq;
+                        for (int kb = 0; kb < kbq; ++kb) memcpy(base + (size_t)kb * sNq * sKq, kr + kb * sKq, sKq * 2);
+                    }
+                    #pragma omp for
+                    for (int64_t pb = 0; pb < kbv; ++pb) {   // a block of subK positions
+                        const uint16_t* vr[64];
+                        for (int q = 0; q < sKv; ++q) vr[q] = v_row(pb * sKv + q);
+                        for (int64_t d = 0; d < DV; ++d) {
+                            uint16_t* o = bv + (((size_t)(d / sNv) * kbv + pb) * sNv + (d % sNv)) * sKv;
+                            for (int q = 0; q < sKv; ++q) o[q] = vr[q][d];
+                        }
+                    }
+                }
+            } else {
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    memcpy(bk + j * DK, k_row(j), DK * 2);
+                    memcpy(bv + j * DV, v_row(j), DV * 2);
+                }
             }
             rknn_mem_sync(qk->ctx, qk->A, RKNN_MEMORY_SYNC_TO_DEVICE);
             rknn_mem_sync(qk->ctx, qk->B, RKNN_MEMORY_SYNC_TO_DEVICE);
             rknn_mem_sync(pv->ctx, pv->B, RKNN_MEMORY_SYNC_TO_DEVICE);
-            // Re-bind B after writing it: for a non-native B the driver converts
-            // it to its internal layout at set_io_mem time, so data written into
-            // an already-bound buffer is never seen (P*V came back all zeros)
-            RKNN_CHECK(rknn_matmul_set_io_mem(qk->ctx, qk->B, &qk->io_attr.B), "set_io_mem attn K");
-            RKNN_CHECK(rknn_matmul_set_io_mem(pv->ctx, pv->B, &pv->io_attr.B), "set_io_mem attn V");
+            if (!nb) {
+                // Re-bind B after writing it: for a non-native B the driver converts
+                // it to its internal layout at set_io_mem time, so data written into
+                // an already-bound buffer is never seen (P*V came back all zeros)
+                RKNN_CHECK(rknn_matmul_set_io_mem(qk->ctx, qk->B, &qk->io_attr.B), "set_io_mem attn K");
+                RKNN_CHECK(rknn_matmul_set_io_mem(pv->ctx, pv->B, &pv->io_attr.B), "set_io_mem attn V");
+            }
         } else if (st == 1) {
             rknn_matmul_run(qk->ctx);
             rknn_mem_sync(qk->ctx, qk->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
