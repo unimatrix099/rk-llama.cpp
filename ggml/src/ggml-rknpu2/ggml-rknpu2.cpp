@@ -556,7 +556,7 @@ struct ggml_backend_rknpu_context {
     // whole-FFN schedule (rknpu_ffn_block): gate, up and down jobs, and
     // gate's and up's chunk contexts as one runner batch
     rknpu_w4a4_job ffn_gate, ffn_up, ffn_down;
-    std::vector<std::shared_ptr<rknpu_matmul_context>> ffn_gu_ctx;
+    std::vector<std::shared_ptr<rknpu_matmul_context>> ffn_gu_ctx, ffn_gud_ctx;
 
     // (M, K, N, B layout, core) -> attention matmul context
     std::map<std::tuple<int, int, int, int, int>, std::unique_ptr<rknpu_attn_context>> attn_ctx_cache;
@@ -1265,36 +1265,38 @@ static void rknpu_ffn_fused(rknpu_w4a4_job& g, rknpu_w4a4_job& u, rknpu_w4a4_job
 }
 
 // The whole FFN [gate, up, GLU(gate, up), down] scheduled as one block, so
-// CPU phases overlap NPU batches across the three matmuls:
-//   prep(0) | NPU G0+U0 || prep(1) | NPU G1+U1 || fused(0) | NPU D0 || fused(1) | NPU D1 || collect D0 | collect D1
-// (for two chunks). Gate, up and the GLU output are never written; down's
-// output is element-exact vs the node-by-node path.
+// CPU phases overlap NPU batches across the three matmuls. NPU batch c runs
+// gate and up of chunk c together with down of chunk c-2; meanwhile the CPU
+// preps chunk c+1, runs the fused gate/up/GEGLU/down-prep of chunk c-1 and
+// collects down chunk c-3. Gate, up and the GLU output are never written;
+// down's output is element-exact vs the node-by-node path.
 static void rknpu_ffn_block(ggml_backend_rknpu_context* bctx, const struct ggml_tensor* src1, struct ggml_tensor* down_dst, int n_omp) {
     auto &g = bctx->ffn_gate, &u = bctx->ffn_up, &d = bctx->ffn_down;
     auto& gu = bctx->ffn_gu_ctx;
+    auto& gud = bctx->ffn_gud_ctx;
     gu.clear();
     gu.insert(gu.end(), g.cctx.begin(), g.cctx.end());
     gu.insert(gu.end(), u.cctx.begin(), u.cctx.end());
+    gud = gu;
+    gud.insert(gud.end(), d.cctx.begin(), d.cctx.end());
     const float* x = (const float*)get_tensor_real_ptr(src1);
     const int row_stride = (int)(src1->nb[1] / sizeof(float));
     float* out = (float*)get_tensor_real_ptr(down_dst);
     const int n = g.n_chunks;
-    auto start_gu = [&](int c) { rknpu_w4a4_job_bind(g, c); rknpu_w4a4_job_bind(u, c); bctx->async_runner.start(gu); };
+    auto start_batch = [&](int c) {   // gate/up chunk c (if any) + down chunk c - 2 (if any)
+        const bool has_gu = c < n, has_d = c >= 2 && c - 2 < n;
+        if (has_gu) { rknpu_w4a4_job_bind(g, c); rknpu_w4a4_job_bind(u, c); }
+        if (has_d) rknpu_w4a4_job_bind(d, c - 2);
+        bctx->async_runner.start(has_gu && has_d ? gud : has_gu ? gu : d.cctx);
+    };
     rknpu_ffn_prep(g, u, x, row_stride, 0, n_omp);
-    start_gu(0);
-    for (int c = 1; c < n; ++c) {
-        rknpu_ffn_prep(g, u, x, row_stride, c, n_omp);          // overlaps G/U chunk c-1
+    start_batch(0);
+    for (int c = 1; c < n + 2; ++c) {
+        if (c < n) rknpu_ffn_prep(g, u, x, row_stride, c, n_omp);   // overlaps batch c-1
         bctx->async_runner.wait();
-        start_gu(c);
-        rknpu_ffn_fused(g, u, d, c - 1, n_omp);                  // overlaps G/U chunk c
-    }
-    bctx->async_runner.wait();
-    rknpu_w4a4_job_start(bctx, d, 0);
-    rknpu_ffn_fused(g, u, d, n - 1, n_omp);                      // overlaps D chunk 0
-    for (int c = 1; c < n; ++c) {
-        bctx->async_runner.wait();
-        rknpu_w4a4_job_start(bctx, d, c);
-        rknpu_w4a4_job_collect(d, c - 1, out, n_omp);            // overlaps D chunk c
+        start_batch(c);
+        if (c - 1 < n) rknpu_ffn_fused(g, u, d, c - 1, n_omp);       // gate/up chunk c-1 done
+        if (c >= 3) rknpu_w4a4_job_collect(d, c - 3, out, n_omp);  // down chunk c-3 done
     }
     bctx->async_runner.wait();
     rknpu_w4a4_job_collect(d, n - 1, out, n_omp);
@@ -1444,7 +1446,12 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 const char* env = std::getenv("RKNPU_FFN_BLOCK");
                 return env == nullptr || std::atoi(env) != 0;
             }();
-            const int MCf = 256;
+            // chunk rows: smaller chunks shorten the schedule's head and tail
+            static const int MCf = []() {
+                const char* env = std::getenv("RKNPU_FFN_MC");
+                const int v = env ? std::atoi(env) : 128;
+                return (v >= 32 && v <= 512 && v % 32 == 0) ? v : 128;
+            }();
             if (ffn_block_enabled && rknpu_pipeline_enabled() && n_omp > 1 && node_i + 3 < cgraph->n_nodes) {
                 struct ggml_tensor* nu = cgraph->nodes[node_i + 1];
                 struct ggml_tensor* ng = cgraph->nodes[node_i + 2];
