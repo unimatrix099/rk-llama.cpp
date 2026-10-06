@@ -1459,10 +1459,21 @@ static void rknpu_ffn_block(ggml_backend_rknpu_context* bctx, const struct ggml_
         if (has_d) rknpu_w4a4_job_bind(d, c - 2);
         bctx->async_runner.start(has_gu && has_d ? gud : has_gu ? gu : d.cctx);
     };
+    // gate/up preps run ahead: batch 0 (gate/up chunk 0 alone) has no other
+    // CPU work to hide it, while every later window has a fused step, so
+    // `ahead` chunks are prepped during batch 0 (RKNPU_FFN_PREP_AHEAD; 1/2/3/all
+    // = 269.2/272.5/271.9/271.0 t/s pp512)
+    static const int ahead = []() {
+        const char* env = std::getenv("RKNPU_FFN_PREP_AHEAD");
+        return env ? std::max(1, std::atoi(env)) : 2;
+    }();
+    int prepped = 1;
     rknpu_ffn_prep(g, u, x, row_stride, 0, n_omp);
     start_batch(0);
     for (int c = 1; c < n + 2; ++c) {
-        if (c < n) rknpu_ffn_prep(g, u, x, row_stride, c, n_omp);   // overlaps batch c-1
+        while (prepped < n && prepped < c + (c == 1 ? ahead : 1)) {   // overlaps batch c-1
+            rknpu_ffn_prep(g, u, x, row_stride, prepped++, n_omp);
+        }
         bctx->async_runner.wait();
         start_batch(c);
         if (c - 1 < n) rknpu_ffn_fused(g, u, d, c - 1, n_omp);       // gate/up chunk c-1 done
