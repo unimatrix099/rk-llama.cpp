@@ -49,15 +49,18 @@ void quantize_fp32_to_int4_packed(const float * src, uint8_t * dst, size_t n_ele
     size_t i2 = 0;   // element index (pairs consumed below as i2/2)
 #ifdef __ARM_NEON
     const float32x4_t vi = vdupq_n_f32(iscale);
-    const int32x4_t lo = vdupq_n_s32(-7), hi = vdupq_n_s32(7);
     for (; i2 + 16 <= n_elements; i2 += 16) {
-        int32x4_t a = vmaxq_s32(lo, vminq_s32(hi, vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i2),      vi))));
-        int32x4_t b = vmaxq_s32(lo, vminq_s32(hi, vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i2 + 4),  vi))));
-        int32x4_t c = vmaxq_s32(lo, vminq_s32(hi, vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i2 + 8),  vi))));
-        int32x4_t d = vmaxq_s32(lo, vminq_s32(hi, vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i2 + 12), vi))));
-        int16x8_t ab = vcombine_s16(vmovn_s32(a), vmovn_s32(b));
-        int16x8_t cd = vcombine_s16(vmovn_s32(c), vmovn_s32(d));
-        uint8x16_t u = vreinterpretq_u8_s8(vcombine_s8(vmovn_s16(ab), vmovn_s16(cd)));
+        // saturating narrows to int8, then one clamp of all 16: the same
+        // values as clamping each int32 (the [-7, 7] range fits in int8)
+        int32x4_t a = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i2),      vi));
+        int32x4_t b = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i2 + 4),  vi));
+        int32x4_t c = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i2 + 8),  vi));
+        int32x4_t d = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i2 + 12), vi));
+        int16x8_t ab = vcombine_s16(vqmovn_s32(a), vqmovn_s32(b));
+        int16x8_t cd = vcombine_s16(vqmovn_s32(c), vqmovn_s32(d));
+        int8x16_t q = vcombine_s8(vqmovn_s16(ab), vqmovn_s16(cd));
+        q = vmaxq_s8(vdupq_n_s8(-7), vminq_s8(vdupq_n_s8(7), q));
+        uint8x16_t u = vreinterpretq_u8_s8(q);
         uint8x8x2_t z = vuzp_u8(vget_low_u8(u), vget_high_u8(u));
         uint8x8_t packed = vorr_u8(vand_u8(z.val[0], vdup_n_u8(0x0F)),
                                    vshl_n_u8(vand_u8(z.val[1], vdup_n_u8(0x0F)), 4));
