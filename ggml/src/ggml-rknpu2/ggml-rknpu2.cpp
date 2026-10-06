@@ -942,6 +942,80 @@ static void rknpu_softmax_row(const float* s_row, const ggml_fp16_t* mrow, int64
 // split. Same NEON tanh-GELU as ggml-cpu's ggml_vec_geglu_f32 on ARM
 // (tanh(z) = 1 - 2/(e^{2z}+1) via the same exp, +-10 cut-offs), so the
 // output is identical for widths that are multiples of 4.
+// Per-head RMS norms of attention projections (Gemma-4's q/k/v norms):
+// RMS_NORM of a reshaped matmul output, optionally times a per-head
+// weight. Computed exactly as ggml-cpu does (double-precision sum of
+// squares over four 2-lane accumulators, (x*scale)*w), so the backend can
+// take these ops and fuse them into the matmul's dequant (RKNPU_HEAD_NORM).
+static bool rknpu_head_norm_enabled() {
+    static const bool v = []() {
+        const char* env = std::getenv("RKNPU_HEAD_NORM");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return v;
+}
+static bool rknpu_head_norm_supported(const struct ggml_tensor* op) {
+    const struct ggml_tensor* a = op->src[0];
+    return op->op == GGML_OP_RMS_NORM && a && (a->op == GGML_OP_RESHAPE || a->op == GGML_OP_VIEW) &&
+           a->view_src && a->view_src->op == GGML_OP_MUL_MAT && a->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(a) && ggml_is_contiguous(op) && a->ne[0] % 8 == 0;
+}
+// the weight operand of a supported per-head norm's MUL, or nullptr
+static const struct ggml_tensor* rknpu_head_norm_weight(const struct ggml_tensor* op) {
+    if (op->op != GGML_OP_MUL || !op->src[0] || !op->src[1]) return nullptr;
+    const struct ggml_tensor* n = rknpu_head_norm_supported(op->src[0]) ? op->src[0] : rknpu_head_norm_supported(op->src[1]) ? op->src[1] : nullptr;
+    if (!n) return nullptr;
+    const struct ggml_tensor* w = op->src[0] == n ? op->src[1] : op->src[0];
+    if (w->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || w->ne[0] != n->ne[0] || ggml_nrows(w) != 1 ||
+        w->nb[0] != sizeof(float) || !ggml_is_contiguous(op) || !ggml_are_same_shape(op, n)) return nullptr;
+    return w;
+}
+static inline double rknpu_rms_sumsq(const float* x, int64_t n) {
+    double sum = 0.0;
+    int64_t i = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    float64x2_t s0 = vdupq_n_f64(0.0), s1 = s0, s2 = s0, s3 = s0;
+    for (; i + 8 <= n; i += 8) {
+        const float32x4_t a = vld1q_f32(x + i), b = vld1q_f32(x + i + 4);
+        const float32x4_t pa = vmulq_f32(a, a), pb = vmulq_f32(b, b);
+        s0 = vaddq_f64(s0, vcvt_f64_f32(vget_low_f32(pa)));
+        s1 = vaddq_f64(s1, vcvt_high_f64_f32(pa));
+        s2 = vaddq_f64(s2, vcvt_f64_f32(vget_low_f32(pb)));
+        s3 = vaddq_f64(s3, vcvt_high_f64_f32(pb));
+    }
+    sum = vaddvq_f64(vaddq_f64(vaddq_f64(s0, s1), vaddq_f64(s2, s3)));
+#endif
+    for (; i < n; i++) sum += (double)(x[i] * x[i]);
+    return sum;
+}
+// one head: y = rms_norm(x) [* w]
+static inline void rknpu_head_norm(float* y, const float* x, int64_t n, float eps, const float* w) {
+    const float mean  = rknpu_rms_sumsq(x, n) / n;
+    const float scale = 1.0f / sqrtf(mean + eps);
+    int64_t j = 0;
+#ifdef __ARM_NEON
+    const float32x4_t vs = vdupq_n_f32(scale);
+    if (w) {
+        for (; j + 4 <= n; j += 4) vst1q_f32(y + j, vmulq_f32(vmulq_f32(vld1q_f32(x + j), vs), vld1q_f32(w + j)));
+    } else {
+        for (; j + 4 <= n; j += 4) vst1q_f32(y + j, vmulq_f32(vld1q_f32(x + j), vs));
+    }
+#endif
+    for (; j < n; j++) y[j] = w ? x[j] * scale * w[j] : x[j] * scale;
+}
+// standalone: the norm node, fused with its weight MUL when that is `mul`
+static void rknpu_head_norm_op(struct ggml_tensor* norm, struct ggml_tensor* mul, int n_omp) {
+    const float* x = (const float*)get_tensor_real_ptr(norm->src[0]);
+    float eps;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    const struct ggml_tensor* wt = mul ? rknpu_head_norm_weight(mul) : nullptr;
+    const float* w = wt ? (const float*)get_tensor_real_ptr(wt) : nullptr;
+    float* y = (float*)get_tensor_real_ptr(mul ? mul : norm);
+    const int64_t hd = norm->ne[0], nr = ggml_nrows(norm);
+    #pragma omp parallel for num_threads(n_omp)
+    for (int64_t r = 0; r < nr; ++r) rknpu_head_norm(y + r * hd, x + r * hd, hd, eps, w);
+}
+
 static bool rknpu_glu_supported(const struct ggml_tensor* op) {
     if (ggml_get_glu_op(op) != GGML_GLU_OP_GEGLU) return false;
     const struct ggml_tensor *a = op->src[0], *b = op->src[1];
@@ -1800,6 +1874,40 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
         }
         if (node->op == GGML_OP_GLU) {
             rknpu_geglu(node, n_omp);
+            continue;
+        }
+        if (node->op == GGML_OP_RMS_NORM) {   // per-head norm not fused into its matmul
+            struct ggml_tensor* mul = nullptr;
+            for (int j = node_i + 1; j < cgraph->n_nodes; ++j) {
+                struct ggml_tensor* t = cgraph->nodes[j];
+                if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_NONE) continue;
+                if (t->op == GGML_OP_MUL && (t->src[0] == node || t->src[1] == node) && rknpu_head_norm_weight(t)) {
+                    // fuse only if the MUL is the norm's sole consumer
+                    bool sole = true;
+                    for (int q2 = node_i + 1; q2 < cgraph->n_nodes && sole; ++q2) {
+                        const struct ggml_tensor* u = cgraph->nodes[q2];
+                        if (u == t) continue;
+                        if (u->view_src == node) sole = false;
+                        for (int q = 0; q < GGML_MAX_SRC; ++q) sole = sole && u->src[q] != node;
+                    }
+                    if (sole && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) { mul = t; node_i = j; }
+                }
+                break;
+            }
+            rknpu_head_norm_op(node, mul, n_omp);
+            continue;
+        }
+        if (node->op == GGML_OP_MUL) {   // a weight MUL whose norm ran separately
+            const struct ggml_tensor* w = rknpu_head_norm_weight(node);
+            const struct ggml_tensor* n = node->src[0] == w ? node->src[1] : node->src[0];
+            const float* x = (const float*)get_tensor_real_ptr(n);
+            const float* wp = (const float*)get_tensor_real_ptr(w);
+            float* y = (float*)get_tensor_real_ptr(node);
+            const int64_t hd = node->ne[0], nr = ggml_nrows(node);
+            #pragma omp parallel for num_threads(n_omp)
+            for (int64_t r = 0; r < nr; ++r) {
+                for (int64_t i = 0; i < hd; ++i) y[r * hd + i] = x[r * hd + i] * wp[i];
+            }
             continue;
         }
         if (node->op != GGML_OP_MUL_MAT) continue;
@@ -3351,6 +3459,12 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
     switch (op->op) {
         case GGML_OP_NONE:
             return true;
+
+        case GGML_OP_RMS_NORM:
+            return rknpu_head_norm_enabled() && rknpu_head_norm_supported(op);
+
+        case GGML_OP_MUL:
+            return rknpu_head_norm_enabled() && rknpu_head_norm_weight(op) != nullptr;
 
         case GGML_OP_GLU: {
             static const bool glu_enabled = []() {
