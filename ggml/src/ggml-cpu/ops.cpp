@@ -4105,13 +4105,55 @@ enum ggml_rms_norm_fuse_op {
     GGML_RMS_NORM_FUSE_OP_MUL_ADD_SCALE,   // (rms_norm(x) * w + r) * k, k a one-element tensor
 };
 
+// sum of squares of one row, as every rms_norm path computes it (fused
+// chains must reproduce it exactly)
+static inline ggml_float ggml_rms_sumsq_f32(const float * x, int64_t ne00) {
+    ggml_float sum = 0.0;
+    int64_t i00 = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    // fp32 products as below, accumulated in double over four
+    // independent 2-lane accumulators (the scalar loop is one
+    // dependent double-add chain)
+    float64x2_t s0 = vdupq_n_f64(0.0), s1 = s0, s2 = s0, s3 = s0;
+    for (; i00 + 8 <= ne00; i00 += 8) {
+        const float32x4_t a = vld1q_f32(x + i00), b = vld1q_f32(x + i00 + 4);
+        const float32x4_t pa = vmulq_f32(a, a), pb = vmulq_f32(b, b);
+        s0 = vaddq_f64(s0, vcvt_f64_f32(vget_low_f32(pa)));
+        s1 = vaddq_f64(s1, vcvt_high_f64_f32(pa));
+        s2 = vaddq_f64(s2, vcvt_f64_f32(vget_low_f32(pb)));
+        s3 = vaddq_f64(s3, vcvt_high_f64_f32(pb));
+    }
+    sum = vaddvq_f64(vaddq_f64(vaddq_f64(s0, s1), vaddq_f64(s2, s3)));
+#endif
+    for (; i00 < ne00; i00++) {
+        sum += (ggml_float)(x[i00] * x[i00]);
+    }
+    return sum;
+}
+
+// y[j] = x[j] * scale * w[j] (the fused RMS_NORM + MUL output)
+static inline void ggml_rms_scale_mul_f32(float * y, const float * x, float scale, const float * w, int64_t ne00) {
+    int64_t j = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    const float32x4_t vs = vdupq_n_f32(scale);
+    for (; j + 4 <= ne00; j += 4) {   // (x*scale)*w, same order as below
+        vst1q_f32(y + j, vmulq_f32(vmulq_f32(vld1q_f32(x + j), vs), vld1q_f32(w + j)));
+    }
+#endif
+    for (; j < ne00; j++) {
+        y[j] = x[j] * scale * w[j];
+    }
+}
+
 template <ggml_rms_norm_fuse_op FUSE_OP>
 static void ggml_compute_forward_rms_norm_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst_rms_norm,
         ggml_tensor * dst_fused = nullptr,
         ggml_tensor * dst_add = nullptr,
-        ggml_tensor * dst_scale = nullptr) {
+        ggml_tensor * dst_scale = nullptr,
+        ggml_tensor * nx_norm = nullptr,
+        ggml_tensor * nx_mul = nullptr) {
 
     const ggml_tensor * src0 = dst_rms_norm->src[0];
     const ggml_tensor * src1 = nullptr;
@@ -4153,26 +4195,7 @@ static void ggml_compute_forward_rms_norm_f32(
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 
-                ggml_float sum = 0.0;
-                int64_t i00 = 0;
-#if defined(__ARM_NEON) && defined(__aarch64__)
-                // fp32 products as below, accumulated in double over four
-                // independent 2-lane accumulators (the scalar loop is one
-                // dependent double-add chain)
-                float64x2_t s0 = vdupq_n_f64(0.0), s1 = s0, s2 = s0, s3 = s0;
-                for (; i00 + 8 <= ne00; i00 += 8) {
-                    const float32x4_t a = vld1q_f32(x + i00), b = vld1q_f32(x + i00 + 4);
-                    const float32x4_t pa = vmulq_f32(a, a), pb = vmulq_f32(b, b);
-                    s0 = vaddq_f64(s0, vcvt_f64_f32(vget_low_f32(pa)));
-                    s1 = vaddq_f64(s1, vcvt_high_f64_f32(pa));
-                    s2 = vaddq_f64(s2, vcvt_f64_f32(vget_low_f32(pb)));
-                    s3 = vaddq_f64(s3, vcvt_high_f64_f32(pb));
-                }
-                sum = vaddvq_f64(vaddq_f64(vaddq_f64(s0, s1), vaddq_f64(s2, s3)));
-#endif
-                for (; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
-                }
+                const ggml_float sum = ggml_rms_sumsq_f32(x, ne00);
 
                 const float mean  = sum/ne00;
                 const float scale = 1.0f/sqrtf(mean + eps);
@@ -4208,6 +4231,19 @@ static void ggml_compute_forward_rms_norm_f32(
                         float t = p + r[j];
                         if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD_SCALE) t = t * k_scale;
                         y[j] = t;
+                    }
+                    if (nx_mul) {
+                        // the next RMS_NORM + MUL of this row, while it is in cache
+                        float eps2;
+                        memcpy(&eps2, nx_norm->op_params, sizeof(float));
+                        const ggml_tensor * w2t = (nx_mul->src[0] == nx_norm) ? nx_mul->src[1] : nx_mul->src[0];
+                        const ggml_float sum2 = ggml_rms_sumsq_f32(y, ne00);
+                        const float mean2  = sum2/ne00;
+                        const float scale2 = 1.0f/sqrtf(mean2 + eps2);
+                        const float * w2 = (float *) ((char *) w2t->data + (i01 % w2t->ne[1])*w2t->nb[1] +
+                                                      (i02 % w2t->ne[2])*w2t->nb[2] + (i03 % w2t->ne[3])*w2t->nb[3]);
+                        float * z = (float *) ((char *) nx_mul->data + i01*nx_mul->nb[1] + i02*nx_mul->nb[2] + i03*nx_mul->nb[3]);
+                        ggml_rms_scale_mul_f32(z, y, scale2, w2, ne00);
                     }
                 } else if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
                     const int64_t i11 = i01 % ne11;
@@ -4258,9 +4294,11 @@ void ggml_compute_forward_rms_norm_mul_add_fused(
         const ggml_compute_params * params,
         ggml_tensor * dst_rms_norm,
         ggml_tensor * dst_mul,
-        ggml_tensor * dst_add) {
+        ggml_tensor * dst_add,
+        ggml_tensor * nx_norm,
+        ggml_tensor * nx_mul) {
     GGML_ASSERT(dst_rms_norm->src[0]->type == GGML_TYPE_F32);
-    ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_MUL_ADD>(params, dst_rms_norm, dst_mul, dst_add);
+    ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_MUL_ADD>(params, dst_rms_norm, dst_mul, dst_add, nullptr, nx_norm, nx_mul);
 }
 
 void ggml_compute_forward_rms_norm_mul_add_scale_fused(
@@ -4268,9 +4306,11 @@ void ggml_compute_forward_rms_norm_mul_add_scale_fused(
         ggml_tensor * dst_rms_norm,
         ggml_tensor * dst_mul,
         ggml_tensor * dst_add,
-        ggml_tensor * dst_scale) {
+        ggml_tensor * dst_scale,
+        ggml_tensor * nx_norm,
+        ggml_tensor * nx_mul) {
     GGML_ASSERT(dst_rms_norm->src[0]->type == GGML_TYPE_F32);
-    ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_MUL_ADD_SCALE>(params, dst_rms_norm, dst_mul, dst_add, dst_scale);
+    ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_MUL_ADD_SCALE>(params, dst_rms_norm, dst_mul, dst_add, dst_scale, nx_norm, nx_mul);
 }
 
 void ggml_compute_forward_rms_norm_mul_fused(
