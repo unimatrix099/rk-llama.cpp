@@ -504,21 +504,6 @@ struct rknpu_deferred_gate {
     const float* chan = nullptr;          // per-channel B scales (pointer-stable map value)
 };
 
-// The down projection's A rows, prepared (Hadamard + INT4) inside the up
-// matmul's fused gate/up/GEGLU collect while each GEGLU row is still in
-// cache: the GLU output is never written, and down's prep only scatters
-// the staged rows into its A buffers. Element-exact vs prepping from the
-// written GLU output (same functions on the same values).
-struct rknpu_prepped_a {
-    const struct ggml_tensor* consumer = nullptr;   // the down matmul
-    int M = 0, K = 0;
-    std::vector<int> seg_off, seg_len;              // K-segments, on Hadamard block bounds
-    std::vector<std::vector<uint8_t>> packed;       // [seg] M rows of seg_len / 2 bytes
-    std::vector<std::vector<float>> scales;         // [seg] M A-scales
-    const float* s_vec = nullptr;                   // down's Hadamard signs (pointer-stable map value)
-    float a_clip = 1.0f;
-};
-
 // Backend main context
 struct ggml_backend_rknpu_context {
     std::string name;
@@ -537,7 +522,6 @@ struct ggml_backend_rknpu_context {
     rknpu_dispatch_pool dispatch_pool;
     rknpu_async_runner async_runner;
     rknpu_deferred_gate deferred_gate;
-    rknpu_prepped_a prepped_a;
 
     // (M, K, N, B layout, core) -> attention matmul context
     std::map<std::tuple<int, int, int, int, int>, std::unique_ptr<rknpu_attn_context>> attn_ctx_cache;
@@ -945,40 +929,6 @@ static void __attribute__((noinline)) rknpu_fused_gate_up_geglu_block(
     }
 }
 
-// rknpu_fused_gate_up_geglu_block, but each GEGLU row goes through the down
-// matmul's A-prep (per K-segment: Hadamard range, amax, INT4 pack) into
-// pa's staging instead of being written out
-static void __attribute__((noinline)) rknpu_fused_gate_up_geglu_prep_block(
-        rknpu_prepped_a& pa, const rknpu_deferred_gate& dg, int chunk, int m_abs, int r0, int nr, int N,
-        const float* common, const std::vector<std::shared_ptr<rknn_tensor_mem>>& c_mem,
-        const std::vector<rknpu2_native_geom>& c_geom, const std::vector<MatrixSegmentN>& segs, const float* chan) {
-    static thread_local std::vector<float> ubuf, gbuf, yrow, full_row;
-    auto grow = [](std::vector<float>& v, size_t n) { if (v.size() < n) v.resize(n); };
-    grow(ubuf, (size_t)4 * N);
-    grow(gbuf, (size_t)4 * N);
-    grow(yrow, (size_t)N);
-    for (size_t idx = 0; idx < segs.size(); ++idx) {
-        const int N_offset = segs[idx].offset_n;
-        rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
-            ubuf.data() + N_offset, (size_t)N, (const int16_t*)c_mem[idx]->virt_addr, r0, nr,
-            c_geom[idx].m_stride, c_geom[idx].outer, c_geom[idx].sub, segs[idx].size_n, common,
-            chan + N_offset, /*store=*/ true);
-    }
-    rknpu_deferred_gate_rows(dg, gbuf.data(), (size_t)N, chunk, r0, nr);
-    for (int r = 0; r < nr; ++r) {
-        const int m = m_abs + r;
-        rknpu_geglu_row(N, yrow.data(), gbuf.data() + (size_t)r * N, ubuf.data() + (size_t)r * N);
-        for (size_t s = 0; s < pa.seg_off.size(); ++s) {
-            const int len = pa.seg_len[s];
-            grow(full_row, (size_t)len);
-            rknpu2_calibration::hadamard_transform_signed_range(full_row.data(), yrow.data(), pa.s_vec, pa.K, pa.seg_off[s], len);
-            const float sc = pa.a_clip * rknpu2_quantization::amax_fp32(full_row.data(), len) / 7.0f;
-            pa.scales[s][m] = sc;
-            rknpu2_quantization::quantize_fp32_to_int4_packed(full_row.data(), pa.packed[s].data() + (size_t)m * (len / 2), len, sc);
-        }
-    }
-}
-
 static bool rknpu_fa_supported(const struct ggml_tensor* op) {
     const struct ggml_tensor *q = op->src[0], *k = op->src[1], *v = op->src[2], *mask = op->src[3], *sinks = op->src[4];
     if (!q || !k || !v || sinks) return false;
@@ -1368,74 +1318,6 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 const bool use_dg = dg.gate != nullptr && pipelined_node && fused_now && fuse_glu->src[0] == dg.gate &&
                                     dg.up == node && dg.M == M && dg.N == N && dg.MC == MC;
                 if (dg.gate && !use_dg) rknpu_materialize_deferred_gate(dg, n_omp);
-                // Stage the down projection's A-prep here when [.., up, GLU,
-                // down] and nothing else reads the GLU (rknpu_prepped_a). The
-                // down node must then take the pipelined path; the checks
-                // below mirror pipelined_node and seg_on_blocks for it.
-                auto& pa = backend_ctx->prepped_a;
-                bool stage_down = false;
-                {
-                    static const bool prep_down_enabled = []() {
-                        const char* env = std::getenv("RKNPU_PREP_DOWN");
-                        return env == nullptr || std::atoi(env) != 0;
-                    }();
-                    const struct ggml_tensor* down = use_dg && node_i + 2 < cgraph->n_nodes ? cgraph->nodes[node_i + 2] : nullptr;
-                    if (prep_down_enabled && down && down->op == GGML_OP_MUL_MAT && down->src[1] == fuse_glu &&
-                        !(fuse_glu->flags & GGML_TENSOR_FLAG_OUTPUT) && down->src[0]->buffer &&
-                        strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(down->src[0]->buffer)), "RKNPU") == 0 &&
-                        down->src[1]->ne[2] * down->src[1]->ne[3] == 1 && (int)down->src[0]->ne[0] == N &&
-                        ggml_is_contiguous(fuse_glu)) {
-                        const struct ggml_tensor* w = down->src[0];
-                        const auto* dp = config.resolve_op_support(w);
-                        const int Kd = (int)w->ne[0];
-                        stage_down = dp && dp->use_hadamard && rknpu2_calibration::hadamard_k_op(Kd) == Kd &&
-                            dp->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4 &&
-                            dp->npu_type_c == rknpu2_configuration::NPU_TYPE_INT16 &&
-                            dp->ac_layout == RKNN_MM_LAYOUT_NATIVE &&
-                            (dp->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4 || dp->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8);
-                        for (int j = node_i + 3; j < cgraph->n_nodes && stage_down; ++j) {
-                            const struct ggml_tensor* t = cgraph->nodes[j];
-                            if (t->view_src == fuse_glu) stage_down = false;
-                            for (int q = 0; q < GGML_MAX_SRC; ++q) stage_down = stage_down && t->src[q] != fuse_glu;
-                        }
-                        if (stage_down) {
-                            int kl = config.max_k_limit;
-                            if (dp->effective_k > 0) kl = (kl > 0) ? std::min(kl, dp->effective_k) : dp->effective_k;
-                            const auto ksegs = compute_k_segments(Kd, kl, dp->k_align);
-                            const int hb = rknpu2_calibration::hadamard_block_len(Kd);
-                            auto* wctx = (ggml_backend_rknpu_buffer_context*)w->buffer->context;
-                            const float* sv = nullptr;
-                            {
-                                std::lock_guard<std::mutex> lock(wctx->mutex);
-                                auto it = wctx->hadamard_s_vectors.find(w);
-                                if (it != wctx->hadamard_s_vectors.end()) sv = it->second.data();
-                            }
-                            stage_down = sv != nullptr;
-                            for (const auto& ks : ksegs) stage_down = stage_down && ks.offset_k % hb == 0 && ks.size_k % hb == 0;
-                            if (stage_down) {
-                                pa.consumer = down;
-                                pa.M = M; pa.K = Kd; pa.s_vec = sv;
-                                pa.a_clip = rknpu2_calibration::a_clip_factor();
-                                pa.seg_off.clear(); pa.seg_len.clear();
-                                for (const auto& ks : ksegs) { pa.seg_off.push_back(ks.offset_k); pa.seg_len.push_back(ks.size_k); }
-                                pa.packed.resize(ksegs.size());
-                                pa.scales.resize(ksegs.size());
-                                for (size_t q = 0; q < ksegs.size(); ++q) {
-                                    pa.packed[q].resize((size_t)M * (ksegs[q].size_k / 2));
-                                    pa.scales[q].resize(M);
-                                }
-                            }
-                        }
-                    }
-                }
-                // this node consumes staged rows (it is the down of the previous up)
-                const bool use_pa = pa.consumer == node;
-                if (use_pa) {
-                    GGML_ASSERT(pipelined_node && is_hadamard && pa.M == M && pa.K == K &&
-                                pa.seg_off.size() == all_k_segments.size() &&
-                                pa.seg_off[k_idx] == k_seg.offset_k && pa.seg_len[k_idx] == K_seg_op &&
-                                "RKNPU: staged down-projection rows do not match the node");
-                }
                 if (pipelined_node) {
                     const int n_chunks = (M + MC - 1) / MC;
                     // chunk contexts (M_op = MC), B bound once per context
@@ -1524,19 +1406,6 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         }
                         RKNN_CHECK(rknn_mem_sync(cctx[0]->ctx, a_slot[c & 1].get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A chunk");
                     };
-                    auto prep_staged = [&](int c) {
-                        const int m0 = c * MC, rows = std::min(MC, M - m0);
-                        uint8_t* dst_a = (uint8_t*)a_slot[c & 1]->virt_addr;
-                        const uint8_t* src = pa.packed[k_idx].data();
-                        const size_t rb = (size_t)K_seg_op / 2;
-                        #pragma omp parallel for num_threads(n_omp)
-                        for (int r = 0; r < rows; ++r) {
-                            const int m = m0 + r;
-                            scales_A[m] = pa.scales[k_idx][m];
-                            rknpu2_native_scatter_row(dst_a, src + (size_t)m * rb, r, a_geom.m_stride, a_geom.outer, a_geom.sub / 2);
-                        }
-                        RKNN_CHECK(rknn_mem_sync(cctx[0]->ctx, a_slot[c & 1].get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A chunk");
-                    };
                     auto start = [&](int c) {
                         for (size_t idx = 0; idx < num_active_segments; ++idx) {
                             auto& mc = cctx[idx];
@@ -1609,13 +1478,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                             const int nr = std::min(4, rows - r0);
                             float common[4];
                             for (int r = 0; r < nr; ++r) common[r] = scales_A[m0 + r0 + r] / hadamard_divisor;
-                            if (stage_down) {
-                                rknpu_fused_gate_up_geglu_prep_block(pa, dg, c, m0 + r0, r0, nr, N, common,
-                                    cslot(c), c_geom, active_n_segments, scales_B_grid->data() + k_idx * (size_t)N);
-                            } else {
-                                rknpu_fused_gate_up_geglu_block(fuse_glu, dg, c, m0 + r0, r0, nr, N, common,
-                                    cslot(c), c_geom, active_n_segments, scales_B_grid->data() + k_idx * (size_t)N);
-                            }
+                            rknpu_fused_gate_up_geglu_block(fuse_glu, dg, c, m0 + r0, r0, nr, N, common,
+                                cslot(c), c_geom, active_n_segments, scales_B_grid->data() + k_idx * (size_t)N);
                         }
                     };
                     // deferred gate: C synced for the CPU, kept for the up's collect
@@ -1632,11 +1496,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     };
 
                     const auto t_run = g_rknpu_profile.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                    auto prep_any = [&](int c) { if (use_pa) prep_staged(c); else prep(c); };
-                    prep_any(0);
+                    prep(0);
                     start(0);
                     for (int c = 1; c < n_chunks; ++c) {
-                        prep_any(c);                     // overlaps NPU chunk c-1
+                        prep(c);                         // overlaps NPU chunk c-1
                         backend_ctx->async_runner.wait();
                         start(c);
                         collect_any(c - 1);   // overlaps NPU chunk c
@@ -1647,7 +1510,6 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         dg.gate = nullptr;
                         dg.up = nullptr;
                     }
-                    if (use_pa && k_idx + 1 == all_k_segments.size()) pa.consumer = nullptr;
                     if (defer_gate) {
                         dg.gate = node;
                         dg.up = cgraph->nodes[node_i + 1];
