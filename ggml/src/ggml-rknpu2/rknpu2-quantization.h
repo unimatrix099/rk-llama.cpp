@@ -104,6 +104,14 @@ void dequant_acc_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const 
                                           int32_t m0, int32_t nrows, int32_t m_stride, int32_t outer, int32_t sub,
                                           int32_t n_limit, const float * common, const float * chan_scales,
                                           bool store = false);
+// Two K-segments at once, stored: dst = c0 * (cs0 * common0) then
+// fma(c1, cs1 * common1, .) — element-exact vs a store pass over src0
+// followed by an accumulate pass over src1, without re-reading dst.
+// Both sources share one native geometry.
+void dequant2_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const int16_t * src0, const int16_t * src1,
+                                       int32_t m0, int32_t nrows, int32_t m_stride, int32_t outer, int32_t sub,
+                                       int32_t n_limit, const float * common0, const float * common1,
+                                       const float * chan0, const float * chan1);
 
 /**
  * @brief Per-output-channel dequantize-accumulate for INT32 C matrices
