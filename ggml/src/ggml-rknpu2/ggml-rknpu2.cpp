@@ -1685,9 +1685,14 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
             if (native) {
                 #pragma omp parallel for num_threads(n_omp)
                 for (int64_t r0 = 0; r0 < M; r0 += FR) {
+                    // gather into a local block, then write whole rows: the
+                    // destination rows are interleaved by head, far apart
+                    static thread_local std::vector<float> o_buf;
+                    if ((int64_t)o_buf.size() < FR * DV) o_buf.resize(FR * DV);
                     uint8_t* rows[512];
-                    for (int k = 0; k < FR; ++k) rows[k] = (uint8_t*)d_row(r0 + k);
+                    for (int k = 0; k < FR; ++k) rows[k] = (uint8_t*)(o_buf.data() + k * DV);
                     rknpu_native_gather_rows(rows, FR, (const uint8_t*)O, (int)r0, pv->c_geom, pv->c_geom.sub * 4);
+                    for (int k = 0; k < FR; ++k) memcpy(d_row(r0 + k), o_buf.data() + k * DV, DV * sizeof(float));
                 }
             } else {
                 #pragma omp parallel for num_threads(n_omp)
