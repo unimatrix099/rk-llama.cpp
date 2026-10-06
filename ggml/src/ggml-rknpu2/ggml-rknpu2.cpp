@@ -432,6 +432,10 @@ struct rknpu_attn_context {
 // time blocked in rknn_matmul_run, so they do not compete for cores with the
 // team. Used only by the pipelined prefill path, where a job lasts tens of
 // milliseconds and condition-variable wake-up latency is irrelevant.
+// CPU time spent blocked in rknpu_async_runner::wait (NPU work not hidden
+// behind CPU work), reported by RKNPU_PROFILE
+static std::atomic<uint64_t> g_rknpu_wait_ns{0};
+
 struct rknpu_async_runner {
     void start(const std::vector<std::shared_ptr<rknpu_matmul_context>>& ctxs) {
         std::unique_lock<std::mutex> lock(mutex);
@@ -450,9 +454,11 @@ struct rknpu_async_runner {
         cv_start.notify_all();
     }
     void wait() {
+        const auto t0 = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lock(mutex);
         cv_done.wait(lock, [this] { return pending == 0; });
         job = nullptr;
+        g_rknpu_wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
     }
     ~rknpu_async_runner() {
         {
@@ -702,9 +708,9 @@ struct rknpu_profile {
         auto now = std::chrono::steady_clock::now();
         if (ns(t_print, now) < 5000000000ull) return;
         t_print = now;
-        fprintf(stderr, "RKNPU_PROFILE t=%.1fs graphs=%llu nodes=%llu graph=%.1fms node=%.1fms npu_run=%.1fms\n",
+        fprintf(stderr, "RKNPU_PROFILE t=%.1fs graphs=%llu nodes=%llu graph=%.1fms node=%.1fms npu_run=%.1fms npu_wait=%.1fms\n",
                 ns(t_start, now) / 1e9, (unsigned long long)graphs, (unsigned long long)nodes,
-                graph_ns / 1e6, node_ns / 1e6, run_ns / 1e6);
+                graph_ns / 1e6, node_ns / 1e6, run_ns / 1e6, g_rknpu_wait_ns.load() / 1e6);
     }
 };
 static rknpu_profile g_rknpu_profile;
