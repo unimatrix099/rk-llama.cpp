@@ -475,18 +475,6 @@ struct rknpu_attn_context {
 // behind CPU work), reported by RKNPU_PROFILE
 static std::atomic<uint64_t> g_rknpu_wait_ns{0};
 
-// The runner's workers invalidate each context's C buffer for the CPU right
-// after its run (RKNPU_SYNC_IN_RUNNER, default on): the cache maintenance
-// then runs on the worker, in parallel and off the critical path, instead
-// of serially on the main thread before every collect
-static bool rknpu_sync_in_runner() {
-    static const bool v = []() {
-        const char* env = std::getenv("RKNPU_SYNC_IN_RUNNER");
-        return env == nullptr || std::atoi(env) != 0;
-    }();
-    return v;
-}
-
 struct rknpu_async_runner {
     void start(const std::vector<std::shared_ptr<rknpu_matmul_context>>& ctxs) {
         std::unique_lock<std::mutex> lock(mutex);
@@ -531,11 +519,7 @@ struct rknpu_async_runner {
                 j = job;
             }
             if (j && idx < (int)j->size()) {
-                auto& mc = (*j)[idx];
-                mc->run();
-                if (rknpu_sync_in_runner() && mc->bound_C) {
-                    rknn_mem_sync(mc->ctx, const_cast<rknn_tensor_mem*>(mc->bound_C), RKNN_MEMORY_SYNC_FROM_DEVICE);
-                }
+                (*j)[idx]->run();
                 std::lock_guard<std::mutex> lock(mutex);
                 if (--pending == 0) cv_done.notify_all();
             }
@@ -1231,7 +1215,7 @@ static void rknpu_w4a4_job_start(ggml_backend_rknpu_context* bctx, rknpu_w4a4_jo
 static void rknpu_w4a4_job_collect(rknpu_w4a4_job& j, int c, float* dst, int n_omp) {
     const int ns = (int)j.seg_off.size();
     for (size_t q = 0; q < j.cctx.size(); ++q) {
-        if (!rknpu_sync_in_runner()) RKNN_CHECK(rknn_mem_sync(j.cctx[q]->ctx, j.c[c & 1][q].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C down chunk");
+        RKNN_CHECK(rknn_mem_sync(j.cctx[q]->ctx, j.c[c & 1][q].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C down chunk");
     }
     const int m0 = c * j.MC, rows = std::min(j.MC, j.M - m0);
     const int n_blocks = (rows + 3) / 4;
@@ -1460,7 +1444,7 @@ static void __attribute__((noinline)) rknpu_ffn_fused_block(rknpu_w4a4_job& g, r
 static void rknpu_ffn_fused(rknpu_w4a4_job& g, rknpu_w4a4_job& u, rknpu_w4a4_job& d, int c, int n_omp) {
     for (rknpu_w4a4_job* j : {&g, &u}) {
         for (size_t q = 0; q < j->cctx.size(); ++q) {
-            if (!rknpu_sync_in_runner()) RKNN_CHECK(rknn_mem_sync(j->cctx[q]->ctx, j->c[c & 1][q].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C ffn chunk");
+            RKNN_CHECK(rknn_mem_sync(j->cctx[q]->ctx, j->c[c & 1][q].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C ffn chunk");
         }
     }
     const int rows = std::min(g.MC, g.M - c * g.MC);
@@ -2266,7 +2250,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     auto collect = [&](int c) {
                         const int m0 = c * MC, rows = std::min(MC, M - m0);
                         for (size_t idx = 0; idx < num_active_segments; ++idx) {
-                            if (!rknpu_sync_in_runner()) RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, cslot(c)[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
+                            RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, cslot(c)[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
                         }
                         const int n_blocks = (rows + 3) / 4;
                         #pragma omp parallel for num_threads(n_omp)
@@ -2293,7 +2277,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     auto collect_fused = [&](int c) {
                         const int m0 = c * MC, rows = std::min(MC, M - m0);
                         for (size_t idx = 0; idx < num_active_segments; ++idx) {
-                            if (!rknpu_sync_in_runner()) RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, cslot(c)[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
+                            RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, cslot(c)[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
                         }
                         const int n_blocks = (rows + 3) / 4;
                         #pragma omp parallel for num_threads(n_omp)
@@ -2312,7 +2296,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     auto collect_fused_dg = [&](int c) {
                         const int m0 = c * MC, rows = std::min(MC, M - m0);
                         for (size_t idx = 0; idx < num_active_segments; ++idx) {
-                            if (!rknpu_sync_in_runner()) RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, cslot(c)[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
+                            RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, cslot(c)[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
                         }
                         const int n_blocks = (rows + 3) / 4;
                         #pragma omp parallel for num_threads(n_omp)
@@ -2333,7 +2317,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     // deferred gate: C synced for the CPU, kept for the up's collect
                     auto keep = [&](int c) {
                         for (size_t idx = 0; idx < num_active_segments; ++idx) {
-                            if (!rknpu_sync_in_runner()) RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, cslot(c)[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
+                            RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, cslot(c)[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
                         }
                     };
                     auto collect_any = [&](int c) {
