@@ -748,6 +748,17 @@ static void* get_tensor_real_ptr(const struct ggml_tensor* tensor) {
     return tensor->data;
 }
 
+// A buffers are only written by the CPU and read by the NPU: allocated
+// non-cacheable they need no cache clean (rknn_mem_sync TO_DEVICE) before
+// each run (RKNPU_A_NONCACHED, default on)
+static bool rknpu_a_noncached() {
+    static const bool v = []() {
+        const char* env = std::getenv("RKNPU_A_NONCACHED");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return v;
+}
+
 // Function for getting buffer from cache or creating new one
 template <typename CacheKeyType>
 static std::shared_ptr<rknn_tensor_mem> get_tensor_buffer(
@@ -765,7 +776,9 @@ static std::shared_ptr<rknn_tensor_mem> get_tensor_buffer(
         }
     }
 
-    rknn_tensor_mem* mem = rknn_create_mem(matmul_ctx, size);
+    rknn_tensor_mem* mem = ((const void*)&cache == (const void*)&backend_ctx->a_buffer_cache && rknpu_a_noncached())
+        ? rknn_create_mem2(matmul_ctx, size, RKNN_FLAG_MEMORY_NON_CACHEABLE)
+        : rknn_create_mem(matmul_ctx, size);
     if (!mem) { return nullptr; }
 
     auto deleter = [matmul_ctx](rknn_tensor_mem* m) {
@@ -1190,7 +1203,7 @@ static bool rknpu_w4a4_job_setup(ggml_backend_rknpu_context* bctx, rknpu_w4a4_jo
 static void rknpu_w4a4_job_bind(rknpu_w4a4_job& j, int c) {
     const int ns = (int)j.seg_off.size();
     for (int sg = 0; sg < ns; ++sg) {
-        RKNN_CHECK(rknn_mem_sync(j.cctx[sg * j.nas]->ctx, j.a[c][sg].get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A down chunk");
+        if (!rknpu_a_noncached()) RKNN_CHECK(rknn_mem_sync(j.cctx[sg * j.nas]->ctx, j.a[c][sg].get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A down chunk");
         for (size_t idx = 0; idx < j.nas; ++idx) {
             auto& mc = j.cctx[sg * j.nas + idx];
             if (mc->bound_A != j.a[c][sg].get()) {
@@ -1306,7 +1319,7 @@ static void rknpu_ffn_prep(rknpu_w4a4_job& g, rknpu_w4a4_job& u, const float* sr
         }
     }
     for (rknpu_w4a4_job* j : {&g, &u}) {
-        RKNN_CHECK(rknn_mem_sync(j->cctx[0]->ctx, j->a[c][0].get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A ffn chunk");
+        if (!rknpu_a_noncached()) RKNN_CHECK(rknn_mem_sync(j->cctx[0]->ctx, j->a[c][0].get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A ffn chunk");
     }
 }
 
@@ -2231,7 +2244,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                             rknpu2_quantization::quantize_fp32_to_int4_packed(ready_row, packed_row.data(), K_seg_op, scales_A[m]);
                             rknpu2_native_scatter_row(dst_a, packed_row.data(), r, a_geom.m_stride, a_geom.outer, a_geom.sub / 2);
                         }
-                        RKNN_CHECK(rknn_mem_sync(cctx[0]->ctx, a_slot[c & 1].get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A chunk");
+                        if (!rknpu_a_noncached()) RKNN_CHECK(rknn_mem_sync(cctx[0]->ctx, a_slot[c & 1].get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A chunk");
                     };
                     auto start = [&](int c) {
                         for (size_t idx = 0; idx < num_active_segments; ++idx) {
@@ -2519,7 +2532,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         }
                     }
 
-                    RKNN_CHECK(rknn_mem_sync(matmul_ctxs[0]->ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
+                    if (!rknpu_a_noncached()) RKNN_CHECK(rknn_mem_sync(matmul_ctxs[0]->ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
                 }
 
                 // ===========================================
