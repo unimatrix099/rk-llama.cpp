@@ -622,9 +622,6 @@ struct ggml_backend_rknpu_context {
     // gate's and up's chunk contexts as one runner batch
     rknpu_w4a4_job ffn_gate, ffn_up, ffn_down;
     std::vector<std::shared_ptr<rknpu_matmul_context>> ffn_gu_ctx, ffn_gud_ctx;
-    // per-layer-input block (rknpu_ple_block): inp_gate and proj jobs
-    rknpu_w4a4_job ple_a, ple_b;
-    std::vector<std::shared_ptr<rknpu_matmul_context>> ple_ab_ctx;
 
     // (M, K, N, B layout, core) -> attention matmul context
     std::map<std::tuple<int, int, int, int, int>, std::unique_ptr<rknpu_attn_context>> attn_ctx_cache;
@@ -1446,150 +1443,6 @@ static void rknpu_ffn_block(ggml_backend_rknpu_context* bctx, const struct ggml_
     rknpu_w4a4_job_collect(d, n - 1, out, n_omp);
 }
 
-// GELU exactly as ggml-cpu computes it (GGML_GELU_FP16): +-10 cut-offs,
-// otherwise fp16(gelu(fp16(x))) from a table built with the same formula
-static const uint16_t* rknpu_gelu_table() {
-    static const std::vector<uint16_t> table = []() {
-        std::vector<uint16_t> t(1 << 16);
-        for (int i = 0; i < (1 << 16); ++i) {
-            const float f = ggml_fp16_to_fp32((ggml_fp16_t)i);
-            const float g = 0.5f * f * (1.0f + tanhf(0.79788456080286535587989211986876f * f * (1.0f + 0.044715f * f * f)));
-            t[i] = ggml_fp32_to_fp16(g);
-        }
-        return t;
-    }();
-    return table.data();
-}
-static inline float rknpu_gelu_ggml(float x, const uint16_t* table) {
-    if (x <= -10.0f) return 0.0f;
-    if (x >= 10.0f) return x;
-    return ggml_fp16_to_fp32(table[ggml_fp32_to_fp16(x)]);
-}
-
-// GELU of a matmul output, and its product with a same-shape tensor (the
-// per-layer input): supported only in that pattern (rknpu_ple_block)
-static bool rknpu_ple_enabled() {
-    static const bool v = []() {
-        const char* env = std::getenv("RKNPU_PLE");
-        return env == nullptr || std::atoi(env) != 0;
-    }();
-    return v;
-}
-static bool rknpu_gelu_supported(const struct ggml_tensor* op) {
-    const struct ggml_tensor* a = op->src[0];
-    return op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_GELU && a && a->op == GGML_OP_MUL_MAT &&
-           a->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_is_contiguous(op);
-}
-static bool rknpu_ple_mul_supported(const struct ggml_tensor* op) {
-    const struct ggml_tensor *a = op->src[0], *b = op->src[1];
-    return op->op == GGML_OP_MUL && a && b && rknpu_gelu_supported(a) && b->type == GGML_TYPE_F32 &&
-           op->type == GGML_TYPE_F32 && ggml_are_same_shape(a, b) && b->nb[0] == sizeof(float) &&
-           ggml_is_contiguous(op) && b->ne[2] == 1 && b->ne[3] == 1;
-}
-static void rknpu_gelu_op(struct ggml_tensor* dst, int n_omp) {
-    const float* x = (const float*)get_tensor_real_ptr(dst->src[0]);
-    float* y = (float*)get_tensor_real_ptr(dst);
-    const uint16_t* t = rknpu_gelu_table();
-    const int64_t n = ggml_nelements(dst);
-    #pragma omp parallel for num_threads(n_omp)
-    for (int64_t i = 0; i < n; ++i) y[i] = rknpu_gelu_ggml(x[i], t);
-}
-static void rknpu_ple_mul_op(struct ggml_tensor* dst, int n_omp) {
-    const struct ggml_tensor *a = dst->src[0], *b = dst->src[1];
-    const float* x = (const float*)get_tensor_real_ptr(a);
-    const char* bb = (const char*)get_tensor_real_ptr(b);
-    float* y = (float*)get_tensor_real_ptr(dst);
-    const int64_t nc = a->ne[0], nr = ggml_nrows(a);
-    #pragma omp parallel for num_threads(n_omp)
-    for (int64_t r = 0; r < nr; ++r) {
-        const float* br = (const float*)(bb + r * b->nb[1]);
-        for (int64_t i = 0; i < nc; ++i) y[r * nc + i] = x[r * nc + i] * br[i];
-    }
-}
-
-// [inp_gate, GELU, MUL(.., per-layer input), proj] as one block, scheduled
-// like rknpu_ffn_block: NPU batch c runs inp_gate chunk c with proj chunk
-// c-2; the CPU preps chunk c+1, turns inp_gate chunk c-1 into proj's A rows
-// (dequant, ggml's GELU, multiply, Hadamard, INT4) and stores proj chunk
-// c-3. The GELU and MUL outputs are never written; proj's output is
-// element-exact vs the node-by-node path.
-static void rknpu_ple_block(ggml_backend_rknpu_context* bctx, const struct ggml_tensor* src1, const struct ggml_tensor* pl,
-                            struct ggml_tensor* out_t, int n_omp) {
-    auto &a = bctx->ple_a, &b = bctx->ple_b;
-    auto& ab = bctx->ple_ab_ctx;
-    ab.clear();
-    ab.insert(ab.end(), a.cctx.begin(), a.cctx.end());
-    ab.insert(ab.end(), b.cctx.begin(), b.cctx.end());
-    const float* x = (const float*)get_tensor_real_ptr(src1);
-    const int row_stride = (int)(src1->nb[1] / sizeof(float));
-    const char* plb = (const char*)get_tensor_real_ptr(pl);
-    float* out = (float*)get_tensor_real_ptr(out_t);
-    const uint16_t* gt = rknpu_gelu_table();
-    const int n = a.n_chunks, MC = a.MC, M = a.M, Ka = a.K, Na = a.N, Kb = b.K;
-    auto prep = [&](int c) {
-        const int m0 = c * MC, rows = std::min(MC, M - m0);
-        #pragma omp parallel for num_threads(n_omp)
-        for (int r = 0; r < rows; ++r) {
-            static thread_local std::vector<float> full_row;
-            static thread_local std::vector<uint8_t> packed_row;
-            if (full_row.size() < (size_t)Ka) full_row.resize(Ka);
-            if (packed_row.size() < (size_t)Ka / 2) packed_row.resize(Ka / 2);
-            rknpu2_calibration::hadamard_transform_signed(full_row.data(), x + (size_t)(m0 + r) * row_stride, a.s_vec, Ka, Ka);
-            const float sc = a.a_clip * rknpu2_quantization::amax_fp32(full_row.data(), Ka) / 7.0f;
-            a.scales_A[0][m0 + r] = sc;
-            rknpu2_quantization::quantize_fp32_to_int4_packed(full_row.data(), packed_row.data(), Ka, sc);
-            rknpu2_native_scatter_row((uint8_t*)a.a[c][0]->virt_addr, packed_row.data(), r, a.a_geom[0].m_stride, a.a_geom[0].outer, a.a_geom[0].sub / 2);
-        }
-        RKNN_CHECK(rknn_mem_sync(a.cctx[0]->ctx, a.a[c][0].get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A ple chunk");
-    };
-    auto fused = [&](int c) {   // inp_gate chunk c -> proj A rows of chunk c
-        for (size_t q = 0; q < a.cctx.size(); ++q) {
-            RKNN_CHECK(rknn_mem_sync(a.cctx[q]->ctx, a.c[c & 1][q].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C ple chunk");
-        }
-        const int m0 = c * MC, rows = std::min(MC, M - m0);
-        const int n_blocks = (rows + 3) / 4;
-        #pragma omp parallel for num_threads(n_omp)
-        for (int blk = 0; blk < n_blocks; ++blk) {
-            const int r0 = blk * 4, nr = std::min(4, rows - r0);
-            static thread_local std::vector<float> rowbuf, full_row;
-            static thread_local std::vector<uint8_t> packed_row;
-            if (rowbuf.size() < (size_t)4 * Na) rowbuf.resize((size_t)4 * Na);
-            if (full_row.size() < (size_t)Kb) full_row.resize(Kb);
-            if (packed_row.size() < (size_t)Kb / 2) packed_row.resize(Kb / 2);
-            rknpu_job_rows(a, rowbuf.data(), (size_t)Na, c, r0, nr);
-            for (int r = 0; r < nr; ++r) {
-                const int m = m0 + r0 + r;
-                float* v = rowbuf.data() + (size_t)r * Na;
-                const float* plr = (const float*)(plb + (size_t)m * pl->nb[1]);
-                for (int i = 0; i < Na; ++i) v[i] = rknpu_gelu_ggml(v[i], gt) * plr[i];
-                rknpu2_calibration::hadamard_transform_signed(full_row.data(), v, b.s_vec, Kb, Kb);
-                const float sc = b.a_clip * rknpu2_quantization::amax_fp32(full_row.data(), Kb) / 7.0f;
-                b.scales_A[0][m] = sc;
-                rknpu2_quantization::quantize_fp32_to_int4_packed(full_row.data(), packed_row.data(), Kb, sc);
-                rknpu2_native_scatter_row((uint8_t*)b.a[c][0]->virt_addr, packed_row.data(), r0 + r,
-                                          b.a_geom[0].m_stride, b.a_geom[0].outer, b.a_geom[0].sub / 2);
-            }
-        }
-    };
-    auto start_batch = [&](int c) {   // inp_gate chunk c (if any) + proj chunk c - 2 (if any)
-        const bool has_a = c < n, has_b = c >= 2 && c - 2 < n;
-        if (has_a) rknpu_w4a4_job_bind(a, c);
-        if (has_b) rknpu_w4a4_job_bind(b, c - 2);
-        bctx->async_runner.start(has_a && has_b ? ab : has_a ? a.cctx : b.cctx);
-    };
-    prep(0);
-    start_batch(0);
-    for (int c = 1; c < n + 2; ++c) {
-        if (c < n) prep(c);                                         // overlaps batch c-1
-        bctx->async_runner.wait();
-        start_batch(c);
-        if (c - 1 < n) fused(c - 1);
-        if (c >= 3) rknpu_w4a4_job_collect(b, c - 3, out, n_omp);
-    }
-    bctx->async_runner.wait();
-    rknpu_w4a4_job_collect(b, n - 1, out, n_omp);
-}
-
 static bool rknpu_fa_supported(const struct ggml_tensor* op) {
     const struct ggml_tensor *q = op->src[0], *k = op->src[1], *v = op->src[2], *mask = op->src[3], *sinks = op->src[4];
     if (!q || !k || !v || sinks) return false;
@@ -1853,69 +1706,9 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
             rknpu_geglu(node, n_omp);
             continue;
         }
-        if (node->op == GGML_OP_UNARY) {   // GELU of a matmul (rknpu_gelu_supported), when not in a block
-            rknpu_gelu_op(node, n_omp);
-            continue;
-        }
-        if (node->op == GGML_OP_MUL) {
-            rknpu_ple_mul_op(node, n_omp);
-            continue;
-        }
         if (node->op != GGML_OP_MUL_MAT) continue;
         const auto t_node = g_rknpu_profile.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (g_rknpu_profile.on) g_rknpu_profile.nodes++;
-
-        // [inp_gate, GELU, MUL, proj] as one block (rknpu_ple_block)
-        {
-            static const int MCp = []() {
-                const char* env = std::getenv("RKNPU_PLE_MC");
-                const int v = env ? std::atoi(env) : 128;
-                return (v >= 32 && v <= 512 && v % 32 == 0) ? v : 128;
-            }();
-            const struct ggml_tensor* x = node->src[1];
-            const int Mp = (int)x->ne[1];
-            // next computing node after j (views in between compute nothing)
-            auto next_op = [&](int j) {
-                for (++j; j < cgraph->n_nodes; ++j) {
-                    const enum ggml_op o = cgraph->nodes[j]->op;
-                    if (o != GGML_OP_VIEW && o != GGML_OP_RESHAPE && o != GGML_OP_PERMUTE && o != GGML_OP_TRANSPOSE && o != GGML_OP_NONE) return j;
-                }
-                return -1;
-            };
-            const int ig = next_op(node_i), im = ig >= 0 ? next_op(ig) : -1, ip = im >= 0 ? next_op(im) : -1;
-            if (rknpu_ple_enabled() && rknpu_pipeline_enabled() && n_omp > 1 && ip >= 0 && Mp > MCp &&
-                x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && x->ne[2] * x->ne[3] == 1) {
-                struct ggml_tensor* ng = cgraph->nodes[ig];
-                struct ggml_tensor* nm = cgraph->nodes[im];
-                struct ggml_tensor* np = cgraph->nodes[ip];
-                bool ok = ng->src[0] == node && rknpu_gelu_supported(ng) && nm->src[0] == ng && rknpu_ple_mul_supported(nm) &&
-                          np->op == GGML_OP_MUL_MAT && np->src[1] == nm && ggml_is_contiguous(np) && (int)np->ne[1] == Mp &&
-                          ggml_is_contiguous(node) && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-                          !(ng->flags & GGML_TENSOR_FLAG_OUTPUT) && !(nm->flags & GGML_TENSOR_FLAG_OUTPUT);
-                for (int j = node_i + 1; j < cgraph->n_nodes && ok; ++j) {   // nothing else reads inp_gate, GELU or MUL
-                    const struct ggml_tensor* t = cgraph->nodes[j];
-                    for (const struct ggml_tensor* v : {(const struct ggml_tensor*)node, (const struct ggml_tensor*)ng, (const struct ggml_tensor*)nm}) {
-                        if (t->view_src == v) ok = false;
-                        for (int q = 0; q < GGML_MAX_SRC; ++q) {
-                            if (t->src[q] == v && !((t == ng && v == node) || (t == nm && v == ng) || (t == np && v == nm))) ok = false;
-                        }
-                    }
-                }
-                ok = ok && rknpu_w4a4_job_setup(backend_ctx, backend_ctx->ple_a, node, Mp, MCp, 7) &&
-                     rknpu_w4a4_job_setup(backend_ctx, backend_ctx->ple_b, np, Mp, MCp, 8) &&
-                     backend_ctx->ple_a.seg_off.size() == 1 && backend_ctx->ple_a.seg_len[0] == backend_ctx->ple_a.K &&
-                     backend_ctx->ple_b.seg_off.size() == 1 && backend_ctx->ple_b.seg_len[0] == backend_ctx->ple_b.K &&
-                     backend_ctx->ple_b.K == backend_ctx->ple_a.N;
-                if (ok) {
-                    rknpu_ple_block(backend_ctx, x, nm->src[1], np, n_omp);
-                    backend_ctx->ple_a.node = backend_ctx->ple_b.node = nullptr;
-                    node_i = ip;
-                    if (g_rknpu_profile.on) g_rknpu_profile.node_ns += rknpu_profile::ns(t_node, std::chrono::steady_clock::now());
-                    continue;
-                }
-                backend_ctx->ple_a.node = backend_ctx->ple_b.node = nullptr;
-            }
-        }
 
         // [gate, up, GLU, down] as one block (rknpu_ffn_block)
         {
@@ -3462,12 +3255,6 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
     switch (op->op) {
         case GGML_OP_NONE:
             return true;
-
-        case GGML_OP_UNARY:
-            return rknpu_ple_enabled() && rknpu_gelu_supported(op);
-
-        case GGML_OP_MUL:
-            return rknpu_ple_enabled() && rknpu_ple_mul_supported(op);
 
         case GGML_OP_GLU: {
             static const bool glu_enabled = []() {
