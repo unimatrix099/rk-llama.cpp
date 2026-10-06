@@ -1742,8 +1742,8 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         bctx->fa_pool.wait(t_qk[it]);
         if (it + 1 < n) bctx->fa_pool.submit(t_qk[it + 1], [&, it] { st_k(it + 1, 1); });
         st_k(it, 2);                                          // overlaps QK(it+1), PV(it-1)
-        if (it >= 1) { bctx->fa_pool.wait(t_pv[it - 1]); st_k(it - 1, 4); }
         bctx->fa_pool.submit(t_pv[it], [&, it] { st_k(it, 3); });
+        if (it >= 1) { bctx->fa_pool.wait(t_pv[it - 1]); st_k(it - 1, 4); }   // overlaps PV(it)
     }
     bctx->fa_pool.wait(t_pv[n - 1]);
     st_k(n - 1, 4);
