@@ -663,6 +663,76 @@ Process note: `pkill -f <pattern>` matched the shell running it and killed
 the command (exit 144). Use `pkill -f "^build/bin/..."` or pgrep with an
 anchored pattern.
 
+### 1h. Attention as one block, steps 1-2: Q/K/V norms and RoPE in the backend (2026-10-06)
+
+Plan (from #1g's outlook), measured stage by stage:
+1. per-head Q/K/V RMS norms fused into the projection's dequant;
+2. RoPE fused after them;
+3. KV-cache writes and attention fill straight from registers;
+4. a block schedule with block-causal overlap.
+
+Probe first. The ops to absorb are about 5% of CPU cycles (Q/K norm 2.2%,
+RoPE 1.6%, cache write 0.85%, V norm 0.1%), and 13% of wall time runs
+outside the NPU backend. So steps 1-2 alone were expected to be small;
+their job is to make Q/K/V one backend piece.
+
+**Step 1: per-head norms.**
+- The backend takes RMS_NORM, and its weight MUL, only when the norm's
+  input is a reshape of a matmul output.
+- The arithmetic is copied from ggml-cpu: the same double-precision sum of
+  squares over four 2-lane accumulators, and `(x*scale)*w`.
+- The pipelined collect dequantizes each 4-row block into a thread-local
+  buffer, normalizes it per head, and writes the norm (or MUL) output. The
+  projection itself is never written. Stand-alone handlers cover decode
+  and other non-pipelined cases.
+
+First result: **3% slower**, with 24% more graph splits. llama.cpp pins
+every tensor named `"norm"` to the layer's device when the model is fully
+offloaded (`llama-context.cpp`, a FIXME scheduler workaround). For this
+backend (an ACCEL device) that device is the CPU. `build_norm` names its
+intermediate `"norm"`, so each Q/K RMS_NORM was pinned to the CPU while
+its weight MUL went to the NPU, adding two backend switches per
+projection. V's norm (a bare `ggml_rms_norm`) was unaffected.
+
+Fix: `gemma4.cpp` builds the Q/K norms as `ggml_mul(ggml_rms_norm(..), w)`,
+the same ops without the pinned name. Result: bit-identical,
+same-binary A/B **+0.6%** (276.5 vs 274.9).
+
+**Step 2: RoPE.**
+- ggml-cpu's rotation is plain scalar C++, compiled with fused
+  multiply-adds, and GCC contracted the two modes differently.
+- `test-rknpu2-rope.cpp` (new; RKNPU vs CPU backend, bit for bit, 5 cases)
+  showed NORMAL exact with `y0 = fma(-x1, s, x0*c)`. NEOX differed by one
+  rounding in 8-16% of elements.
+- Trying all four orders found NEOX = `fma(x0, c, -(x1*s))`,
+  `fma(x0, s, x1*c)`.
+- The cos/sin table copies `ggml_rope_cache_init` (powf, cosf/sinf,
+  frequency factors). Only `ext_factor == 0` (no YaRN) is supported;
+  anything else stays on the CPU.
+- The guard now runs the RoPE test, since a different compiler could
+  contract differently.
+
+Fused version: one cos/sin table per token, applied in place after each
+head's norm, while the row is in L1. The projection, normed and pre-RoPE
+tensors are never written.
+
+Same-binary A/B, twice:
+
+| RoPE | pp512 |
+|---|---|
+| on CPU | 273.4 |
+| standalone in backend | 275.8 |
+| fused | **277.1** (+1.4%) |
+
+Q, K, V, their norms and both RoPEs now form **one NPU-backend split** per
+layer, down from five alternating with the CPU; total graph splits fell
+21%. Quality is bit-identical (PPL32 27.2382, KLD 0.587297); pp128 and
+decode are unchanged.
+
+**Steps 1-2 together: ~+2% pp512**, in line with the probe. What remains
+between the projections and attention is the two KV-cache writes
+(`SET_ROWS`, CPU), the next step.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
@@ -1754,6 +1824,10 @@ becomes a server.
 | `RKNPU_FA_ROWS` | 64 | row block for the native-layout attention moves (#1g) |
 | `RKNPU_FA_OVERLAP` | 1 | 0 = attention items run strictly in sequence (#1g); note the core-dependence (±0.02% PPL) in #1g |
 | `GGML_CPU_DISABLE_FUSION_CHAIN` | unset | 1 = ggml-cpu's fused post-norm pass does not also compute the following RMS_NORM + MUL (#1g); identical |
+| `RKNPU_HEAD_NORM` | 1 | 0 = per-head Q/K/V RMS norms (and weight MUL) stay on ggml-cpu (#1h) |
+| `RKNPU_ROPE` | 1 | 0 = RoPE stays on ggml-cpu (#1h) |
+| `RKNPU_ROPE_FUSE` | 1 | 0 = RoPE runs as a separate backend op instead of inside the Q/K dequant (#1h) |
+| `RKNPU_ROPE_ANY` | unset | 1 = backend takes any F32 NORMAL/NEOX RoPE (exactness test hook) (#1h) |
 | `RKNPU_PROFILE` | unset | Diagnostic: prints cumulative wall time in the backend (graph / per-node / NPU run) every ~5 s to stderr; take the slope over a decode window and divide by the token rate (#1c) |
 | `RKNPU_DISPATCH_POOL` | unset | 1 = old dispatch path: NPU segments on the persistent pool and serial M=1 A-prep instead of ggml's OpenMP team. For A/B comparison only (#1c) |
 | `OMP_NUM_THREADS=4` | unset | no longer required: the #3 fix covers M=1, and since 2026-10-02 the backend takes ggml's thread count for M > 1 too (#1b); still harmless |

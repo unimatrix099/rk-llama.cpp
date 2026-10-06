@@ -23,6 +23,9 @@ python3 -c "import sys; p,k,t=$P32,$KLD,$TOP; sys.exit(0 if (p <= 26.8771*1.02 a
 FA=$(ssh -o BatchMode=yes $B 'cd ~/rk-llama.cpp-rebase && g++ -O2 docs/backend/test-rknpu2-flash-attn.cpp -I ggml/include -Lbuild/bin -lggml -lggml-base -lggml-cpu -lggml-rknpu2 -Wl,-rpath,$PWD/build/bin -o /tmp/test-rknpu2-flash-attn && ulimit -n 65536 && /tmp/test-rknpu2-flash-attn 2>&1 | grep -c " OK$"'; true)
 echo "flash-attn test: $FA/12 OK"
 [ "$FA" = "12" ] || { echo "flash-attn test failed"; exit 1; }
+RP=$(ssh -o BatchMode=yes $B 'cd ~/rk-llama.cpp-rebase && g++ -O2 docs/backend/test-rknpu2-rope.cpp -I ggml/include -Lbuild/bin -lggml -lggml-base -lggml-cpu -lggml-rknpu2 -Wl,-rpath,$PWD/build/bin -o /tmp/test-rknpu2-rope && ulimit -n 65536 && /tmp/test-rknpu2-rope 2>&1 | grep -c " OK$"'; true)
+echo "rope exactness test: $RP/5 OK"
+[ "$RP" = "5" ] || { echo "rope exactness test failed"; exit 1; }
 for i in 1 2 3; do
   out=$(ssh -o BatchMode=yes $B 'bash ~/rk-llama.cpp-rebase/docs/backend/rknpu2-autoresearch/decode-check.sh 2>&1 | tail -1'; true)
   echo "server run $i: $out"
