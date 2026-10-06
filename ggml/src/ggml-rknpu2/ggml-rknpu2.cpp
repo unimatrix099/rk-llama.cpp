@@ -1285,6 +1285,47 @@ static void rknpu_job_rows(const rknpu_w4a4_job& j, float* dst, size_t dst_strid
     }
 }
 
+// Gate and up of rows r0..r0+nr of one N-segment straight from their INT16
+// C cells (one shared native geometry, 8-wide cells) to the GEGLU output,
+// tile by tile: the same operations as dequantizing both (store path) and
+// then rknpu_geglu_row, so element-exact, without the row buffers.
+static void __attribute__((noinline)) rknpu_gate_up_geglu_tiles(
+        float* y, size_t ys, const int16_t* cg, const int16_t* cu, int r0, int nr, const rknpu2_native_geom& geom,
+        int n_limit, const float* common_g, const float* common_u, const float* chan_g, const float* chan_u) {
+#ifdef __ARM_NEON
+    const float32x4_t c0 = vdupq_n_f32(0.79788456080286535587989211986876f), c1 = vdupq_n_f32(0.044715f);
+    const float32x4_t one = vdupq_n_f32(1.0f), two = vdupq_n_f32(2.0f), half = vdupq_n_f32(0.5f);
+    auto gelu_mul = [&](float32x4_t xv, float32x4_t g) {
+        const float32x4_t z  = vmulq_f32(vmulq_f32(c0, xv), vfmaq_f32(one, vmulq_f32(c1, xv), xv));
+        const float32x4_t th = vsubq_f32(one, vdivq_f32(two, vaddq_f32(rknpu_v_expf(vmulq_f32(two, z)), one)));
+        float32x4_t gel = vmulq_f32(vmulq_f32(half, xv), vaddq_f32(one, th));
+        gel = vbslq_f32(vcleq_f32(xv, vdupq_n_f32(-10.0f)), vdupq_n_f32(0.0f), gel);
+        gel = vbslq_f32(vcgeq_f32(xv, vdupq_n_f32(10.0f)), xv, gel);
+        return vmulq_f32(gel, g);
+    };
+    const int outer = n_limit / 8;
+    for (int t = 0; t < outer; ++t) {
+        const int n0 = t * 8;
+        const float32x4_t sg0 = vld1q_f32(chan_g + n0), sg1 = vld1q_f32(chan_g + n0 + 4);
+        const float32x4_t su0 = vld1q_f32(chan_u + n0), su1 = vld1q_f32(chan_u + n0 + 4);
+        for (int r = 0; r < nr; ++r) {
+            const size_t cell = ((size_t)t * geom.m_stride + r0 + r) * 8;
+            const int16x8_t g16 = vld1q_s16(cg + cell), u16 = vld1q_s16(cu + cell);
+            const float32x4_t vcg = vdupq_n_f32(common_g[r]), vcu = vdupq_n_f32(common_u[r]);
+            const float32x4_t x0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(g16))),  vmulq_f32(sg0, vcg));
+            const float32x4_t x1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(g16))), vmulq_f32(sg1, vcg));
+            const float32x4_t u0 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(u16))),  vmulq_f32(su0, vcu));
+            const float32x4_t u1 = vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(u16))), vmulq_f32(su1, vcu));
+            float* yr = y + (size_t)r * ys + n0;
+            vst1q_f32(yr,     gelu_mul(x0, u0));
+            vst1q_f32(yr + 4, gelu_mul(x1, u1));
+        }
+    }
+#else
+    GGML_ABORT("rknpu_gate_up_geglu_tiles needs NEON");
+#endif
+}
+
 // Gate and up rows of chunk c -> GEGLU -> down's A-prep into its chunk-c
 // A buffer (as rknpu_fused_gate_up_geglu_prep_block)
 static void __attribute__((noinline)) rknpu_ffn_fused_block(rknpu_w4a4_job& g, rknpu_w4a4_job& u, rknpu_w4a4_job& d,
@@ -1296,16 +1337,51 @@ static void __attribute__((noinline)) rknpu_ffn_fused_block(rknpu_w4a4_job& g, r
     grow(ubuf, (size_t)4 * N);
     grow(gbuf, (size_t)4 * N);
     grow(yrow, (size_t)N);
-    rknpu_job_rows(u, ubuf.data(), (size_t)N, c, r0, nr);
-    rknpu_job_rows(g, gbuf.data(), (size_t)N, c, r0, nr);
+    // GEGLU rows straight from the gate and up INT16 tiles when both share
+    // 8-wide cell geometries (else via dequantized row buffers)
+    static const bool tiles_env = []() {
+        const char* env = std::getenv("RKNPU_GEGLU_TILES");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    bool tiles = tiles_env && g.nas == u.nas;
+    for (size_t idx = 0; tiles && idx < g.nas; ++idx) {
+        const auto &a = g.c_geom[idx], &b = u.c_geom[idx];
+        tiles = a.sub == 8 && b.sub == 8 && a.m_stride == b.m_stride && a.outer == b.outer &&
+                g.nsegs[idx].offset_n == u.nsegs[idx].offset_n && g.nsegs[idx].size_n == u.nsegs[idx].size_n &&
+                g.nsegs[idx].size_n % 8 == 0;
+    }
+#ifndef __ARM_NEON
+    tiles = false;
+#endif
+    grow(ubuf, (size_t)4 * N);   // the GEGLU rows when tiled
+    if (tiles) {
+        float cg[4], cu[4];
+        for (int r = 0; r < nr; ++r) {
+            cg[r] = g.scales_A[0][c * g.MC + r0 + r] / g.hdiv;
+            cu[r] = u.scales_A[0][c * u.MC + r0 + r] / u.hdiv;
+        }
+        for (size_t idx = 0; idx < g.nas; ++idx) {
+            const int N_offset = g.nsegs[idx].offset_n;
+            rknpu_gate_up_geglu_tiles(ubuf.data() + N_offset, (size_t)N,
+                (const int16_t*)g.c[c & 1][idx]->virt_addr, (const int16_t*)u.c[c & 1][idx]->virt_addr,
+                r0, nr, g.c_geom[idx], g.nsegs[idx].size_n, cg, cu, g.chan + N_offset, u.chan + N_offset);
+        }
+    } else {
+        rknpu_job_rows(u, ubuf.data(), (size_t)N, c, r0, nr);
+        rknpu_job_rows(g, gbuf.data(), (size_t)N, c, r0, nr);
+    }
     for (int r = 0; r < nr; ++r) {
         const int m = c * g.MC + r0 + r;
-        rknpu_geglu_row(N, yrow.data(), gbuf.data() + (size_t)r * N, ubuf.data() + (size_t)r * N);
+        const float* yr = ubuf.data() + (size_t)r * N;
+        if (!tiles) {
+            rknpu_geglu_row(N, yrow.data(), gbuf.data() + (size_t)r * N, ubuf.data() + (size_t)r * N);
+            yr = yrow.data();
+        }
         for (size_t sg = 0; sg < d.seg_off.size(); ++sg) {
             const int len = d.seg_len[sg];
             grow(full_row, (size_t)len);
             grow(packed_row, (size_t)len / 2);
-            rknpu2_calibration::hadamard_transform_signed_range(full_row.data(), yrow.data(), d.s_vec, d.K, d.seg_off[sg], len);
+            rknpu2_calibration::hadamard_transform_signed_range(full_row.data(), yr, d.s_vec, d.K, d.seg_off[sg], len);
             const float sc = d.a_clip * rknpu2_quantization::amax_fp32(full_row.data(), len) / 7.0f;
             d.scales_A[sg][m] = sc;
             rknpu2_quantization::quantize_fp32_to_int4_packed(full_row.data(), packed_row.data(), len, sc);
