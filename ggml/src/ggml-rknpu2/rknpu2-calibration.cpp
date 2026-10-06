@@ -198,19 +198,16 @@ static void fwht_iterative(float* data, int size) {
         // stage h=1: pairwise butterflies inside each 4-lane vector.
         // [a,b,c,d] -> [a+b, a-b, c+d, c-d]: even lanes from v+rev,
         // odd lanes from v-rev (vtrn1 interleaves them back).
+        // stage h=2 in the same pass: butterflies between the two lane
+        // pairs of the same vector (same operations as a second pass)
         for (int i = 0; i < size; i += 4) {
             float32x4_t v   = vld1q_f32(data + i);
             float32x4_t sw  = vrev64q_f32(v);
             float32x4_t sum = vaddq_f32(v, sw);
             float32x4_t dif = vsubq_f32(v, sw);
-            vst1q_f32(data + i, vtrn1q_f32(sum, dif));
-        }
-        // stage h=2: butterflies between the two lane pairs of one vector
-        for (int i = 0; i < size; i += 4) {
-            float32x4_t v = vld1q_f32(data + i);
-            float32x2_t lo = vget_low_f32(v), hi = vget_high_f32(v);
-            vst1_f32(data + i,     vadd_f32(lo, hi));
-            vst1_f32(data + i + 2, vsub_f32(lo, hi));
+            float32x4_t u   = vtrn1q_f32(sum, dif);
+            float32x2_t lo = vget_low_f32(u), hi = vget_high_f32(u);
+            vst1q_f32(data + i, vcombine_f32(vadd_f32(lo, hi), vsub_f32(lo, hi)));
         }
         // stages h>=4: contiguous 4-wide butterflies, two stages (h, 2h) per
         // pass over the data (radix-4). Same adds and subtracts in the same
