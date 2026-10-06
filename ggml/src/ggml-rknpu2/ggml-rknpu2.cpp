@@ -398,13 +398,33 @@ struct rknpu_attn_context {
     rknn_matmul_io_attr io_attr;
     rknn_matmul_ctx ctx = 0;
     rknn_tensor_mem *A = nullptr, *B = nullptr, *C = nullptr;
+    // Native A/C: the CPU writes A and reads C in the NPU's tiling (in
+    // parallel, inside loops it runs anyway) instead of the runtime
+    // converting both on one thread inside every run
+    bool native = false;
+    rknpu2_native_geom a_geom = {0, 0, 0}, c_geom = {0, 0, 0};
     rknpu_attn_context(int M, int K, int N, int b_layout, int core_id) {
+        static const bool want_native = []() {
+            const char* env = std::getenv("RKNPU_FA_NATIVE");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
         memset(&info, 0, sizeof(info));
         info.M = M; info.K = K; info.N = N;
         info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
         info.B_layout = (int16_t)b_layout;
-        info.AC_layout = RKNN_MM_LAYOUT_NORM;
+        info.AC_layout = want_native ? RKNN_MM_LAYOUT_NATIVE : RKNN_MM_LAYOUT_NORM;
         if (rknn_matmul_create(&ctx, &info, &io_attr) < 0) { ctx = 0; return; }
+        if (want_native) {
+            native = rknpu2_native_geom_from_dims(io_attr.A.dims, io_attr.A.n_dims, &a_geom) == 0 &&
+                     rknpu2_native_geom_from_dims(io_attr.C.dims, io_attr.C.n_dims, &c_geom) == 0 &&
+                     a_geom.outer * a_geom.sub == K && c_geom.outer * c_geom.sub == N &&
+                     a_geom.m_stride == M && c_geom.m_stride == M;
+            if (!native) {   // unexpected geometry: plain layout
+                rknn_matmul_destroy(ctx);
+                info.AC_layout = RKNN_MM_LAYOUT_NORM;
+                if (rknn_matmul_create(&ctx, &info, &io_attr) < 0) { ctx = 0; return; }
+            }
+        }
         rknn_matmul_set_core_mask(ctx, core_id == 0 ? RKNN_NPU_CORE_0 : core_id == 1 ? RKNN_NPU_CORE_1 : RKNN_NPU_CORE_2);
         A = rknn_create_mem(ctx, io_attr.A.size);
         B = rknn_create_mem(ctx, io_attr.B.size);
@@ -1322,6 +1342,43 @@ static bool rknpu_fa_supported(const struct ggml_tensor* op) {
     return true;
 }
 
+// Four consecutive rows r0..r0+3 of a native-layout matrix: in every cell
+// column their cells are adjacent (4 * cb contiguous bytes, one cache line
+// for 16-byte cells), so they are moved together, line by line
+static inline void rknpu_native_gather_rows(uint8_t* const* rows, int R, const uint8_t* src, int r0, const rknpu2_native_geom& g, int cb) {
+    for (int t = 0; t < g.outer; ++t) {
+        const uint8_t* c = src + ((size_t)t * g.m_stride + r0) * cb;
+#ifdef __ARM_NEON
+        if (cb == 16) {
+            for (int k = 0; k < R; ++k) vst1q_u8(rows[k] + (size_t)t * 16, vld1q_u8(c + k * 16));
+            continue;
+        }
+#endif
+        for (int k = 0; k < R; ++k) memcpy(rows[k] + (size_t)t * cb, c + k * cb, cb);
+    }
+}
+static inline void rknpu_native_scatter_rows(uint8_t* dst, const uint8_t* const* rows, int R, int r0, const rknpu2_native_geom& g, int cb) {
+    for (int t = 0; t < g.outer; ++t) {
+        uint8_t* c = dst + ((size_t)t * g.m_stride + r0) * cb;
+#ifdef __ARM_NEON
+        if (cb == 16) {
+            for (int k = 0; k < R; ++k) vst1q_u8(c + k * 16, vld1q_u8(rows[k] + (size_t)t * 16));
+            continue;
+        }
+#endif
+        for (int k = 0; k < R; ++k) memcpy(c + k * cb, rows[k] + (size_t)t * cb, cb);
+    }
+}
+// rows per block in the native-layout attention loops (RKNPU_FA_ROWS)
+static int rknpu_fa_rows() {
+    static const int v = []() {
+        const char* env = std::getenv("RKNPU_FA_ROWS");
+        const int x = env ? std::atoi(env) : 64;
+        return (x >= 4 && x <= 512 && x % 4 == 0) ? x : 64;
+    }();
+    return v;
+}
+
 static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tensor* dst, int n_omp) {
     const struct ggml_tensor *q = dst->src[0], *k = dst->src[1], *v = dst->src[2], *mask = dst->src[3];
     const int64_t DK = k->ne[0], DV = v->ne[0];
@@ -1353,10 +1410,27 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
 
         // A = Q rows of the rk2 heads of this group, FP16, row r = hh*n_q + i
         uint16_t* a = (uint16_t*)qk->A->virt_addr;
-        #pragma omp parallel for num_threads(n_omp)
-        for (int64_t r = 0; r < M; ++r) {
+        const int FR = rknpu_fa_rows();
+        const bool native = qk->native && pv->native && M % FR == 0;
+        auto q_row = [&](int64_t r) {
             const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
-            rknpu_fp32_to_fp16((const float*)(q_base + i * q->nb[1] + h * q->nb[2] + i3 * q->nb[3]), a + r * DK, DK);
+            return (const float*)(q_base + i * q->nb[1] + h * q->nb[2] + i3 * q->nb[3]);
+        };
+        if (native) {
+            #pragma omp parallel for num_threads(n_omp)
+            for (int64_t r0 = 0; r0 < M; r0 += FR) {
+                static thread_local std::vector<uint16_t> buf;
+                if ((int64_t)buf.size() < FR * DK) buf.resize(FR * DK);
+                uint8_t* rows[512];
+                for (int k = 0; k < FR; ++k) {
+                    rknpu_fp32_to_fp16(q_row(r0 + k), buf.data() + k * DK, DK);
+                    rows[k] = (uint8_t*)(buf.data() + k * DK);
+                }
+                rknpu_native_scatter_rows((uint8_t*)a, rows, FR, (int)r0, qk->a_geom, qk->a_geom.sub * 2);
+            }
+        } else {
+            #pragma omp parallel for num_threads(n_omp)
+            for (int64_t r = 0; r < M; ++r) rknpu_fp32_to_fp16(q_row(r), a + r * DK, DK);
         }
         // B = K rows (n_kv x DK, TP_NORM) and V rows (n_kv x DV, NORM)
         uint16_t* bk = (uint16_t*)qk->B->virt_addr;
@@ -1379,14 +1453,36 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         // softmax rows into P (FP16) = A of the second matmul
         const float* S = (const float*)qk->C->virt_addr;
         uint16_t* P = (uint16_t*)pv->A->virt_addr;
-        #pragma omp parallel for num_threads(n_omp)
-        for (int64_t r = 0; r < M; ++r) {
-            const int64_t i = r % n_q;
-            static thread_local std::vector<float> row;
-            if ((int64_t)row.size() < n_kv) row.resize(n_kv);
-            const float* s_row = S + r * n_kv;
-            const ggml_fp16_t* mrow = mask ? (const ggml_fp16_t*)(m_seq + i * mask->nb[1]) : nullptr;
-            rknpu_softmax_row(s_row, mrow, n_kv, scale, softcap, row.data(), P + r * n_kv);
+        auto m_row = [&](int64_t r) {
+            return mask ? (const ggml_fp16_t*)(m_seq + (r % n_q) * mask->nb[1]) : nullptr;
+        };
+        if (native) {
+            #pragma omp parallel for num_threads(n_omp)
+            for (int64_t r0 = 0; r0 < M; r0 += FR) {
+                static thread_local std::vector<float> row, s_buf;
+                static thread_local std::vector<uint16_t> p_buf;
+                if ((int64_t)row.size() < n_kv) row.resize(n_kv);
+                if ((int64_t)s_buf.size() < FR * n_kv) s_buf.resize(FR * n_kv);
+                if ((int64_t)p_buf.size() < FR * n_kv) p_buf.resize(FR * n_kv);
+                uint8_t* srows[512];
+                uint8_t* prows[512];
+                for (int k = 0; k < FR; ++k) {
+                    srows[k] = (uint8_t*)(s_buf.data() + k * n_kv);
+                    prows[k] = (uint8_t*)(p_buf.data() + k * n_kv);
+                }
+                rknpu_native_gather_rows(srows, FR, (const uint8_t*)S, (int)r0, qk->c_geom, qk->c_geom.sub * 4);
+                for (int k = 0; k < FR; ++k) {
+                    rknpu_softmax_row(s_buf.data() + k * n_kv, m_row(r0 + k), n_kv, scale, softcap, row.data(), p_buf.data() + k * n_kv);
+                }
+                rknpu_native_scatter_rows((uint8_t*)P, prows, FR, (int)r0, pv->a_geom, pv->a_geom.sub * 2);
+            }
+        } else {
+            #pragma omp parallel for num_threads(n_omp)
+            for (int64_t r = 0; r < M; ++r) {
+                static thread_local std::vector<float> row;
+                if ((int64_t)row.size() < n_kv) row.resize(n_kv);
+                rknpu_softmax_row(S + r * n_kv, m_row(r), n_kv, scale, softcap, row.data(), P + r * n_kv);
+            }
         }
         rknn_mem_sync(pv->ctx, pv->A, RKNN_MEMORY_SYNC_TO_DEVICE);
         rknn_matmul_run(pv->ctx);
@@ -1394,11 +1490,21 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
 
         // O rows -> dst (permuted: row (i*n_head + h))
         const float* O = (const float*)pv->C->virt_addr;
-        #pragma omp parallel for num_threads(n_omp)
-        for (int64_t r = 0; r < M; ++r) {
+        // permute(0, 2, 1, 3): row (i3*n_q*n_head + i*n_head + h)
+        auto d_row = [&](int64_t r) {
             const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
-            // permute(0, 2, 1, 3): row (i3*n_q*n_head + i*n_head + h)
-            memcpy(d_base + (i3 * n_q * n_head + i * n_head + h) * dst->nb[1], O + r * DV, DV * sizeof(float));
+            return d_base + (i3 * n_q * n_head + i * n_head + h) * dst->nb[1];
+        };
+        if (native) {
+            #pragma omp parallel for num_threads(n_omp)
+            for (int64_t r0 = 0; r0 < M; r0 += FR) {
+                uint8_t* rows[512];
+                for (int k = 0; k < FR; ++k) rows[k] = (uint8_t*)d_row(r0 + k);
+                rknpu_native_gather_rows(rows, FR, (const uint8_t*)O, (int)r0, pv->c_geom, pv->c_geom.sub * 4);
+            }
+        } else {
+            #pragma omp parallel for num_threads(n_omp)
+            for (int64_t r = 0; r < M; ++r) memcpy(d_row(r), O + r * DV, DV * sizeof(float));
         }
     }
     }
