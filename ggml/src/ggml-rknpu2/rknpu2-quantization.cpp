@@ -201,18 +201,11 @@ void dequant_acc_int16_tiled_perchan(float * dst, const int16_t * src_native,
 // cache line, and the per-cell body is inlined instead of a call per cell.
 // Per element it is exactly dequant_acc_int16_to_fp32_perchan (same vector
 // body for full 8-groups, same mul-then-fma tail), so results are identical.
-// Tiles ahead to prefetch: a row block reads one line per tile, a
-// page-sized stride apart, which the hardware prefetcher does not follow
-static const int32_t k_tile_prefetch = 8;
-
 void dequant_acc_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const int16_t * src_native,
                                           int32_t m0, int32_t nrows, int32_t m_stride, int32_t outer, int32_t sub,
                                           int32_t n_limit, const float * common, const float * chan_scales, bool store) {
     for (int32_t t = 0; t < outer; ++t) {
         const int32_t n0 = t * sub;
-        if (t + k_tile_prefetch < outer) {
-            __builtin_prefetch(src_native + ((size_t)(t + k_tile_prefetch) * m_stride + m0) * sub);
-        }
         const int32_t lim = std::min(sub, n_limit - n0);
         if (lim <= 0) {
             break;
