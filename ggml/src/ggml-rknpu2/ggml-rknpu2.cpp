@@ -2149,6 +2149,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
         // Computing K dimensions segments
         size_t current_offset_in_tensor = 0;
         std::vector<size_t> seg_b_offset(num_active_segments, 0);
+        int hn_last_node = -1;   // last node fused into a per-head-norm dequant (see below)
         for (size_t k_idx = 0; k_idx < all_k_segments.size(); ++k_idx) {
             const auto& k_seg = all_k_segments[k_idx];
             const int K_seg_op = k_seg.size_k;
@@ -2228,6 +2229,54 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 const int MC = 256;
                 static_assert(MC == 256, "pipelined_node uses M > 256");
                 const bool fused_now = fuse_glu != nullptr && all_k_segments.size() == 1;
+                // Per-head norm (+ weight) of this matmul's output, fused into
+                // its dequant: [matmul, reshape, RMS_NORM, (MUL)] with nothing
+                // else reading the matmul or the norm. The output is the norm
+                // (or MUL) tensor; the raw projection is never written.
+                struct ggml_tensor* hn_norm = nullptr;
+                struct ggml_tensor* hn_out = nullptr;
+                const float* hn_w = nullptr;
+                float hn_eps = 0.0f;
+                int hn_last = -1;
+                if (rknpu_head_norm_enabled() && pipelined_node && !fuse_glu && !defer_gate && nbatch == 1 &&
+                    all_k_segments.size() == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                    auto next_op = [&](int j) {
+                        for (++j; j < cgraph->n_nodes; ++j) {
+                            const enum ggml_op o = cgraph->nodes[j]->op;
+                            if (o != GGML_OP_VIEW && o != GGML_OP_RESHAPE && o != GGML_OP_PERMUTE && o != GGML_OP_TRANSPOSE && o != GGML_OP_NONE) return j;
+                        }
+                        return -1;
+                    };
+                    const int jn = next_op(node_i);
+                    struct ggml_tensor* nn = jn >= 0 ? cgraph->nodes[jn] : nullptr;
+                    if (nn && rknpu_head_norm_supported(nn) && nn->src[0]->view_src == node && N % nn->ne[0] == 0 &&
+                        ggml_nelements(nn) == (int64_t)M * N && !(nn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                        const int jm = next_op(jn);
+                        struct ggml_tensor* mm = jm >= 0 ? cgraph->nodes[jm] : nullptr;
+                        const struct ggml_tensor* w = (mm && (mm->src[0] == nn || mm->src[1] == nn)) ? rknpu_head_norm_weight(mm) : nullptr;
+                        const struct ggml_tensor* view = nn->src[0];
+                        bool ok = true;
+                        for (int j = node_i + 1; j < cgraph->n_nodes && ok; ++j) {
+                            const struct ggml_tensor* t = cgraph->nodes[j];
+                            if (t != view && (t->view_src == node || t->view_src == view)) ok = false;
+                            for (int q = 0; q < GGML_MAX_SRC; ++q) {
+                                const struct ggml_tensor* sq = t->src[q];
+                                if (sq == node && t != view) ok = false;
+                                if (sq == view && t != nn) ok = false;
+                                if (w && sq == nn && t != mm) ok = false;
+                            }
+                            if (w && t->view_src == nn) ok = false;
+                        }
+                        if (ok) {
+                            hn_norm = nn;
+                            hn_out = w ? mm : nn;
+                            hn_w = w ? (const float*)get_tensor_real_ptr(w) : nullptr;
+                            memcpy(&hn_eps, nn->op_params, sizeof(float));
+                            hn_last = w ? jm : jn;
+                            hn_last_node = hn_last;
+                        }
+                    }
+                }
                 auto& dg = backend_ctx->deferred_gate;
                 const bool use_dg = dg.gate != nullptr && pipelined_node && fused_now && fuse_glu->src[0] == dg.gate &&
                                     dg.up == node && dg.M == M && dg.N == N && dg.MC == MC;
@@ -2428,10 +2477,44 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                             RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, cslot(c)[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
                         }
                     };
+                    // per-head norm fused into the dequant (a separate lambda, as above)
+                    auto collect_norm = [&](int c) {
+                        const int m0 = c * MC, rows = std::min(MC, M - m0);
+                        for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                            RKNN_CHECK(rknn_mem_sync(cctx[idx]->ctx, cslot(c)[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C chunk");
+                        }
+                        float* out = (float*)get_tensor_real_ptr(hn_out);
+                        const int64_t hd = hn_norm->ne[0];
+                        const int n_blocks = (rows + 3) / 4;
+                        #pragma omp parallel for num_threads(n_omp)
+                        for (int blk = 0; blk < n_blocks; ++blk) {
+                            const int r0 = blk * 4;
+                            const int nr = std::min(4, rows - r0);
+                            static thread_local std::vector<float> rbuf;
+                            if (rbuf.size() < (size_t)4 * N) rbuf.resize((size_t)4 * N);
+                            float common[4];
+                            for (int r = 0; r < nr; ++r) common[r] = scales_A[m0 + r0 + r] / hadamard_divisor;
+                            for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                                const int N_offset = active_n_segments[idx].offset_n;
+                                rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(
+                                    rbuf.data() + N_offset, (size_t)N,
+                                    (const int16_t*)cslot(c)[idx]->virt_addr, r0, nr,
+                                    c_geom[idx].m_stride, c_geom[idx].outer, c_geom[idx].sub,
+                                    active_n_segments[idx].size_n, common,
+                                    scales_B_grid->data() + N_offset, /*store=*/ true);
+                            }
+                            for (int r = 0; r < nr; ++r) {
+                                const float* x = rbuf.data() + (size_t)r * N;
+                                float* y = out + (size_t)(m0 + r0 + r) * N;
+                                for (int64_t h = 0; h < N; h += hd) rknpu_head_norm(y + h, x + h, hd, hn_eps, hn_w);
+                            }
+                        }
+                    };
                     auto collect_any = [&](int c) {
                         if (defer_gate) keep(c);
                         else if (use_dg) collect_fused_dg(c);
                         else if (fused_now) collect_fused(c);
+                        else if (hn_out) collect_norm(c);
                         else collect(c);
                     };
 
@@ -2824,6 +2907,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
         if (fuse_glu && all_k_segments.size() == 1) {
             ++node_i;   // the GLU was computed inside this node's dequant
         }
+        if (hn_last_node >= 0) node_i = hn_last_node;   // the norm (and MUL) were computed in its dequant
     }
     rknpu_materialize_deferred_gate(backend_ctx->deferred_gate, n_omp);
 
