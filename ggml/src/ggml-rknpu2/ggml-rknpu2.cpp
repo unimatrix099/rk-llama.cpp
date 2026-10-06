@@ -1304,8 +1304,20 @@ static void __attribute__((noinline)) rknpu_gate_up_geglu_tiles(
         return vmulq_f32(gel, g);
     };
     const int outer = n_limit / 8;
+    // prefetch both C streams pf tiles ahead: each tile is one line of this
+    // row block, a page-sized stride apart, which the hardware prefetcher
+    // does not follow (RKNPU_TILE_PF, 0 = off)
+    static const int pf = []() {
+        const char* env = std::getenv("RKNPU_TILE_PF");
+        return env ? std::atoi(env) : 8;
+    }();
     for (int t = 0; t < outer; ++t) {
         const int n0 = t * 8;
+        if (pf > 0 && t + pf < outer) {
+            const size_t cell_pf = ((size_t)(t + pf) * geom.m_stride + r0) * 8;
+            __builtin_prefetch(cg + cell_pf);
+            __builtin_prefetch(cu + cell_pf);
+        }
         const float32x4_t sg0 = vld1q_f32(chan_g + n0), sg1 = vld1q_f32(chan_g + n0 + 4);
         const float32x4_t su0 = vld1q_f32(chan_u + n0), su1 = vld1q_f32(chan_u + n0 + 4);
         for (int r = 0; r < nr; ++r) {
