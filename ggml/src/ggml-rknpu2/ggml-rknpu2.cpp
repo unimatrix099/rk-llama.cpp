@@ -1938,7 +1938,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
         // instead of accumulating, so its M x N output is not zeroed here
         // (a serial memset on the main thread, ~8% of pp512). Same
         // conditions as `pipelined` there.
-        const bool pipelined_node = rknpu_pipeline_enabled() && nbatch == 1 && M > 256 &&
+        const bool pipelined_node = rknpu_pipeline_enabled() && nbatch == 1 && M > 128 &&
             pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4 &&
             pipeline->npu_type_c == rknpu2_configuration::NPU_TYPE_INT16 &&
             pipeline->ac_layout == RKNN_MM_LAYOUT_NATIVE &&
@@ -2096,8 +2096,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 // extra B read per chunk (prefill NPU runs are compute-bound:
                 // 1.55 vs 1.62 ms/token at M=512 vs 256). RKNPU_PIPELINE=0
                 // disables it.
-                const int MC = 256;
-                static_assert(MC == 256, "pipelined_node uses M > 256");
+                const int MC = 128;
+                static_assert(MC == 128, "pipelined_node uses M > 128");
                 const bool fused_now = fuse_glu != nullptr && all_k_segments.size() == 1;
                 auto& dg = backend_ctx->deferred_gate;
                 const bool use_dg = dg.gate != nullptr && pipelined_node && fused_now && fuse_glu->src[0] == dg.gate &&
