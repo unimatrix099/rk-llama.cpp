@@ -1,6 +1,6 @@
 // FLASH_ATTN_EXT: RKNPU backend vs CPU backend at Gemma-4 E4B shapes
 // (head dim 256, 8 query heads on 2 KV heads, causal mask, softcap, 1-2
-// sequences). Hardware test: needs the board's NPU. Caught the P*V-all-zeros
+// sequences, two rounds). Hardware test: needs the board's NPU. Caught the P*V-all-zeros
 // bug of the first NPU attention version (B re-bind, decode research #1e).
 //
 // Build on the board from the repo root:
@@ -49,10 +49,14 @@ int main() {
     int bad = 0;
     struct { int nq, nkv, nseq; bool mask; float softcap; } cases[] = {
         {64, 256, 1, false, 0.0f}, {64, 256, 1, true, 0.0f}, {64, 256, 1, true, 30.0f}, {64, 256, 2, true, 0.0f}, {512, 512, 1, true, 0.0f},
+        {512, 512, 4, true, 0.0f},
     };
     const int DK = 256, nh = 8, nkvh = 2;
+    // two rounds with different data: the second reuses the backend's warm
+    // attention contexts, so state left in them from earlier calls shows up
+    for (int round = 0; round < 2; ++round)
     for (auto& c : cases) {
-        std::mt19937 g(11); std::normal_distribution<float> d(0, 1);
+        std::mt19937 g(11 + 1000 * round); std::normal_distribution<float> d(0, 1);
         std::vector<float> qv((size_t)DK * c.nq * nh * c.nseq);
         std::vector<ggml_fp16_t> kv((size_t)DK * c.nkv * nkvh * c.nseq), vv(kv.size());
         for (auto& x : qv) x = d(g);
@@ -68,8 +72,8 @@ int main() {
         for (size_t i = 0; i < a.size(); ++i) { double e = fabs(a[i] - b[i]); if (e > worst) { worst = e; wi = i; } }
         const bool ok = worst < 2e-2;
         bad += !ok;
-        printf("nq=%d nkv=%d nseq=%d mask=%d softcap=%g: max abs err %.3e at %zu (cpu %g npu %g) %s\n",
-               c.nq, c.nkv, c.nseq, c.mask, c.softcap, worst, wi, a[wi], b[wi], ok ? "OK" : "WRONG");
+        printf("round %d nq=%d nkv=%d nseq=%d mask=%d softcap=%g: max abs err %.3e at %zu (cpu %g npu %g) %s\n",
+               round, c.nq, c.nkv, c.nseq, c.mask, c.softcap, worst, wi, a[wi], b[wi], ok ? "OK" : "WRONG");
     }
     return bad;
 }
