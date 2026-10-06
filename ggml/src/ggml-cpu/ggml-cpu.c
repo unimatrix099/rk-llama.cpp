@@ -3088,9 +3088,12 @@ static int ggml_cpu_try_fuse_ops(
     struct ggml_tensor * node = cgraph->nodes[node_n];
 
     if (node->op == GGML_OP_RMS_NORM) {
-        // RMS_NORM + MUL + ADD fusion (a post-norm followed by its residual add)
+        // RMS_NORM + MUL + ADD (+ MUL by a one-element tensor) fusion: a
+        // post-norm followed by its residual add (and a layer scale)
+        const enum ggml_op fuse_ops4[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL };
         const enum ggml_op fuse_ops3[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
-        if (ggml_can_fuse(cgraph, node_n, fuse_ops3, 3)) {
+        const bool fuse4 = ggml_can_fuse(cgraph, node_n, fuse_ops4, 4);
+        if (fuse4 || ggml_can_fuse(cgraph, node_n, fuse_ops3, 3)) {
             struct ggml_tensor * mul_node = cgraph->nodes[node_n + 1];
             struct ggml_tensor * add_node = cgraph->nodes[node_n + 2];
             const struct ggml_tensor * mul_w = (mul_node->src[0] == node) ? mul_node->src[1] : mul_node->src[0];
@@ -3106,6 +3109,15 @@ static int ggml_cpu_try_fuse_ops(
                 ggml_are_same_shape(mul_node, add_node) &&
                 res->nb[0]          == sizeof(float)) {
 
+                if (fuse4) {
+                    struct ggml_tensor * sc_node = cgraph->nodes[node_n + 3];
+                    const struct ggml_tensor * kt = (sc_node->src[0] == add_node) ? sc_node->src[1] : sc_node->src[0];
+                    if (kt->type == GGML_TYPE_F32 && ggml_nelements(kt) == 1 && sc_node->type == GGML_TYPE_F32 &&
+                        ggml_are_same_shape(sc_node, add_node)) {
+                        ggml_compute_forward_rms_norm_mul_add_scale_fused(params, node, mul_node, add_node, sc_node);
+                        return 3;
+                    }
+                }
                 ggml_compute_forward_rms_norm_mul_add_fused(params, node, mul_node, add_node);
                 return 2;
             }

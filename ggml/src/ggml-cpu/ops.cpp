@@ -4102,6 +4102,7 @@ enum ggml_rms_norm_fuse_op {
     GGML_RMS_NORM_FUSE_OP_NONE,
     GGML_RMS_NORM_FUSE_OP_MUL,
     GGML_RMS_NORM_FUSE_OP_MUL_ADD,   // rms_norm(x) * w + r (a residual add)
+    GGML_RMS_NORM_FUSE_OP_MUL_ADD_SCALE,   // (rms_norm(x) * w + r) * k, k a one-element tensor
 };
 
 template <ggml_rms_norm_fuse_op FUSE_OP>
@@ -4109,20 +4110,28 @@ static void ggml_compute_forward_rms_norm_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst_rms_norm,
         ggml_tensor * dst_fused = nullptr,
-        ggml_tensor * dst_add = nullptr) {
+        ggml_tensor * dst_add = nullptr,
+        ggml_tensor * dst_scale = nullptr) {
 
     const ggml_tensor * src0 = dst_rms_norm->src[0];
     const ggml_tensor * src1 = nullptr;
     const ggml_tensor * res  = nullptr;
     ggml_tensor       * dst  = dst_rms_norm;
 
-    if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL || FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD) {
+    constexpr bool with_add = FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD || FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD_SCALE;
+    if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL || with_add) {
         src1 = (dst_fused->src[0] == dst_rms_norm) ? dst_fused->src[1] : dst_fused->src[0];
         dst  = dst_fused;
     }
-    if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD) {
+    if constexpr (with_add) {
         res = (dst_add->src[0] == dst_fused) ? dst_add->src[1] : dst_add->src[0];
         dst = dst_add;
+    }
+    float k_scale = 1.0f;
+    if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD_SCALE) {
+        const ggml_tensor * kt = (dst_scale->src[0] == dst_add) ? dst_scale->src[1] : dst_scale->src[0];
+        k_scale = *(const float *) kt->data;
+        dst = dst_scale;
     }
 
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
@@ -4173,7 +4182,7 @@ static void ggml_compute_forward_rms_norm_f32(
 
                 float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
 
-                if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD) {
+                if constexpr (with_add) {
                     // as the MUL below, then + r: the same operations as the
                     // separate ADD (a float add commutes exactly)
                     const int64_t i11 = i01 % ne11;
@@ -4185,15 +4194,20 @@ static void ggml_compute_forward_rms_norm_f32(
                     int64_t j = 0;
 #if defined(__ARM_NEON) && defined(__aarch64__)
                     const float32x4_t vs = vdupq_n_f32(scale);
+                    const float32x4_t vk = vdupq_n_f32(k_scale);
                     for (; j + 4 <= ne00; j += 4) {
                         float32x4_t p = vmulq_f32(vmulq_f32(vld1q_f32(x + j), vs), vld1q_f32(w + j));
                         __asm__("" : "+w"(p));   // keep the product rounded: no fused multiply-add
-                        vst1q_f32(y + j, vaddq_f32(p, vld1q_f32(r + j)));
+                        float32x4_t t = vaddq_f32(p, vld1q_f32(r + j));
+                        if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD_SCALE) t = vmulq_f32(t, vk);
+                        vst1q_f32(y + j, t);
                     }
 #endif
                     for (; j < ne00; j++) {
                         volatile float p = x[j] * scale * w[j];   // likewise
-                        y[j] = p + r[j];
+                        float t = p + r[j];
+                        if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL_ADD_SCALE) t = t * k_scale;
+                        y[j] = t;
                     }
                 } else if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
                     const int64_t i11 = i01 % ne11;
@@ -4247,6 +4261,16 @@ void ggml_compute_forward_rms_norm_mul_add_fused(
         ggml_tensor * dst_add) {
     GGML_ASSERT(dst_rms_norm->src[0]->type == GGML_TYPE_F32);
     ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_MUL_ADD>(params, dst_rms_norm, dst_mul, dst_add);
+}
+
+void ggml_compute_forward_rms_norm_mul_add_scale_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * dst_rms_norm,
+        ggml_tensor * dst_mul,
+        ggml_tensor * dst_add,
+        ggml_tensor * dst_scale) {
+    GGML_ASSERT(dst_rms_norm->src[0]->type == GGML_TYPE_F32);
+    ggml_compute_forward_rms_norm_f32<GGML_RMS_NORM_FUSE_OP_MUL_ADD_SCALE>(params, dst_rms_norm, dst_mul, dst_add, dst_scale);
 }
 
 void ggml_compute_forward_rms_norm_mul_fused(
