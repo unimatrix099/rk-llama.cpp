@@ -2353,6 +2353,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 // (or MUL) tensor; the raw projection is never written.
                 struct ggml_tensor* hn_norm = nullptr;
                 struct ggml_tensor* hn_out = nullptr;
+                struct ggml_tensor* hn_rope = nullptr;   // RoPE fused after the norm, if any
                 const float* hn_w = nullptr;
                 float hn_eps = 0.0f;
                 int hn_last = -1;
@@ -2391,6 +2392,28 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                             hn_w = w ? (const float*)get_tensor_real_ptr(w) : nullptr;
                             memcpy(&hn_eps, nn->op_params, sizeof(float));
                             hn_last = w ? jm : jn;
+                            // and the RoPE of the normed heads, when it follows and
+                            // is the only reader of the norm output
+                            const int jr = next_op(hn_last);
+                            struct ggml_tensor* rr = jr >= 0 ? cgraph->nodes[jr] : nullptr;
+                            static const bool rope_fuse = []() {
+                                const char* env = std::getenv("RKNPU_ROPE_FUSE");
+                                return env == nullptr || std::atoi(env) != 0;
+                            }();
+                            if (rope_fuse && rknpu_rope_enabled() && rr && rr->src[0] == hn_out && rknpu_rope_supported(rr) &&
+                                rr->ne[2] == M && !(hn_out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                                bool sole = true;
+                                for (int j = node_i + 1; j < cgraph->n_nodes && sole; ++j) {
+                                    const struct ggml_tensor* t = cgraph->nodes[j];
+                                    if (t->view_src == hn_out) sole = false;
+                                    for (int q = 0; q < GGML_MAX_SRC; ++q) sole = sole && (t->src[q] != hn_out || t == rr);
+                                }
+                                if (sole) {
+                                    hn_rope = rr;
+                                    hn_out = rr;
+                                    hn_last = jr;
+                                }
+                            }
                             hn_last_node = hn_last;
                         }
                     }
@@ -2603,6 +2626,14 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         }
                         float* out = (float*)get_tensor_real_ptr(hn_out);
                         const int64_t hd = hn_norm->ne[0];
+                        rknpu_rope_params rp;
+                        const int32_t* rpos = nullptr;
+                        const float* rff = nullptr;
+                        if (hn_rope) {
+                            rp = rknpu_rope_get(hn_rope);
+                            rpos = (const int32_t*)get_tensor_real_ptr(hn_rope->src[1]);
+                            rff = hn_rope->src[2] ? (const float*)get_tensor_real_ptr(hn_rope->src[2]) : nullptr;
+                        }
                         const int n_blocks = (rows + 3) / 4;
                         #pragma omp parallel for num_threads(n_omp)
                         for (int blk = 0; blk < n_blocks; ++blk) {
@@ -2621,10 +2652,16 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                                     active_n_segments[idx].size_n, common,
                                     scales_B_grid->data() + N_offset, /*store=*/ true);
                             }
+                            static thread_local std::vector<float> rcache;
+                            if (hn_rope && (int64_t)rcache.size() < hd) rcache.resize(hd);
                             for (int r = 0; r < nr; ++r) {
                                 const float* x = rbuf.data() + (size_t)r * N;
                                 float* y = out + (size_t)(m0 + r0 + r) * N;
-                                for (int64_t h = 0; h < N; h += hd) rknpu_head_norm(y + h, x + h, hd, hn_eps, hn_w);
+                                if (hn_rope) rknpu_rope_cache(rcache.data(), rpos[m0 + r0 + r], rp, rff, hd);
+                                for (int64_t h = 0; h < N; h += hd) {
+                                    rknpu_head_norm(y + h, x + h, hd, hn_eps, hn_w);
+                                    if (hn_rope) rknpu_rope_head(y + h, y + h, rcache.data(), hd, rp);
+                                }
                             }
                         }
                     };
