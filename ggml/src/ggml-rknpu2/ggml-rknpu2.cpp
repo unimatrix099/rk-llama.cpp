@@ -24,6 +24,7 @@
 #include <cstring>
 #include <chrono>
 #include <deque>
+#include <unordered_set>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -634,6 +635,9 @@ struct ggml_backend_rknpu_context {
     rknpu_async_runner async_runner;
     rknpu_deferred_gate deferred_gate;
     rknpu_w4a4_job down_job;
+    // nodes already computed ahead of their graph position (a KV-cache write
+    // done inside its projection's dequant)
+    std::unordered_set<const struct ggml_tensor*> done_nodes;
     rknpu_fn_pool fa_pool;
     // whole-FFN schedule (rknpu_ffn_block): gate, up and down jobs, and
     // gate's and up's chunk contexts as one runner batch
@@ -1128,6 +1132,47 @@ static void rknpu_rope_op(struct ggml_tensor* dst, int n_omp) {
         rknpu_rope_cache(cache.data(), pp[t], rp, ff, ne0);
         for (int64_t h = 0; h < nh; ++h) rknpu_rope_head(y + (t * nh + h) * ne0, x + (t * nh + h) * ne0, cache.data(), ne0, rp);
     }
+}
+
+// KV-cache writes of the fused K (normed + roped) and V (normed) rows:
+// SET_ROWS from a view of those outputs into an F16 (or F32) cache, with
+// ggml-cpu's conversion (round to nearest even) (RKNPU_KV_WRITE)
+static bool rknpu_kv_write_enabled() {
+    static const bool v = []() {
+        const char* env = std::getenv("RKNPU_KV_WRITE");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return v;
+}
+static bool rknpu_set_rows_supported(const struct ggml_tensor* op) {
+    const struct ggml_tensor *b = op->src[0], *idx = op->src[1];
+    if (op->op != GGML_OP_SET_ROWS || !b || !idx || b->type != GGML_TYPE_F32) return false;
+    if (op->type != GGML_TYPE_F16 && op->type != GGML_TYPE_F32) return false;
+    if (idx->type != GGML_TYPE_I64 && idx->type != GGML_TYPE_I32) return false;
+    if (b->ne[2] != 1 || b->ne[3] != 1 || op->ne[2] != 1 || op->ne[3] != 1 || idx->ne[0] != b->ne[1] || ggml_nrows(idx) != 1) return false;
+    if (b->nb[0] != sizeof(float) || op->nb[0] != ggml_type_size(op->type) || b->ne[0] != op->ne[0]) return false;
+    const struct ggml_tensor* src = b->view_src ? b->view_src : b;
+    return (src->op == GGML_OP_ROPE && rknpu_rope_supported(src)) ||
+           (src->op == GGML_OP_RMS_NORM && rknpu_head_norm_supported(src));
+}
+static inline int64_t rknpu_row_index(const struct ggml_tensor* idx, const void* base, int64_t i) {
+    return idx->type == GGML_TYPE_I64 ? ((const int64_t*)base)[i] : (int64_t)((const int32_t*)base)[i];
+}
+// one row into the cache
+static inline void rknpu_kv_store_row(const struct ggml_tensor* sr, char* cache, const void* idxp, int64_t i, const float* row) {
+    const int64_t c = rknpu_row_index(sr->src[1], idxp, i);
+    GGML_ASSERT(c >= 0 && c < sr->ne[1]);
+    char* d = cache + c * sr->nb[1];
+    if (sr->type == GGML_TYPE_F16) rknpu_fp32_to_fp16(row, (uint16_t*)d, sr->ne[0]);
+    else memcpy(d, row, sr->ne[0] * sizeof(float));
+}
+static void rknpu_set_rows_op(struct ggml_tensor* sr, int n_omp) {
+    const struct ggml_tensor* b = sr->src[0];
+    const char* bp = (const char*)get_tensor_real_ptr(b);
+    const void* ip = get_tensor_real_ptr(sr->src[1]);
+    char* cache = (char*)get_tensor_real_ptr(sr);
+    #pragma omp parallel for num_threads(n_omp)
+    for (int64_t i = 0; i < b->ne[1]; ++i) rknpu_kv_store_row(sr, cache, ip, i, (const float*)(bp + i * b->nb[1]));
 }
 
 static bool rknpu_glu_supported(const struct ggml_tensor* op) {
@@ -2011,6 +2056,11 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
             rknpu_head_norm_op(node, mul, n_omp);
             continue;
         }
+        if (!backend_ctx->done_nodes.empty() && backend_ctx->done_nodes.erase(node)) continue;
+        if (node->op == GGML_OP_SET_ROWS) {   // KV-cache write not fused into its projection's dequant
+            rknpu_set_rows_op(node, n_omp);
+            continue;
+        }
         if (node->op == GGML_OP_ROPE) {   // RoPE not fused into a projection's dequant
             rknpu_rope_op(node, n_omp);
             continue;
@@ -2268,6 +2318,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
         size_t current_offset_in_tensor = 0;
         std::vector<size_t> seg_b_offset(num_active_segments, 0);
         int hn_last_node = -1;   // last node fused into a per-head-norm dequant (see below)
+        const struct ggml_tensor* hn_kv_node = nullptr;   // the cache write it did ahead of its position
         for (size_t k_idx = 0; k_idx < all_k_segments.size(); ++k_idx) {
             const auto& k_seg = all_k_segments[k_idx];
             const int K_seg_op = k_seg.size_k;
@@ -2354,6 +2405,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 struct ggml_tensor* hn_norm = nullptr;
                 struct ggml_tensor* hn_out = nullptr;
                 struct ggml_tensor* hn_rope = nullptr;   // RoPE fused after the norm, if any
+                struct ggml_tensor* hn_kv = nullptr;     // KV-cache write fused at the end, if any
+                bool hn_kv_only = false;                 // ... and nothing else reads the FP32 rows
                 const float* hn_w = nullptr;
                 float hn_eps = 0.0f;
                 int hn_last = -1;
@@ -2415,6 +2468,43 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                                 }
                             }
                             hn_last_node = hn_last;
+                            // and the KV-cache write of the result, found further on
+                            // (K's comes after V's projection): done here if no
+                            // computing node in between touches that cache
+                            if (rknpu_kv_write_enabled()) {
+                                for (int j = hn_last + 1; j < cgraph->n_nodes && j < hn_last + 64; ++j) {
+                                    struct ggml_tensor* t = cgraph->nodes[j];
+                                    if (t->op == GGML_OP_SET_ROWS && t->src[0] && t->src[0]->view_src == hn_out &&
+                                        rknpu_set_rows_supported(t) && t->src[0]->ne[0] == N && t->src[0]->ne[1] == M &&
+                                        t->src[0]->nb[1] == (size_t)N * sizeof(float)) {
+                                        const struct ggml_tensor* cache = t->view_src;
+                                        bool clear = cache != nullptr;
+                                        for (int q2 = hn_last + 1; q2 < j && clear; ++q2) {
+                                            const struct ggml_tensor* u = cgraph->nodes[q2];
+                                            if (u->op == GGML_OP_VIEW || u->op == GGML_OP_RESHAPE || u->op == GGML_OP_PERMUTE || u->op == GGML_OP_TRANSPOSE || u->op == GGML_OP_NONE) continue;
+                                            if (u->view_src == cache) clear = false;
+                                            for (int q = 0; q < GGML_MAX_SRC; ++q) {
+                                                const struct ggml_tensor* sq = u->src[q];
+                                                clear = clear && !(sq && (sq == cache || sq->view_src == cache));
+                                            }
+                                        }
+                                        if (clear) {
+                                            hn_kv = t;
+                                            hn_kv_node = t;
+                                            // the FP32 rows need not be written if only the cache write reads them
+                                            bool only = true;
+                                            for (int q2 = node_i + 1; q2 < cgraph->n_nodes && only; ++q2) {
+                                                const struct ggml_tensor* u = cgraph->nodes[q2];
+                                                if (u == t || u == t->src[0]) continue;
+                                                if (u->view_src == hn_out) only = false;
+                                                for (int q = 0; q < GGML_MAX_SRC; ++q) only = only && u->src[q] != hn_out && u->src[q] != t->src[0];
+                                            }
+                                            hn_kv_only = only && !(hn_out->flags & GGML_TENSOR_FLAG_OUTPUT);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2629,6 +2719,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         rknpu_rope_params rp;
                         const int32_t* rpos = nullptr;
                         const float* rff = nullptr;
+                        char* kv_cache = hn_kv ? (char*)get_tensor_real_ptr(hn_kv) : nullptr;
+                        const void* kv_idx = hn_kv ? get_tensor_real_ptr(hn_kv->src[1]) : nullptr;
                         if (hn_rope) {
                             rp = rknpu_rope_get(hn_rope);
                             rpos = (const int32_t*)get_tensor_real_ptr(hn_rope->src[1]);
@@ -2655,13 +2747,14 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                             static thread_local std::vector<float> rcache;
                             if (hn_rope && (int64_t)rcache.size() < hd) rcache.resize(hd);
                             for (int r = 0; r < nr; ++r) {
-                                const float* x = rbuf.data() + (size_t)r * N;
-                                float* y = out + (size_t)(m0 + r0 + r) * N;
+                                float* x = rbuf.data() + (size_t)r * N;
+                                float* y = hn_kv_only ? x : out + (size_t)(m0 + r0 + r) * N;   // in place when only the cache needs it
                                 if (hn_rope) rknpu_rope_cache(rcache.data(), rpos[m0 + r0 + r], rp, rff, hd);
                                 for (int64_t h = 0; h < N; h += hd) {
                                     rknpu_head_norm(y + h, x + h, hd, hn_eps, hn_w);
                                     if (hn_rope) rknpu_rope_head(y + h, y + h, rcache.data(), hd, rp);
                                 }
+                                if (hn_kv) rknpu_kv_store_row(hn_kv, kv_cache, kv_idx, m0 + r0 + r, y);
                             }
                         }
                     };
@@ -3063,8 +3156,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
             ++node_i;   // the GLU was computed inside this node's dequant
         }
         if (hn_last_node >= 0) node_i = hn_last_node;   // the norm (and MUL) were computed in its dequant
+        if (hn_kv_node) backend_ctx->done_nodes.insert(hn_kv_node);   // its cache write too
     }
     rknpu_materialize_deferred_gate(backend_ctx->deferred_gate, n_omp);
+    backend_ctx->done_nodes.clear();   // pointers are only meaningful within this graph
 
     return GGML_STATUS_SUCCESS;
 }
@@ -3701,6 +3796,9 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
 
         case GGML_OP_RMS_NORM:
             return rknpu_head_norm_enabled() && rknpu_head_norm_supported(op);
+
+        case GGML_OP_SET_ROWS:
+            return rknpu_kv_write_enabled() && rknpu_set_rows_supported(op);
 
         case GGML_OP_ROPE:
             return (rknpu_rope_any() || (rknpu_rope_enabled() && rknpu_head_norm_enabled())) && rknpu_rope_supported(op);
