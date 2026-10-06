@@ -1019,7 +1019,11 @@ static void rknpu_head_norm_op(struct ggml_tensor* norm, struct ggml_tensor* mul
 // RoPE of the per-head-normed Q/K (Gemma-4), reproducing ggml-cpu
 // exactly: the same cos/sin cache (no YaRN extrapolation, ext_factor == 0)
 // and the rotation as ggml-cpu's compiled code does it, one rounded product
-// then a fused multiply-add: y0 = fma(-x1, s, x0*c), y1 = fma(x0, s, x1*c).
+// then a fused multiply-add. GCC contracted the two modes differently:
+// NEOX y0 = fma(x0, c, -(x1*s)), y1 = fma(x0, s, x1*c); NORMAL
+// y0 = fma(-x1, s, x0*c), y1 = fma(x0, s, x1*c). Found by testing all four
+// orders against ggml-cpu; test-rknpu2-rope.cpp checks it bit for bit (the
+// guard runs it), since a different compiler could contract differently.
 // Supported only after a head norm this backend runs (RKNPU_ROPE), or for
 // any F32 RoPE with RKNPU_ROPE_ANY=1 (exactness tests).
 struct rknpu_rope_params {
@@ -1086,7 +1090,7 @@ static inline void rknpu_rope_head(float* y, const float* x, const float* cache,
         for (; i + 4 <= h; i += 4) {
             const float32x4x2_t cs = vld2q_f32(cache + 2 * i);   // cos, sin
             const float32x4_t x0 = vld1q_f32(xa + i), x1 = vld1q_f32(xa + i + h);
-            const float32x4_t y0 = vfmsq_f32(vmulq_f32(x0, cs.val[0]), x1, cs.val[1]);
+            const float32x4_t y0 = vfmaq_f32(vnegq_f32(vmulq_f32(x1, cs.val[1])), x0, cs.val[0]);
             const float32x4_t y1 = vfmaq_f32(vmulq_f32(x1, cs.val[0]), x0, cs.val[1]);
             vst1q_f32(ya + i, y0);
             vst1q_f32(ya + i + h, y1);
@@ -1094,7 +1098,7 @@ static inline void rknpu_rope_head(float* y, const float* x, const float* cache,
 #endif
         for (; i < h; ++i) {
             const float c = cache[2 * i], sn = cache[2 * i + 1], x0 = xa[i], x1 = xa[i + h];
-            ya[i]     = fmaf(-x1, sn, x0 * c);
+            ya[i]     = fmaf(x0, c, -(x1 * sn));
             ya[i + h] = fmaf(x0, sn, x1 * c);
         }
     } else {   // NORMAL: adjacent pairs
