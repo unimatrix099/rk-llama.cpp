@@ -579,7 +579,7 @@ struct rknpu_fn_pool {
     struct ticket { bool done = false; };
     void submit(ticket& t, std::function<void()> fn) {
         std::unique_lock<std::mutex> lock(mutex);
-        while (threads.size() < 2) threads.emplace_back([this] { worker(); });
+        while (threads.size() < 3) threads.emplace_back([this] { worker(); });   // QK(it+1), PV(it), PV(it-1)
         t.done = false;
         queue.push_back({&t, std::move(fn)});
         cv.notify_one();
