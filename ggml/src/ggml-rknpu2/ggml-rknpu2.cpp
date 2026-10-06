@@ -557,6 +557,9 @@ struct ggml_backend_rknpu_context {
     // gate's and up's chunk contexts as one runner batch
     rknpu_w4a4_job ffn_gate, ffn_up, ffn_down;
     std::vector<std::shared_ptr<rknpu_matmul_context>> ffn_gu_ctx, ffn_gud_ctx;
+    // shared-input block (rknpu_shared_input_block): up to 3 jobs, one batch
+    rknpu_w4a4_job sib_job[3];
+    std::vector<std::shared_ptr<rknpu_matmul_context>> sib_ctx;
 
     // (M, K, N, B layout, core) -> attention matmul context
     std::map<std::tuple<int, int, int, int, int>, std::unique_ptr<rknpu_attn_context>> attn_ctx_cache;
@@ -1302,6 +1305,76 @@ static void rknpu_ffn_block(ggml_backend_rknpu_context* bctx, const struct ggml_
     rknpu_w4a4_job_collect(d, n - 1, out, n_omp);
 }
 
+// Consecutive matmuls reading the same activations (Gemma-4's Q, K, V) as
+// one block: each row is read once and transformed and quantized for every
+// job, the jobs' chunk c runs as one NPU batch, and while it runs the CPU
+// preps chunk c+1 and stores chunk c-1 of every output. Element-exact vs
+// running the nodes one by one.
+static void rknpu_shared_input_block(ggml_backend_rknpu_context* bctx, int n_jobs, const struct ggml_tensor* src1,
+                                     struct ggml_tensor* const* dsts, int n_omp) {
+    rknpu_w4a4_job* jobs = bctx->sib_job;
+    auto& batch = bctx->sib_ctx;
+    batch.clear();
+    for (int q = 0; q < n_jobs; ++q) batch.insert(batch.end(), jobs[q].cctx.begin(), jobs[q].cctx.end());
+    const float* x = (const float*)get_tensor_real_ptr(src1);
+    const int row_stride = (int)(src1->nb[1] / sizeof(float));
+    float* outs[3];
+    for (int q = 0; q < n_jobs; ++q) outs[q] = (float*)get_tensor_real_ptr(dsts[q]);
+    const int MC = jobs[0].MC, M = jobs[0].M, n = jobs[0].n_chunks, K = jobs[0].K;
+    auto prep = [&](int c) {
+        const int m0 = c * MC, rows = std::min(MC, M - m0);
+        #pragma omp parallel for num_threads(n_omp)
+        for (int r = 0; r < rows; ++r) {
+            const float* src_row = x + (size_t)(m0 + r) * row_stride;
+            static thread_local std::vector<float> full_row;
+            static thread_local std::vector<uint8_t> packed_row;
+            if (full_row.size() < (size_t)K) full_row.resize(K);
+            if (packed_row.size() < (size_t)K / 2) packed_row.resize(K / 2);
+            for (int q = 0; q < n_jobs; ++q) {
+                rknpu_w4a4_job& j = jobs[q];
+                rknpu2_calibration::hadamard_transform_signed(full_row.data(), src_row, j.s_vec, K, K);
+                const float sc = j.a_clip * rknpu2_quantization::amax_fp32(full_row.data(), K) / 7.0f;
+                j.scales_A[0][m0 + r] = sc;
+                rknpu2_quantization::quantize_fp32_to_int4_packed(full_row.data(), packed_row.data(), K, sc);
+                const auto& ag = j.a_geom[0];
+                rknpu2_native_scatter_row((uint8_t*)j.a[c][0]->virt_addr, packed_row.data(), r, ag.m_stride, ag.outer, ag.sub / 2);
+            }
+        }
+        for (int q = 0; q < n_jobs; ++q) {
+            RKNN_CHECK(rknn_mem_sync(jobs[q].cctx[0]->ctx, jobs[q].a[c][0].get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A sib chunk");
+        }
+    };
+    auto start = [&](int c) {
+        for (int q = 0; q < n_jobs; ++q) rknpu_w4a4_job_bind(jobs[q], c);
+        bctx->async_runner.start(batch);
+    };
+    auto collect = [&](int c) {
+        for (int q = 0; q < n_jobs; ++q) {
+            for (size_t i = 0; i < jobs[q].cctx.size(); ++i) {
+                RKNN_CHECK(rknn_mem_sync(jobs[q].cctx[i]->ctx, jobs[q].c[c & 1][i].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C sib chunk");
+            }
+        }
+        const int m0 = c * MC, rows = std::min(MC, M - m0);
+        const int n_blocks = (rows + 3) / 4;
+        #pragma omp parallel for num_threads(n_omp)
+        for (int it = 0; it < n_blocks * n_jobs; ++it) {
+            const int q = it / n_blocks, r0 = (it % n_blocks) * 4;
+            const rknpu_w4a4_job& j = jobs[q];
+            rknpu_job_rows(j, outs[q] + (size_t)(m0 + r0) * j.N, (size_t)j.N, c, r0, std::min(4, rows - r0));
+        }
+    };
+    prep(0);
+    start(0);
+    for (int c = 1; c < n; ++c) {
+        prep(c);                     // overlaps batch c-1
+        bctx->async_runner.wait();
+        start(c);
+        collect(c - 1);              // overlaps batch c
+    }
+    bctx->async_runner.wait();
+    collect(n - 1);
+}
+
 static bool rknpu_fa_supported(const struct ggml_tensor* op) {
     const struct ggml_tensor *q = op->src[0], *k = op->src[1], *v = op->src[2], *mask = op->src[3], *sinks = op->src[4];
     if (!q || !k || !v || sinks) return false;
@@ -1488,6 +1561,52 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     continue;
                 }
                 backend_ctx->ffn_gate.node = backend_ctx->ffn_up.node = backend_ctx->ffn_down.node = nullptr;
+            }
+        }
+
+        // matmuls sharing this node's activations, adjacent in the graph
+        // (views in between do not compute): rknpu_shared_input_block
+        {
+            static const bool sib_enabled = []() {
+                const char* env = std::getenv("RKNPU_SHARED_INPUT");
+                return env == nullptr || std::atoi(env) != 0;
+            }();
+            static const int MCs = []() {
+                const char* env = std::getenv("RKNPU_SHARED_INPUT_MC");
+                const int v = env ? std::atoi(env) : 128;
+                return (v >= 32 && v <= 512 && v % 32 == 0) ? v : 128;
+            }();
+            const struct ggml_tensor* x = node->src[1];
+            const int Ms = (int)x->ne[1];
+            if (sib_enabled && rknpu_pipeline_enabled() && n_omp > 1 && Ms > MCs && x->type == GGML_TYPE_F32 &&
+                x->nb[0] == sizeof(float) && x->ne[2] * x->ne[3] == 1) {
+                struct ggml_tensor* members[3] = {node, nullptr, nullptr};
+                int n_members = 1, last = node_i;
+                for (int j = node_i + 1; j < cgraph->n_nodes && n_members < 3; ++j) {
+                    struct ggml_tensor* t = cgraph->nodes[j];
+                    if (t->op == GGML_OP_MUL_MAT && t->src[1] == x && t->src[0]->ne[0] == node->src[0]->ne[0] &&
+                        ggml_is_contiguous(t) && t->ne[2] * t->ne[3] == 1) {
+                        members[n_members++] = t;
+                        last = j;
+                        continue;
+                    }
+                    if (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE ||
+                        t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE) continue;
+                    break;
+                }
+                bool ok = n_members >= 2 && ggml_is_contiguous(node) && node->ne[2] * node->ne[3] == 1;
+                for (int q = 0; q < n_members && ok; ++q) {
+                    ok = rknpu_w4a4_job_setup(backend_ctx, backend_ctx->sib_job[q], members[q], Ms, MCs, 4 + q) &&
+                         backend_ctx->sib_job[q].seg_off.size() == 1 && backend_ctx->sib_job[q].seg_len[0] == backend_ctx->sib_job[q].K;
+                }
+                if (ok) {
+                    rknpu_shared_input_block(backend_ctx, n_members, x, members, n_omp);
+                    for (auto& j : backend_ctx->sib_job) j.node = nullptr;
+                    node_i = last;
+                    if (g_rknpu_profile.on) g_rknpu_profile.node_ns += rknpu_profile::ns(t_node, std::chrono::steady_clock::now());
+                    continue;
+                }
+                for (auto& j : backend_ctx->sib_job) j.node = nullptr;
             }
         }
 
