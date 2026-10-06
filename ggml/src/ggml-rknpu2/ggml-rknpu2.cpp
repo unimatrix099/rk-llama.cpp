@@ -517,8 +517,8 @@ struct rknpu_deferred_gate {
 // the NPU before up's last collect, which it then overlaps; and both of its
 // K-segments run per chunk, dequantized together (dequant2). Element-exact
 // vs the separate GLU write, prep and per-segment passes.
-struct rknpu_down_job {
-    const struct ggml_tensor* node = nullptr;   // pending down matmul
+struct rknpu_w4a4_job {
+    const struct ggml_tensor* node = nullptr;   // pending matmul
     int M = 0, N = 0, K = 0, MC = 0, n_chunks = 0;
     size_t nas = 0;
     std::vector<int> seg_off, seg_len;                                  // K-segments
@@ -552,7 +552,11 @@ struct ggml_backend_rknpu_context {
     rknpu_dispatch_pool dispatch_pool;
     rknpu_async_runner async_runner;
     rknpu_deferred_gate deferred_gate;
-    rknpu_down_job down_job;
+    rknpu_w4a4_job down_job;
+    // whole-FFN schedule (rknpu_ffn_block): gate, up and down jobs, and
+    // gate's and up's chunk contexts as one runner batch
+    rknpu_w4a4_job ffn_gate, ffn_up, ffn_down;
+    std::vector<std::shared_ptr<rknpu_matmul_context>> ffn_gu_ctx;
 
     // (M, K, N, B layout, core) -> attention matmul context
     std::map<std::tuple<int, int, int, int, int>, std::unique_ptr<rknpu_attn_context>> attn_ctx_cache;
@@ -960,11 +964,12 @@ static void __attribute__((noinline)) rknpu_fused_gate_up_geglu_block(
     }
 }
 
-// Sets up `down` (the matmul after [up, GLU]) as a rknpu_down_job; false
+// Sets up `down` (the matmul after [up, GLU]) as a rknpu_w4a4_job; false
 // when it would not take the pipelined W4A4 path with K-segments on
 // Hadamard block bounds (then nothing is staged and it runs normally)
-static bool rknpu_down_job_setup(ggml_backend_rknpu_context* bctx, rknpu_down_job& j,
-                                 const struct ggml_tensor* down, int M, int MC) {
+static bool rknpu_w4a4_job_setup(ggml_backend_rknpu_context* bctx, rknpu_w4a4_job& j,
+                                 const struct ggml_tensor* down, int M, int MC, int role = 0) {
+    // role separates the A/C buffer cache keys of jobs that are live at once
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
     const struct ggml_tensor* w = down->src[0];
     if (!w->buffer || strcmp(ggml_backend_buft_name(ggml_backend_buffer_get_type(w->buffer)), "RKNPU") != 0) return false;
@@ -1036,7 +1041,7 @@ static bool rknpu_down_job_setup(ggml_backend_rknpu_context* bctx, rknpu_down_jo
         for (int sg = 0; sg < ns; ++sg) {
             auto& c0 = j.cctx[sg * nas];
             j.a[c][sg] = get_tensor_buffer(bctx, c0->ctx, c0->io_attr.A.size,
-                std::make_tuple(MC, ksegs[sg].size_k, (int)p->npu_type_a + 16 * (c + 1) + 8192 + 64 * sg, dom), bctx->a_buffer_cache);
+                std::make_tuple(MC, ksegs[sg].size_k, (int)p->npu_type_a + 16 * (c + 1) + 8192 + 64 * sg + 1024 * role, dom), bctx->a_buffer_cache);
             if (!j.a[c][sg]) return false;
         }
     }
@@ -1046,7 +1051,7 @@ static bool rknpu_down_job_setup(ggml_backend_rknpu_context* bctx, rknpu_down_jo
             for (size_t idx = 0; idx < nas; ++idx) {
                 auto& mc = j.cctx[sg * nas + idx];
                 j.c[sl][sg * nas + idx] = get_tensor_buffer(bctx, mc->ctx, mc->io_attr.C.size,
-                    std::make_tuple(MC, nsegs[idx].size_n, nsegs[idx].core_id, (int)p->npu_type_c + 16 * (sl + 1) + 8192 + 64 * sg, dom),
+                    std::make_tuple(MC, nsegs[idx].size_n, nsegs[idx].core_id, (int)p->npu_type_c + 16 * (sl + 1) + 8192 + 64 * sg + 1024 * role, dom),
                     bctx->c_buffer_cache);
                 if (!j.c[sl][sg * nas + idx]) return false;
             }
@@ -1079,7 +1084,7 @@ static bool rknpu_down_job_setup(ggml_backend_rknpu_context* bctx, rknpu_down_jo
     return true;
 }
 
-static void rknpu_down_job_start(ggml_backend_rknpu_context* bctx, rknpu_down_job& j, int c) {
+static void rknpu_w4a4_job_bind(rknpu_w4a4_job& j, int c) {
     const int ns = (int)j.seg_off.size();
     for (int sg = 0; sg < ns; ++sg) {
         RKNN_CHECK(rknn_mem_sync(j.cctx[sg * j.nas]->ctx, j.a[c][sg].get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A down chunk");
@@ -1096,11 +1101,15 @@ static void rknpu_down_job_start(ggml_backend_rknpu_context* bctx, rknpu_down_jo
             }
         }
     }
+}
+
+static void rknpu_w4a4_job_start(ggml_backend_rknpu_context* bctx, rknpu_w4a4_job& j, int c) {
+    rknpu_w4a4_job_bind(j, c);
     bctx->async_runner.start(j.cctx);
     j.started = c;
 }
 
-static void rknpu_down_job_collect(rknpu_down_job& j, int c, float* dst, int n_omp) {
+static void rknpu_w4a4_job_collect(rknpu_w4a4_job& j, int c, float* dst, int n_omp) {
     const int ns = (int)j.seg_off.size();
     for (size_t q = 0; q < j.cctx.size(); ++q) {
         RKNN_CHECK(rknn_mem_sync(j.cctx[q]->ctx, j.c[c & 1][q].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C down chunk");
@@ -1138,7 +1147,7 @@ static void rknpu_down_job_collect(rknpu_down_job& j, int c, float* dst, int n_o
 // job's A-prep (per K-segment: Hadamard range, amax, INT4 pack) straight
 // into its A buffer for this chunk instead of being written out
 static void __attribute__((noinline)) rknpu_fused_gate_up_geglu_prep_block(
-        rknpu_down_job& j, const rknpu_deferred_gate& dg, int chunk, int m_abs, int r0, int nr, int N,
+        rknpu_w4a4_job& j, const rknpu_deferred_gate& dg, int chunk, int m_abs, int r0, int nr, int N,
         const float* common, const std::vector<std::shared_ptr<rknn_tensor_mem>>& c_mem,
         const std::vector<rknpu2_native_geom>& c_geom, const std::vector<MatrixSegmentN>& segs, const float* chan) {
     static thread_local std::vector<float> ubuf, gbuf, yrow, full_row;
@@ -1170,6 +1179,125 @@ static void __attribute__((noinline)) rknpu_fused_gate_up_geglu_prep_block(
             rknpu2_native_scatter_row((uint8_t*)j.a[chunk][sg]->virt_addr, packed_row.data(), r0 + r, ag.m_stride, ag.outer, ag.sub / 2);
         }
     }
+}
+
+// A-prep of chunk c for gate and up together (same activation rows, each
+// with its own Hadamard signs): every row is read once. Same steps as the
+// pipelined prep for a single K-segment.
+static void rknpu_ffn_prep(rknpu_w4a4_job& g, rknpu_w4a4_job& u, const float* src1, int row_stride, int c, int n_omp) {
+    const int m0 = c * g.MC, rows = std::min(g.MC, g.M - m0);
+    #pragma omp parallel for num_threads(n_omp)
+    for (int r = 0; r < rows; ++r) {
+        const float* src_row = src1 + (size_t)(m0 + r) * row_stride;
+        static thread_local std::vector<float> full_row;
+        static thread_local std::vector<uint8_t> packed_row;
+        if (full_row.size() < (size_t)g.K) full_row.resize(g.K);
+        if (packed_row.size() < (size_t)g.K / 2) packed_row.resize(g.K / 2);
+        for (rknpu_w4a4_job* j : {&g, &u}) {
+            rknpu2_calibration::hadamard_transform_signed(full_row.data(), src_row, j->s_vec, j->K, j->K);
+            const float sc = j->a_clip * rknpu2_quantization::amax_fp32(full_row.data(), j->K) / 7.0f;
+            j->scales_A[0][m0 + r] = sc;
+            rknpu2_quantization::quantize_fp32_to_int4_packed(full_row.data(), packed_row.data(), j->K, sc);
+            const auto& ag = j->a_geom[0];
+            rknpu2_native_scatter_row((uint8_t*)j->a[c][0]->virt_addr, packed_row.data(), r, ag.m_stride, ag.outer, ag.sub / 2);
+        }
+    }
+    for (rknpu_w4a4_job* j : {&g, &u}) {
+        RKNN_CHECK(rknn_mem_sync(j->cctx[0]->ctx, j->a[c][0].get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A ffn chunk");
+    }
+}
+
+// Rows r0..r0+nr of chunk c of a single-K-segment job, stored into dst
+static void rknpu_job_rows(const rknpu_w4a4_job& j, float* dst, size_t dst_stride, int c, int r0, int nr) {
+    float common[4];
+    for (int r = 0; r < nr; ++r) common[r] = j.scales_A[0][c * j.MC + r0 + r] / j.hdiv;
+    for (size_t idx = 0; idx < j.nas; ++idx) {
+        const int N_offset = j.nsegs[idx].offset_n;
+        const auto& g = j.c_geom[idx];
+        rknpu2_quantization::dequant_acc_int16_tiled_perchan_rows(dst + N_offset, dst_stride,
+            (const int16_t*)j.c[c & 1][idx]->virt_addr, r0, nr, g.m_stride, g.outer, g.sub,
+            j.nsegs[idx].size_n, common, j.chan + N_offset, /*store=*/ true);
+    }
+}
+
+// Gate and up rows of chunk c -> GEGLU -> down's A-prep into its chunk-c
+// A buffer (as rknpu_fused_gate_up_geglu_prep_block)
+static void __attribute__((noinline)) rknpu_ffn_fused_block(rknpu_w4a4_job& g, rknpu_w4a4_job& u, rknpu_w4a4_job& d,
+                                                           int c, int r0, int nr) {
+    const int N = g.N;
+    static thread_local std::vector<float> ubuf, gbuf, yrow, full_row;
+    static thread_local std::vector<uint8_t> packed_row;
+    auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
+    grow(ubuf, (size_t)4 * N);
+    grow(gbuf, (size_t)4 * N);
+    grow(yrow, (size_t)N);
+    rknpu_job_rows(u, ubuf.data(), (size_t)N, c, r0, nr);
+    rknpu_job_rows(g, gbuf.data(), (size_t)N, c, r0, nr);
+    for (int r = 0; r < nr; ++r) {
+        const int m = c * g.MC + r0 + r;
+        rknpu_geglu_row(N, yrow.data(), gbuf.data() + (size_t)r * N, ubuf.data() + (size_t)r * N);
+        for (size_t sg = 0; sg < d.seg_off.size(); ++sg) {
+            const int len = d.seg_len[sg];
+            grow(full_row, (size_t)len);
+            grow(packed_row, (size_t)len / 2);
+            rknpu2_calibration::hadamard_transform_signed_range(full_row.data(), yrow.data(), d.s_vec, d.K, d.seg_off[sg], len);
+            const float sc = d.a_clip * rknpu2_quantization::amax_fp32(full_row.data(), len) / 7.0f;
+            d.scales_A[sg][m] = sc;
+            rknpu2_quantization::quantize_fp32_to_int4_packed(full_row.data(), packed_row.data(), len, sc);
+            const auto& ag = d.a_geom[sg];
+            rknpu2_native_scatter_row((uint8_t*)d.a[c][sg]->virt_addr, packed_row.data(), r0 + r, ag.m_stride, ag.outer, ag.sub / 2);
+        }
+    }
+}
+
+static void rknpu_ffn_fused(rknpu_w4a4_job& g, rknpu_w4a4_job& u, rknpu_w4a4_job& d, int c, int n_omp) {
+    for (rknpu_w4a4_job* j : {&g, &u}) {
+        for (size_t q = 0; q < j->cctx.size(); ++q) {
+            RKNN_CHECK(rknn_mem_sync(j->cctx[q]->ctx, j->c[c & 1][q].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C ffn chunk");
+        }
+    }
+    const int rows = std::min(g.MC, g.M - c * g.MC);
+    const int n_blocks = (rows + 3) / 4;
+    #pragma omp parallel for num_threads(n_omp)
+    for (int blk = 0; blk < n_blocks; ++blk) {
+        rknpu_ffn_fused_block(g, u, d, c, blk * 4, std::min(4, rows - blk * 4));
+    }
+}
+
+// The whole FFN [gate, up, GLU(gate, up), down] scheduled as one block, so
+// CPU phases overlap NPU batches across the three matmuls:
+//   prep(0) | NPU G0+U0 || prep(1) | NPU G1+U1 || fused(0) | NPU D0 || fused(1) | NPU D1 || collect D0 | collect D1
+// (for two chunks). Gate, up and the GLU output are never written; down's
+// output is element-exact vs the node-by-node path.
+static void rknpu_ffn_block(ggml_backend_rknpu_context* bctx, const struct ggml_tensor* src1, struct ggml_tensor* down_dst, int n_omp) {
+    auto &g = bctx->ffn_gate, &u = bctx->ffn_up, &d = bctx->ffn_down;
+    auto& gu = bctx->ffn_gu_ctx;
+    gu.clear();
+    gu.insert(gu.end(), g.cctx.begin(), g.cctx.end());
+    gu.insert(gu.end(), u.cctx.begin(), u.cctx.end());
+    const float* x = (const float*)get_tensor_real_ptr(src1);
+    const int row_stride = (int)(src1->nb[1] / sizeof(float));
+    float* out = (float*)get_tensor_real_ptr(down_dst);
+    const int n = g.n_chunks;
+    auto start_gu = [&](int c) { rknpu_w4a4_job_bind(g, c); rknpu_w4a4_job_bind(u, c); bctx->async_runner.start(gu); };
+    rknpu_ffn_prep(g, u, x, row_stride, 0, n_omp);
+    start_gu(0);
+    for (int c = 1; c < n; ++c) {
+        rknpu_ffn_prep(g, u, x, row_stride, c, n_omp);          // overlaps G/U chunk c-1
+        bctx->async_runner.wait();
+        start_gu(c);
+        rknpu_ffn_fused(g, u, d, c - 1, n_omp);                  // overlaps G/U chunk c
+    }
+    bctx->async_runner.wait();
+    rknpu_w4a4_job_start(bctx, d, 0);
+    rknpu_ffn_fused(g, u, d, n - 1, n_omp);                      // overlaps D chunk 0
+    for (int c = 1; c < n; ++c) {
+        bctx->async_runner.wait();
+        rknpu_w4a4_job_start(bctx, d, c);
+        rknpu_w4a4_job_collect(d, c - 1, out, n_omp);            // overlaps D chunk c
+    }
+    bctx->async_runner.wait();
+    rknpu_w4a4_job_collect(d, n - 1, out, n_omp);
 }
 
 static bool rknpu_fa_supported(const struct ggml_tensor* op) {
@@ -1310,17 +1438,63 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
         const auto t_node = g_rknpu_profile.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (g_rknpu_profile.on) g_rknpu_profile.nodes++;
 
+        // [gate, up, GLU, down] as one block (rknpu_ffn_block)
+        {
+            static const bool ffn_block_enabled = []() {
+                const char* env = std::getenv("RKNPU_FFN_BLOCK");
+                return env == nullptr || std::atoi(env) != 0;
+            }();
+            const int MCf = 256;
+            if (ffn_block_enabled && rknpu_pipeline_enabled() && n_omp > 1 && node_i + 3 < cgraph->n_nodes) {
+                struct ggml_tensor* nu = cgraph->nodes[node_i + 1];
+                struct ggml_tensor* ng = cgraph->nodes[node_i + 2];
+                struct ggml_tensor* nd = cgraph->nodes[node_i + 3];
+                const struct ggml_tensor* x = node->src[1];
+                const int Mf = (int)x->ne[1];
+                bool ok = nu->op == GGML_OP_MUL_MAT && ng->op == GGML_OP_GLU && nd->op == GGML_OP_MUL_MAT &&
+                          nu->src[1] == x && ng->src[0] == node && ng->src[1] == nu && nd->src[1] == ng &&
+                          rknpu_glu_supported(ng) && Mf > MCf && x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) &&
+                          x->ne[2] * x->ne[3] == 1 && node->src[0]->ne[1] == nu->src[0]->ne[1] &&
+                          node->src[0]->ne[0] == nu->src[0]->ne[0] && nd->src[0]->ne[0] == node->src[0]->ne[1] &&
+                          ggml_is_contiguous(nd) && (int)nd->ne[1] == Mf &&
+                          !(node->flags & GGML_TENSOR_FLAG_OUTPUT) && !(nu->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                          !(ng->flags & GGML_TENSOR_FLAG_OUTPUT);
+                for (int j = node_i + 1; j < cgraph->n_nodes && ok; ++j) {   // nothing else reads gate, up or the GLU
+                    const struct ggml_tensor* t = cgraph->nodes[j];
+                    for (const struct ggml_tensor* v : {(const struct ggml_tensor*)node, (const struct ggml_tensor*)nu, (const struct ggml_tensor*)ng}) {
+                        if (t->view_src == v) ok = false;
+                        for (int q = 0; q < GGML_MAX_SRC; ++q) {
+                            if (t->src[q] == v && !((t == nu && v == node) || (t == ng && (v == node || v == nu)) || (t == nd && v == ng))) ok = false;
+                        }
+                    }
+                }
+                ok = ok && rknpu_w4a4_job_setup(backend_ctx, backend_ctx->ffn_gate, node, Mf, MCf, 1) &&
+                     rknpu_w4a4_job_setup(backend_ctx, backend_ctx->ffn_up, nu, Mf, MCf, 2) &&
+                     rknpu_w4a4_job_setup(backend_ctx, backend_ctx->ffn_down, nd, Mf, MCf, 3) &&
+                     backend_ctx->ffn_gate.seg_off.size() == 1 && backend_ctx->ffn_up.seg_off.size() == 1 &&
+                     backend_ctx->ffn_gate.seg_len[0] == backend_ctx->ffn_gate.K && backend_ctx->ffn_up.seg_len[0] == backend_ctx->ffn_up.K;
+                if (ok) {
+                    rknpu_ffn_block(backend_ctx, x, nd, n_omp);
+                    backend_ctx->ffn_gate.node = backend_ctx->ffn_up.node = backend_ctx->ffn_down.node = nullptr;
+                    node_i += 3;
+                    if (g_rknpu_profile.on) g_rknpu_profile.node_ns += rknpu_profile::ns(t_node, std::chrono::steady_clock::now());
+                    continue;
+                }
+                backend_ctx->ffn_gate.node = backend_ctx->ffn_up.node = backend_ctx->ffn_down.node = nullptr;
+            }
+        }
+
         if (backend_ctx->down_job.node == node) {   // prepared and started by the up node
             auto& j = backend_ctx->down_job;
             float* d = (float*)get_tensor_real_ptr(node);
-            if (j.started < 0) rknpu_down_job_start(backend_ctx, j, 0);
+            if (j.started < 0) rknpu_w4a4_job_start(backend_ctx, j, 0);
             for (int c = 1; c < j.n_chunks; ++c) {
                 backend_ctx->async_runner.wait();
-                rknpu_down_job_start(backend_ctx, j, c);
-                rknpu_down_job_collect(j, c - 1, d, n_omp);   // overlaps NPU chunk c
+                rknpu_w4a4_job_start(backend_ctx, j, c);
+                rknpu_w4a4_job_collect(j, c - 1, d, n_omp);   // overlaps NPU chunk c
             }
             backend_ctx->async_runner.wait();
-            rknpu_down_job_collect(j, j.n_chunks - 1, d, n_omp);
+            rknpu_w4a4_job_collect(j, j.n_chunks - 1, d, n_omp);
             j.node = nullptr;
             if (g_rknpu_profile.on) g_rknpu_profile.node_ns += rknpu_profile::ns(t_node, std::chrono::steady_clock::now());
             continue;
@@ -1578,7 +1752,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                                     dg.up == node && dg.M == M && dg.N == N && dg.MC == MC;
                 if (dg.gate && !use_dg) rknpu_materialize_deferred_gate(dg, n_omp);
                 // [.., up, GLU, down] with the GLU read by nothing else: run
-                // down as a rknpu_down_job prepared from this collect
+                // down as a rknpu_w4a4_job prepared from this collect
                 bool stage_down = false;
                 {
                     static const bool prep_down_enabled = []() {
@@ -1595,7 +1769,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                             if (t->view_src == fuse_glu) stage_down = false;
                             for (int q = 0; q < GGML_MAX_SRC; ++q) stage_down = stage_down && t->src[q] != fuse_glu;
                         }
-                        stage_down = stage_down && rknpu_down_job_setup(backend_ctx, backend_ctx->down_job, down, M, MC);
+                        stage_down = stage_down && rknpu_w4a4_job_setup(backend_ctx, backend_ctx->down_job, down, M, MC);
                     }
                 }
                 if (pipelined_node) {
@@ -1792,7 +1966,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     backend_ctx->async_runner.wait();
                     // down's first chunk (its rows were staged by collect(0))
                     // overlaps this node's last collect
-                    if (stage_down && n_chunks > 1) rknpu_down_job_start(backend_ctx, backend_ctx->down_job, 0);
+                    if (stage_down && n_chunks > 1) rknpu_w4a4_job_start(backend_ctx, backend_ctx->down_job, 0);
                     collect_any(n_chunks - 1);
                     if (use_dg) {
                         dg.gate = nullptr;
