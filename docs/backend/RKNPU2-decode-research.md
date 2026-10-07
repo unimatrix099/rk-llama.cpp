@@ -952,21 +952,53 @@ no draft.
 **Holdout: MTP output is not strictly identical.** Six new prompts (code,
 arithmetic, German, JSON, a story, a list), 256 tokens each, MTP n=5 p0.6
 against no draft on the same build: **4/6 identical**. The story splits at
-a near-tie ("...below the cliffs." vs "...below."). The arithmetic prompt
-splits inside the hidden reasoning. The result is the same with
-`RKNPU_W8A8_NATIVE=0`, so it predates this work. Cause: decode logits
-depend very slightly on the batch size. llama-perplexity over the same
-tokens with `-ub 2` or `-ub 4` against `-ub 1` gives mean KLD 2e-6,
-maximum 4.3e-5, same top token 100%. A verify batch therefore scores a
-token slightly differently from one-token decode, and over long greedy
-outputs a rare near-tie flips. The earlier "output-identical" claims (#1b
-and above) hold for 128-token outputs on the four bench prompts only. The
-quality impact is nil at that KLD; finding the batch-dependent op (CPU
-attention at n_q > 1 is a suspect) is open.
+a near-tie ("...below the cliffs." vs "...below."); the arithmetic prompt
+splits inside the hidden reasoning. Same with `RKNPU_W8A8_NATIVE=0`, so it
+predates this work. Bisect:
+- **The target's decode on the NPU path is batch-invariant.** A libllama
+  harness (`batchdiff.cpp`, kept with the profiling patches) feeds the
+  same tokens one at a time and in batches of 2-8. It also covers batches
+  from position 0, a 60-token text, and MTP-like verify batches whose
+  wrong drafts are rolled back with `llama_memory_seq_rm`. In every case
+  the logits are **bit-identical**, with and without `cb_eval`.
+- A first reading of "batch-dependent logits" came from llama-perplexity
+  KLD (ub=4 vs ub=1: mean 2e-6, maximum 4.3e-5). That is the precision
+  floor of its saved-logits format: ub=1 against itself gives the same.
+- Loading the drafter while accepting no drafts (`--spec-draft-p-min 1.0`)
+  gives 6/6 identical, so the server's MTP configuration alone changes
+  nothing.
+- The pure CPU path also diverges under MTP: 5/6 identical, the story
+  splitting at char 4. Its decode really is batch-dependent (KLD ub=4 vs
+  ub=1: mean 3.8e-4, maximum 0.047).
 
-**Lossy candidate, not taken:** the Q8_0 LM head is ~671 MB of the
-per-token stream, ~21 ms of the ~114 ms. Running it as W4A4 would cut
-~10 ms per token (~+9% tg64), but changes numerics.
+So on the NPU path the divergence comes from the MTP serving flow (draft,
+verify and accept bookkeeping), not from the target's arithmetic. It is
+open. Greedy MTP output should be treated as equivalent in quality, not
+byte-identical. The earlier "output-identical" claims (#1b and above) hold
+for the four 128-token bench prompts only.
+
+**Drafter on the CPU** (`RKNPU_EXCLUDE_TYPES=f16`; the target has no F16
+weights): n_max 5, p_min 0.6 gives **18.19 t/s**, 74% acceptance, 4/4,
+against 17.85 with the drafter on the NPU's F16 path. This is the best
+exact configuration.
+
+**Lossy probe: LM head on W4A4.** `RKNPU_HYBRID=W4A4_HADAMARD` moves the
+Q8_0 LM head (~671 MB, ~21 ms of the ~114 ms token) and the BF16
+`per_layer_model_proj` to W4A4:
+
+| | exact | W4A4 LM head + PLE proj |
+|---|---|---|
+| tg64 | 8.78 | **9.76 (+11.2%)** |
+| PPL32 | 27.2382 | 27.2524 |
+| KLD vs CPU (4 ch) | 0.5873 | 0.5981 |
+| same top | 72.06% | 70.98% |
+| MTP n=5 p0.6, drafter on CPU | **18.19** (74% accept) | 16.88 (61% accept) |
+
+This is inside the tolerant gate, but it **costs MTP 7%**. The drafter
+predicts the exact target, and the coarser LM head disagrees with it more
+often. (Without `RKNPU_EXCLUDE_TYPES=f16` the global override also puts
+the drafter's F16 weights on W4A4: 38% acceptance, 12.07 t/s.) Worth it
+only for plain decode without drafting; not adopted.
 
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 

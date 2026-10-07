@@ -23,7 +23,8 @@ supersedes the older "Handover notes" section at the end of that file.
   | pp128 | ~192 t/s |
   | tg64 | 8.78 t/s |
   | NPU decode with MTP drafter (n=1) | 9.29 t/s |
-  | **llama-server MTP, centroid drafter, n_max 5, p_min 0.6 (pinned, 2026-10-07)** | **17.85 t/s** (no draft 8.5) |
+  | llama-server MTP, centroid drafter, n_max 5, p_min 0.6 (pinned, 2026-10-07) | 17.85 t/s (no draft 8.5) |
+  | **... with the drafter on the CPU (`RKNPU_EXCLUDE_TYPES=f16`)** | **18.19 t/s** |
   | PPL32 | 27.2382 |
   | KLD vs CPU (4 chunks) | 0.587297, same-top 72.06% |
 
@@ -49,11 +50,12 @@ supersedes the older "Handover notes" section at the end of that file.
 - **MTP setup (decode research §1i):** reconvert the drafter so it keeps
   its centroid tensors (on the board:
   `~/venv-convert/bin/python convert_hf_to_gguf.py ~/hf/gemma-4-E4B-it-assistant --outtype f16 --outfile ~/models/gemma-4-E4B-it-assistant-centroid-F16.gguf`),
-  then run `taskset -c 4-7 build/bin/llama-server -m <E4B> -md <centroid drafter> --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.6 -t 4`.
+  then run `RKNPU_EXCLUDE_TYPES=f16 taskset -c 4-7 build/bin/llama-server -m <E4B> -md <centroid drafter> --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.6 -t 4`.
   Pin the server: unpinned it loses ~25%.
-- **Open issue:** decode logits depend very slightly on the batch size
-  (mean KLD 2e-6), so long MTP outputs can differ from no-draft at a
-  near-tie (holdout 4/6 identical at 256 tokens); see §1i.
+- **Open issue:** long MTP outputs can differ from no-draft at a near-tie
+  (holdout 4/6 identical at 256 tokens; the CPU path 5/6). The NPU target
+  decode is proven batch-invariant, so the cause is in the MTP serving
+  flow; see §1i.
 - **Open issue:** NPU attention output depends slightly on which NPU core
   serves a KV group (±0.02% PPL, first batch always identical); see §1g.
 
