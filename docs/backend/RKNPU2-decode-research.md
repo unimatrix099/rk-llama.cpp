@@ -1054,6 +1054,52 @@ The CPU *decode* path itself (routed `RKNPU_CPU_DECODE`) stays
 batch-dependent through its matmul kernels; on the NPU path the
 attention was the only source.
 
+### 1k. GQA-grouped CPU attention for decode and verify (2026-10-07)
+
+**Where an MTP cycle goes at longer context.** A 512-token generation (n=5,
+p0.6, drafter on CPU) runs at 13.08 t/s, against ~18 t/s on the 128-token
+bench prompts.
+- Drafting is 8% of the time.
+- The NPU backend graph is ~70% (NPU runs 59%).
+- In a perf profile, leaving out libgomp spin, CPU attention is about 40%
+  of the CPU work: `ggml_vec_dot_f16` 12.4% plus `flash_attn_ext` 10.0%.
+
+Batch latency against context depth (llama-bench `-p 1,2,4,6 -d 0,768`)
+puts a 6-row verify at depth 768 at +61 ms over an empty context, about
+10 ms per row.
+
+**Why.** ggml-cpu's `one_chunk` kernel handles each (query row, head)
+independently and re-reads the whole K/V range each time. E4B has 8 query
+heads per 2 KV heads, so a 6-row verify reads each KV head's cache 24
+times, ~800 KB per pass at 800 cells (more than the A76's 512 KB L2).
+
+**Change** (`ggml/src/ggml-cpu/ops.cpp`, `GGML_CPU_FA_GROUPED`, default on):
+- For F16 K/V and batches below the 64-row tiled path, the work items are
+  parts of one KV head's rows. A group is split so the threads stay busy:
+  M=1 gives 4 items of 2 rows; M=6 gives 4 items of 12 rows. At most 12
+  rows per item, with state on the stack.
+- The new kernel walks the KV range once, applying each K/V row to every
+  row of the item while it is in L1. Per row, the operations and their
+  order are those of `one_chunk`: the same dot product, online-softmax
+  update and FP16 accumulation. Results are **byte-identical** (logit
+  dumps at depths 300 and 700, single-token and 4-row batch).
+- Sinks, the split-KV partial path and `use_ref` keep the old kernel.
+
+**Result**, same binary, batch latency in ms:
+
+| depth 768 | M=1 | M=2 | M=4 | M=6 |
+|---|---|---|---|---|
+| per-row kernel | 129.0 | 142.1 | 167.3 | 194.4 |
+| grouped | **124.1** | **130.3** | **142.0** | **161.7** (-17%) |
+
+At depth 0 nothing changes (113-132 ms either way). The 512-token MTP
+generation goes from 12.91 to **13.48 t/s (+4.4%)**, same output, and the
+gain grows with context. Bench prompts (n=5 p0.6, drafter on CPU): 18.37
+t/s (was 18.17), 4/4 identical. Guard bit-identical (PPL32 27.2382, KLD
+0.587297, FA 12/12, RoPE 5/5, server 3x 4/4). The 6-prompt holdout run was
+cut short by a machine shutdown: **re-run it**
+(`docs/handover/profiling-patches/mtp-holdout.sh`).
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
@@ -2150,6 +2196,7 @@ becomes a server.
 | `RKNPU_ROPE_FUSE` | 1 | 0 = RoPE runs as a separate backend op instead of inside the Q/K dequant (#1h) |
 | `RKNPU_ROPE_ANY` | unset | 1 = backend takes any F32 NORMAL/NEOX RoPE (exactness test hook) (#1h) |
 | `RKNPU_KV_WRITE` | 1 | 0 = KV-cache writes (`SET_ROWS`) of K/V stay on ggml-cpu (#1h) |
+| `GGML_CPU_FA_GROUPED` | 1 | 0 = ggml-cpu flash attention handles each (query row, head) separately for small batches instead of per KV-head group (#1k) |
 | `GGML_CPU_FA_SPLIT_KV` | 0 | 1 = ggml-cpu flash attention splits the KV range for single-row decode at >= 512 cells (upstream default; faster only with few heads, breaks speculative-decoding identity; #1j) |
 | `RKNPU_W8A8_NATIVE` | 1 | 0 = W8A8 nodes keep NORM A/C at 1 < M <= 32 (the runtime then converts C on one thread per run; #1i) |
 | `RKNPU_FA_RANGE` | 1 | 0 = NPU attention softmax gathers all S columns and scans each row's mask (#1h step 5) |
