@@ -857,6 +857,117 @@ cross-node overlap, same ~50 ms) unlikely to pay as well. The remaining
 attention gains must cut CPU work or memory traffic, not add overlap.
 Code reverted.
 
+### 1i. MTP decode on the NPU: 11.86 -> 17.12 t/s, output-identical (2026-10-07)
+
+Goal: faster token generation for E4B. Start: plain decode tg64 8.78 t/s
+(llama-bench), at the board's bandwidth limit. Per token, NPU runs take
+~99.6 ms of ~114 ms, ~2.6 GB streamed at ~26.6 GB/s, plus ~213 backend
+graph splits.
+
+**Online research, condensed.**
+- On RK3588, RKLLM runs LLMs as W8A8 only; this backend's W4A4 already
+  reads fewer bytes per token.
+- M=1 decode is GEMV-bound, so the NPU's TOPS don't matter; speculative
+  decoding is the standard way past that limit on edge NPUs.
+- Gemma-4's assistant (MTP drafter) ships **masked-embedding centroids**
+  (vLLM `Gemma4MTPMaskedEmbedder`): 2048 centroids, the top 32 chosen, so
+  32 x 128 = 4096 candidate tokens are scored instead of 262,144 (the same
+  idea as FR-Spec). llama.cpp declared the tensors, but the converter
+  dropped them and the graph never used them.
+
+**Measure first.** The NPU verify batch is now nearly free (llama-bench
+`-p 1,2,3,4,5,8 -n 0`, ms per batch):
+
+| M | 1 | 2 | 3 | 4 | 5 | 8 |
+|---|---|---|---|---|---|---|
+| ms | 113.8 | 118.5 | 120.6 | 122.9 | 130.1 | 132.6 |
+
+(It was 172 / 237 / 247 / 262 in #1b, before the #1c decode loop.) The MTP
+sweep in #1b ran the server unpinned; pinned (`taskset -c 4-7`) gives:
+no draft 8.49, n=1 10.92, n=3 **11.86** t/s, all 4/4 output-identical.
+
+**Where an n=3 cycle went** (~220 ms for 2.27 tokens; trace timings, a
+per-node profile, and a timer on the LM-head node):
+- drafting: 26 ms per cycle (3 steps), mostly the drafter's full-vocab
+  F16 LM head (262,144 x 256, 134 MB per step);
+- **the target's LM head at M=4: ~86 ms**, against 21.4 ms at M=1.
+
+**Root cause of the M=4 LM head.** E4B's tied `token_embd` is Q8_0, so the
+output projection runs on the W8A8 pipeline (~671 MB of INT8 weight),
+whose A/C layout was NORM. With NORM, the RKNN runtime converts C between
+row-major and its tiling on one thread inside every run. That is cheap at
+M=1 and ~64 ms per core at M=4. Standalone probes show the NPU itself
+does not care about M: INT8 K=2560, N=87,392 per core runs in ~20.0 ms at
+M=1, 2, 4 and 8, and three INT4 cores at once run in 10.6 ms for M=1, 2
+and 4 alike. (The runtime also rejects INT4 contexts with N not a multiple
+of 64; INT8 accepts multiples of 32.)
+
+**Changes:**
+1. **`RKNPU_W8A8_NATIVE`** (default on): W8A8 nodes with per-channel
+   scales and 1 < M <= 32 use NATIVE A/C. INT8 A rows are quantized, then
+   scattered into the native tiling. INT32 C is dequantized cell by cell
+   with the existing per-channel kernel (`dequant_acc_int32_tiled_perchan`,
+   exact by construction; unit test against the row-major kernel). M=1
+   and prefill are unchanged. LM head at M=4: 85 -> **21.4 ms** per core
+   run; PPL (b=4) identical on and off.
+2. **Centroid draft logits** for `gemma4-assistant`:
+   - The converter exports `masked_embd_centroids` and
+     `masked_embd_ordering` (I32), plus `masked_embedding.centroid_count`
+     and `.top_k`.
+   - The loader registers the tensors with real ops (upstream had
+     `GGML_OP_NONE`, which made the loader skip them).
+   - The graph scores only the top-k centroids' tokens and fills the rest
+     with -inf.
+   - Draft generation went from 26 to 17 ms per cycle, with **identical
+     drafts** (same acceptance per position) on the traced prompt. The
+     drafter must be reconverted (`gemma-4-E4B-it-assistant-centroid-F16.gguf`
+     on the board); an old GGUF falls back to the full LM head.
+
+**Result** (pinned server, 4 prompts x 128 tokens, greedy; every cell
+4/4 output-identical to no-draft):
+
+| decode t/s | no draft | n=1 | n=2 | n=3 | n=4 |
+|---|---|---|---|---|---|
+| before | 8.49 | 10.92 | 10.53 | 11.86 | 8.93 |
+| W8A8 native, full drafter | 8.51 | 12.45 | - | 16.44 | - |
+| **W8A8 native + centroid drafter** | 8.22 | 12.83 | 15.31 | **17.12** | 16.69 |
+
+MTP n=3 is now **2.0x plain decode**. Acceptance is unchanged (73 / 62 /
+57 / 48% for n=1..4). Plain llama-bench tg64 is unchanged, since only
+batches of 2-32 rows take the new path. Guard bit-identical (PPL32
+27.2382, KLD 0.587297, FA 12/12, RoPE 5/5, server 3x 4/4).
+
+**Draft length (`--spec-draft-p-min`, no code).** Stopping a draft once
+the drafter's top probability falls under p_min lets longer drafts pay off:
+
+| t/s (accept) | n=3 | n=4 | n=5 | n=6 |
+|---|---|---|---|---|
+| p_min 0 | 17.12 (57%) | 16.69 (48%) | - | - |
+| p_min 0.3 | 17.21 (61%) | 16.84 (52%) | 17.32 (48%) | 16.64 (41%) |
+| p_min 0.6 | 16.46 (79%) | 17.15 (76%) | **17.85 (74%)** | 17.70 (72%) |
+
+Best: `--spec-draft-n-max 5 --spec-draft-p-min 0.6`, **17.85 t/s**, 2.1x
+no draft.
+
+**Holdout: MTP output is not strictly identical.** Six new prompts (code,
+arithmetic, German, JSON, a story, a list), 256 tokens each, MTP n=5 p0.6
+against no draft on the same build: **4/6 identical**. The story splits at
+a near-tie ("...below the cliffs." vs "...below."). The arithmetic prompt
+splits inside the hidden reasoning. The result is the same with
+`RKNPU_W8A8_NATIVE=0`, so it predates this work. Cause: decode logits
+depend very slightly on the batch size. llama-perplexity over the same
+tokens with `-ub 2` or `-ub 4` against `-ub 1` gives mean KLD 2e-6,
+maximum 4.3e-5, same top token 100%. A verify batch therefore scores a
+token slightly differently from one-token decode, and over long greedy
+outputs a rare near-tie flips. The earlier "output-identical" claims (#1b
+and above) hold for 128-token outputs on the four bench prompts only. The
+quality impact is nil at that KLD; finding the batch-dependent op (CPU
+attention at n_q > 1 is a suspect) is open.
+
+**Lossy candidate, not taken:** the Q8_0 LM head is ~671 MB of the
+per-token stream, ~21 ms of the ~114 ms. Running it as W4A4 would cut
+~10 ms per token (~+9% tg64), but changes numerics.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
@@ -1953,6 +2064,7 @@ becomes a server.
 | `RKNPU_ROPE_FUSE` | 1 | 0 = RoPE runs as a separate backend op instead of inside the Q/K dequant (#1h) |
 | `RKNPU_ROPE_ANY` | unset | 1 = backend takes any F32 NORMAL/NEOX RoPE (exactness test hook) (#1h) |
 | `RKNPU_KV_WRITE` | 1 | 0 = KV-cache writes (`SET_ROWS`) of K/V stay on ggml-cpu (#1h) |
+| `RKNPU_W8A8_NATIVE` | 1 | 0 = W8A8 nodes keep NORM A/C at 1 < M <= 32 (the runtime then converts C on one thread per run; #1i) |
 | `RKNPU_FA_RANGE` | 1 | 0 = NPU attention softmax gathers all S columns and scans each row's mask (#1h step 5) |
 | `RKNPU_PROFILE` | unset | Diagnostic: prints cumulative wall time in the backend (graph / per-node / NPU run) every ~5 s to stderr; take the slope over a decode window and divide by the token rate (#1c) |
 | `RKNPU_DISPATCH_POOL` | unset | 1 = old dispatch path: NPU segments on the persistent pool and serial M=1 A-prep instead of ggml's OpenMP team. For A/B comparison only (#1c) |
