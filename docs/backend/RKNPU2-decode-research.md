@@ -824,11 +824,38 @@ RoPE 5/5, server 3x 4/4).
 Discarded: normalizing and converting P to FP16 in one pass instead of
 two (`tmp *= inv`, then convert). Exact, but 291.7 vs 291.4, noise.
 
-Next, for the head/tail waits without a cross-node scheduler: split each
-group item into head halves (half-M contexts, B shared through
-`rknn_create_mem_from_fd`), so the exposed head QK and tail PV are about
-half as long. Estimate ~+0.7-1.4% net of extra runs; dynamic-M contexts
-don't help, since one context runs one shape at a time.
+**Step 6: head-half items — NO-GO (2026-10-07).** This tried option 1's
+goal without a cross-node scheduler. Each group item was split into head
+subsets (`RKNPU_FA_SPLIT=2`: half-M contexts, 4 items per layer for
+pp512), so the exposed first QK and last PV runs are half as long. The
+second half copied the first half's native B with a `memcpy` (same K, N,
+so the same layout) instead of redoing the K copy and V transpose.
+Dynamic-M contexts were no option: one context runs one shape at a time.
+- Exact: flash-attention test 12/12 with the split.
+- Same-binary A/B, three pairs: **291.3 vs 292.3 (-0.35%)**.
+- The stage profile (per pp512, with `RKNPU_FA_RANGE` on in both) shows
+  why:
+
+  | ms | split 1 | split 2 | delta |
+  |---|---|---|---|
+  | fill (Q + B) | 41.7 | 59.9 | +18.2 |
+  | QK waits | 27.7 | 9.5 | -18.2 |
+  | softmax | 80.3 | 99.7 | +19.4 |
+  | PV waits | 26.8 | 10.9 | -15.9 |
+  | output | 43.4 | 47.8 | +4.4 |
+  | attention total | 236.8 | 246.9 | +10.1 |
+
+  The waits fell as predicted, by 34 ms. But softmax does the same work
+  and ran 24% slower once NPU runs overlapped it more. The likely cause is
+  the CPU and the NPU's DMA competing for DRAM bandwidth. The B `memcpy`
+  is at most ~8 ms of the fill growth, so sharing B through
+  `rknn_create_mem_from_fd` cannot recover the loss.
+
+**Lesson: exposed NPU time is not free to hide on this board.** Overlap
+slows the memory-heavy CPU stages it overlaps. That makes option 1 (the
+cross-node overlap, same ~50 ms) unlikely to pay as well. The remaining
+attention gains must cut CPU work or memory traffic, not add overlap.
+Code reverted.
 
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
