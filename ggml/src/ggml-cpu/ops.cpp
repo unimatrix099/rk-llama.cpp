@@ -9610,7 +9610,14 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    // Split-KV is off by default: single-row decode then takes the same path as small
+    // batches, so speculative verify batches reproduce one-token decode bit for bit
+    // (with it, the FP16 accumulation order differs once nek1 >= 512). GGML_CPU_FA_SPLIT_KV=1 enables it.
+    static const bool split_kv_enabled = []() {
+        const char * env = getenv("GGML_CPU_FA_SPLIT_KV");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    const bool use_split_kv_path = !use_ref && split_kv_enabled && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
