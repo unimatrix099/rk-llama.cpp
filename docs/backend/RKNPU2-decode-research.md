@@ -786,6 +786,50 @@ Open options, cheapest first:
    twice the NPU work on an idle NPU. Needs per-name pipeline routing and a
    pipelined INT8 path; unmeasured, maybe ~5%.
 
+**Step 5: where the exposed attention wait sits, and a cheaper softmax
+gather (2026-10-07, new dev machine).**
+
+The re-profile (`dbgfa2.py` split by item position, per pp512) located the
+~51 ms of exposed NPU time. For pp512 there are only **2 items** per layer
+(`n_seq = 1`, `n_kvh = 2`), so nearly all of it is at the pipeline's head
+and tail:
+
+| Stage | ms / pp512 |
+|---|---|
+| fill item 0 / item 1 | 19.3 / 21.7 |
+| QK wait, item 0 (head) | **19.6** |
+| QK wait, item 1 | 3.1 |
+| softmax | 116.5 |
+| PV wait, item 0 | 0.3 |
+| PV wait, last item (tail) | **31.5** |
+| output item 0 / last | 24.6 / 19.5 |
+
+perf (user cycles) splits the softmax stage into the native gather/scatter
+loop (3.3%) and the row math (2.8%). Two wastes:
+- every 64-row block gathered all `n_kv` S columns, though the causal mask
+  limits a block to its union `[lo, hi)`, ~56% of the columns on average
+  for pp512;
+- every row rescanned its mask for the `-inf` runs, scalar, once per head
+  and per group, though the 4 heads and 2 groups share the mask row.
+
+Change (`RKNPU_FA_RANGE`, default on): `[lo, hi)` is found once per mask
+row per attention call, and the gather reads only the cells of the
+block's union range. The softmax reads only `[lo, hi)` anyway, so the
+output is unchanged.
+
+Same-binary A/B, three pairs: **291.9 vs 287.1 (+1.7%)**. Guard
+bit-identical (PPL32 27.2382, KLD 0.587297, same-top 72.06%, FA 12/12,
+RoPE 5/5, server 3x 4/4).
+
+Discarded: normalizing and converting P to FP16 in one pass instead of
+two (`tmp *= inv`, then convert). Exact, but 291.7 vs 291.4, noise.
+
+Next, for the head/tail waits without a cross-node scheduler: split each
+group item into head halves (half-M contexts, B shared through
+`rknn_create_mem_from_fd`), so the exposed head QK and tail PV are about
+half as long. Estimate ~+0.7-1.4% net of extra runs; dynamic-M contexts
+don't help, since one context runs one shape at a time.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
@@ -1882,6 +1926,7 @@ becomes a server.
 | `RKNPU_ROPE_FUSE` | 1 | 0 = RoPE runs as a separate backend op instead of inside the Q/K dequant (#1h) |
 | `RKNPU_ROPE_ANY` | unset | 1 = backend takes any F32 NORMAL/NEOX RoPE (exactness test hook) (#1h) |
 | `RKNPU_KV_WRITE` | 1 | 0 = KV-cache writes (`SET_ROWS`) of K/V stay on ggml-cpu (#1h) |
+| `RKNPU_FA_RANGE` | 1 | 0 = NPU attention softmax gathers all S columns and scans each row's mask (#1h step 5) |
 | `RKNPU_PROFILE` | unset | Diagnostic: prints cumulative wall time in the backend (graph / per-node / NPU run) every ~5 s to stderr; take the slope over a decode window and divide by the token rate (#1c) |
 | `RKNPU_DISPATCH_POOL` | unset | 1 = old dispatch path: NPU segments on the persistent pool and serial M=1 A-prep instead of ggml's OpenMP team. For A/B comparison only (#1c) |
 | `OMP_NUM_THREADS=4` | unset | no longer required: the #3 fix covers M=1, and since 2026-10-02 the backend takes ggml's thread count for M > 1 too (#1b); still harmless |

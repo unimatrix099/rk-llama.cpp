@@ -166,6 +166,11 @@ supersedes the older "Handover notes" section at the end of that file.
   memory slowly, so the next run may fail at model load. Wait or retry.
 - **huggingface.co may be unreachable from the dev machine.** Download on the
   board instead.
+- **The first benchmarks after a fresh boot run ~3-4% slow** (pp512 ~277
+  instead of ~288 on 2026-10-07, clocks pinned, 40 C). They recovered after a
+  few runs. Warm up before taking a baseline.
+- **On an x86_64 dev machine** `check-prep` (NEON) cannot build locally; the
+  guard runs it on the board.
 - **The board's models** are in `~/models/`. The measured E4B is
   `gemma-4-E4B-it-Q4_0-ggmlorg.gguf`; the MTP drafter is
   `gemma-4-E4B-it-assistant-F16.gguf`.

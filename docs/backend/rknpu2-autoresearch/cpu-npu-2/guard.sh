@@ -9,7 +9,9 @@
 set -euo pipefail
 B=${RKNPU_BOARD:-pi@192.168.0.178}
 cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)/docs/backend"
-for t in check-prep check-dispatch check; do make -s -f Makefile.rknpu2-tools $t 2>&1 | grep -q "0 failures" || { echo "unit $t failed"; exit 1; }; done
+for t in check-dispatch check; do make -s -f Makefile.rknpu2-tools $t 2>&1 | grep -q "0 failures" || { echo "unit $t failed"; exit 1; }; done
+# NEON prep kernels: run locally on aarch64, else on the board
+if [ "$(uname -m)" = aarch64 ]; then make -s -f Makefile.rknpu2-tools check-prep 2>&1; else ssh -o BatchMode=yes $B 'cd ~/rk-llama.cpp-rebase/docs/backend && make -s -f Makefile.rknpu2-tools check-prep 2>&1'; fi | grep -q "0 failures" || { echo "unit check-prep failed"; exit 1; }
 Q=$(ssh -o BatchMode=yes $B 'ulimit -n 65536; cd ~/rk-llama.cpp-rebase; M=~/models/gemma-4-E4B-it-Q4_0-ggmlorg.gguf; W=~/wikitext-2-raw/wiki.test.raw
   p32=$(build/bin/llama-perplexity -m $M -f $W --chunks 32 -t 4 2>&1 | grep -oE "Final estimate: PPL = [0-9.]+" | grep -oE "[0-9.]+$")
   k=$(build/bin/llama-perplexity -m $M -f $W --chunks 4 -t 4 --kl-divergence-base ~/kld-cpu-e4b-4ch.bin --kl-divergence 2>&1)
