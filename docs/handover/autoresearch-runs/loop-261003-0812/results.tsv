@@ -1,0 +1,13 @@
+# metric_direction: higher_is_better
+iteration	timestamp	commit	metric	delta	guard	guard-metric	status	description
+0	2026-10-05T09:14:42+00:00	e2c451ff6	5.828	0.0	pass	35.0480	baseline	initial state (rebase/w4a4-on-upstream)
+1	2026-10-05T09:17:58+00:00	d3711f67c	5.789	-0.021	-	-	discard	Hadamard sign vector by pointer (no measurable effect)
+2	2026-10-05T09:27:06+00:00	6a754e5e9	6.047	+0.237	pass	35.0480	keep	NEON bf16 vec_dot, bit-identical (per_layer_model_proj BF16 runs on CPU)
+3	2026-10-05T09:45:24+00:00	e02281ff2	7.782	+1.735	pass	35.0480	keep	NPU segments on ggml's hot OpenMP team instead of the dispatch pool
+4	2026-10-05T09:53:51+00:00	047d9bd1c	7.888	+0.106	pass	35.0480+decode4/4	keep	per-segment sync+dequant on the team thread that ran it (M=1)
+5	2026-10-05T10:03:05+00:00	42b2b4477	8.018	+0.130	pass	35.0480+decode4/4	keep	M=1 int4 A-prep split across the OpenMP team (blocks + 64-elem chunks)
+6	2026-10-05T10:10:30+00:00	950b9397f	8.103	+0.085	pass	35.0480+decode4/4	keep	4-row bf16 vec_dot (independent double chains per row)
+7	2026-10-05T10:22:08+00:00	527207118	8.241	+0.138	pass	35.0480+decode4/4	keep	skip redundant rknn_matmul_set_io_mem (A/C already bound)
+8	2026-10-05T10:22:08+00:00	abbb95038	8.198	-0.043	pass	35.0480+decode4/4	discard	small weights (<=1M elem) on one NPU core: slower
+9	2026-10-05T12:08:24+00:00	4bbe2f7bc	8.254	+0.013	FAIL->fixed	35.0480+server-segfault	discard	bf16 x4 register accumulators: below noise; guard exposed a pre-existing server segfault (fixed separately)
+fix	2026-10-05T12:42:01+00:00	52647f68e	8.245	-	pass	35.0480+decode4/4+stress12/12	keep	bugfix: accept empty mul_mats (server segfault 50% -> 0/12), abort on packed read-back

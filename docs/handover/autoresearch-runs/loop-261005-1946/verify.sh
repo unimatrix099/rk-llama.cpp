@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Verify: sync the current commit to the board, rebuild, print E4B pure-NPU W4A4 pp512 (t/s).
 set -euo pipefail
-B=${RKNPU_BOARD:-pi@192.168.0.178}; SSH="ssh -o BatchMode=yes $B"
-cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+B=pi@192.168.0.178; SSH="ssh -o BatchMode=yes $B"
+cd /workspace
 BASE=$($SSH 'cd ~/rk-llama.cpp-rebase && git rev-parse HEAD')
 git bundle create /tmp/ar.bundle "$BASE"..HEAD >/dev/null 2>&1 || true
 if [ "$(git rev-parse HEAD)" != "$BASE" ]; then

@@ -1972,6 +1972,10 @@ Pin clocks (`scripts/fix_freq_rk3588.sh`) and `ulimit -n 65536` first.
 
 ## Handover notes (continuing on another machine)
 
+> **Current handover (2026-10-07): see [`docs/handover/README.md`](../handover/README.md).**
+> It covers state, setup on a new machine, restoring Claude's memory, the
+> profiling patches and the loop harness. The notes below are older.
+
 ### State as of 2026-10-02 (supersedes the board details below)
 
 - **Branch:** `rebase/w4a4-on-upstream`, local in the dev container, **not pushed**.
