@@ -862,25 +862,28 @@ static inline float32x4_t rknpu_v_expf(float32x4_t x) {
 }
 #endif
 
-// One attention row: P = softmax(softcap(s*scale) + mask), written as FP16.
-// Masked (-inf) positions give exactly 0; an all-masked row gives zeros.
-static void rknpu_softmax_row(const float* s_row, const ggml_fp16_t* mrow, int64_t n_all, float scale, float softcap,
-                              float* tmp, uint16_t* out_all) {
-    // Leading and trailing runs of -inf mask (causal / sliding window) give
-    // exact zeros: work only on [lo, hi), aligned to the 4-lane vectors so
-    // every lane sums the same positions as over the whole row
+// Leading and trailing runs of -inf mask (causal / sliding window) give
+// exact zeros: the softmax works only on [lo, hi), aligned to the 4-lane
+// vectors so every lane sums the same positions as over the whole row.
+// An all-masked row gives lo = hi = 0.
+static void rknpu_softmax_range(const ggml_fp16_t* mrow, int64_t n_all, int64_t* lo_out, int64_t* hi_out) {
     int64_t lo = 0, hi = n_all;
     if (mrow) {
         const uint16_t* m16 = (const uint16_t*)mrow;
         while (hi > 0 && m16[hi - 1] == 0xFC00) --hi;
         while (lo < hi && m16[lo] == 0xFC00) ++lo;
-        if (hi == 0) {
-            memset(out_all, 0, n_all * sizeof(uint16_t));
-            return;
-        }
+        if (hi == 0) lo = 0;
         lo &= ~(int64_t)3;
-        hi = std::min(n_all, (hi + 3) & ~(int64_t)3);
+        hi = hi == 0 ? 0 : std::min(n_all, (hi + 3) & ~(int64_t)3);
     }
+    *lo_out = lo; *hi_out = hi;
+}
+
+// One attention row: P = softmax(softcap(s*scale) + mask), written as FP16,
+// over [lo, hi) from rknpu_softmax_range; only s_row[lo, hi) is read.
+// Masked (-inf) positions give exactly 0; an all-masked row gives zeros.
+static void rknpu_softmax_row(const float* s_row, const ggml_fp16_t* mrow, int64_t n_all, int64_t lo, int64_t hi,
+                              float scale, float softcap, float* tmp, uint16_t* out_all) {
     memset(out_all, 0, lo * sizeof(uint16_t));
     memset(out_all + hi, 0, (n_all - hi) * sizeof(uint16_t));
     s_row += lo;
@@ -1760,8 +1763,10 @@ static bool rknpu_fa_supported(const struct ggml_tensor* op) {
 // Four consecutive rows r0..r0+3 of a native-layout matrix: in every cell
 // column their cells are adjacent (4 * cb contiguous bytes, one cache line
 // for 16-byte cells), so they are moved together, line by line
-static inline void rknpu_native_gather_rows(uint8_t* const* rows, int R, const uint8_t* src, int r0, const rknpu2_native_geom& g, int cb) {
-    for (int t = 0; t < g.outer; ++t) {
+static inline void rknpu_native_gather_rows(uint8_t* const* rows, int R, const uint8_t* src, int r0, const rknpu2_native_geom& g, int cb,
+                                            int t0 = 0, int t1 = -1) {
+    if (t1 < 0) t1 = g.outer;
+    for (int t = t0; t < t1; ++t) {
         const uint8_t* c = src + ((size_t)t * g.m_stride + r0) * cb;
 #ifdef __ARM_NEON
         if (cb == 16) {
@@ -1812,6 +1817,25 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
     const char* v_base = (const char*)get_tensor_real_ptr(v);
     const char* m_base = mask ? (const char*)get_tensor_real_ptr(mask) : nullptr;
     char* d_base = (char*)get_tensor_real_ptr(dst);
+
+    // Softmax range [lo, hi) of every mask row, found once and shared by all
+    // heads and groups; the softmax gathers only those S cells (RKNPU_FA_RANGE)
+    static const bool range_enabled = []() {
+        const char* env = std::getenv("RKNPU_FA_RANGE");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    std::vector<int32_t> m_lo, m_hi;
+    if (mask && range_enabled) {
+        const int64_t n_ms = mask->ne[3];
+        m_lo.resize(n_ms * n_q);
+        m_hi.resize(n_ms * n_q);
+        #pragma omp parallel for num_threads(n_omp)
+        for (int64_t x = 0; x < n_ms * n_q; ++x) {
+            int64_t lo, hi;
+            rknpu_softmax_range((const ggml_fp16_t*)(m_base + (x / n_q) * mask->nb[3] + (x % n_q) * mask->nb[1]), n_kv, &lo, &hi);
+            m_lo[x] = (int32_t)lo; m_hi[x] = (int32_t)hi;
+        }
+    }
 
     // Stage st of the attention of group g of sequence i3: 0 = fill A (Q) and
     // B (K, V), 1 = Q*K^T run, 2 = softmax into P, 3 = P*V run, 4 = output.
@@ -1920,9 +1944,24 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                         srows[k] = (uint8_t*)(s_buf.data() + k * n_kv);
                         prows[k] = (uint8_t*)(p_buf.data() + k * n_kv);
                     }
-                    rknpu_native_gather_rows(srows, FR, (const uint8_t*)S, (int)r0, qk->c_geom, qk->c_geom.sub * 4);
+                    int64_t lo[512], hi[512];
+                    int64_t blo = n_kv, bhi = 0;
                     for (int k = 0; k < FR; ++k) {
-                        rknpu_softmax_row(s_buf.data() + k * n_kv, m_row(r0 + k), n_kv, scale, softcap, row.data(), p_buf.data() + k * n_kv);
+                        if (!m_lo.empty()) {
+                            const int64_t x = (i3 % mask->ne[3]) * n_q + (r0 + k) % n_q;
+                            lo[k] = m_lo[x]; hi[k] = m_hi[x];
+                        } else {
+                            rknpu_softmax_range(m_row(r0 + k), n_kv, &lo[k], &hi[k]);
+                        }
+                        if (hi[k] > lo[k]) { blo = std::min(blo, lo[k]); bhi = std::max(bhi, hi[k]); }
+                    }
+                    const int sub = qk->c_geom.sub;
+                    if (!range_enabled) { blo = 0; bhi = n_kv; }
+                    if (bhi > blo) {
+                        rknpu_native_gather_rows(srows, FR, (const uint8_t*)S, (int)r0, qk->c_geom, sub * 4, (int)(blo / sub), (int)((bhi + sub - 1) / sub));
+                    }
+                    for (int k = 0; k < FR; ++k) {
+                        rknpu_softmax_row(s_buf.data() + k * n_kv, m_row(r0 + k), n_kv, lo[k], hi[k], scale, softcap, row.data(), p_buf.data() + k * n_kv);
                     }
                     rknpu_native_scatter_rows((uint8_t*)P, prows, FR, (int)r0, pv->a_geom, pv->a_geom.sub * 2);
                 }
@@ -1931,7 +1970,9 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                 for (int64_t r = 0; r < M; ++r) {
                     static thread_local std::vector<float> row;
                     if ((int64_t)row.size() < n_kv) row.resize(n_kv);
-                    rknpu_softmax_row(S + r * n_kv, m_row(r), n_kv, scale, softcap, row.data(), P + r * n_kv);
+                    int64_t lo, hi;
+                    rknpu_softmax_range(m_row(r), n_kv, &lo, &hi);
+                    rknpu_softmax_row(S + r * n_kv, m_row(r), n_kv, lo, hi, scale, softcap, row.data(), P + r * n_kv);
                 }
             }
         } else if (st == 3) {
