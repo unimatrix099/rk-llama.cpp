@@ -974,7 +974,8 @@ predates this work. Bisect:
 So on the NPU path the divergence comes from the MTP serving flow (draft,
 verify and accept bookkeeping), not from the target's arithmetic. It is
 open. Greedy MTP output should be treated as equivalent in quality, not
-byte-identical. The earlier "output-identical" claims (#1b and above) hold
+byte-identical. **Resolved in #1j:** the cause was ggml-cpu's split-KV
+flash attention. The earlier "output-identical" claims (#1b and above) hold
 for the four 128-token bench prompts only.
 
 **Drafter on the CPU** (`RKNPU_EXCLUDE_TYPES=f16`; the target has no F16
@@ -999,6 +1000,59 @@ predicts the exact target, and the coarser LM head disagrees with it more
 often. (Without `RKNPU_EXCLUDE_TYPES=f16` the global override also puts
 the drafter's F16 weights on W4A4: 38% acceptance, 12.07 t/s.) Worth it
 only for plain decode without drafting; not adopted.
+
+### 1j. MTP output divergence: ggml-cpu split-KV flash attention (2026-10-07)
+
+Symptom: #1i's holdout. MTP output differed from no-draft on 2 of 6
+256-token prompts; the CPU path and n-gram drafting showed it too. The
+story prompt split on a token that is not a near-tie: no-draft ranks
+" jagged" at logprob -1.42; MTP emitted " base", which is outside the top 3.
+
+**Bisect** (tools in `docs/handover/profiling-patches/`):
+1. *Server bookkeeping ruled out.* `replay.cpp` re-feeds the server's
+   exact verify batches (extracted from a `-v` log: prompt, then per cycle
+   the last token, the drafts, and the accepted count) through libllama
+   with the server's prompt split (8/20/4 tokens, for its context
+   checkpoints). It reproduces all 129 server decisions, " base" included.
+   A one-token-at-a-time mode over the same accepted path gives " jagged",
+   like no-draft.
+2. *Not rollback, not a causality leak.* Changing the later drafts in the
+   failing batch does not change row 1. Dropping the whole batch and
+   re-decoding the kept tokens one at a time still disagrees from
+   position 257 on.
+3. *Layer 0, attention.* Capturing per-layer outputs for the failing row:
+   Q, K and V are bit-identical, but `kqv_out-0` differs (0.2% relative),
+   and later layers compound it.
+4. *Position threshold.* `posdiff.cpp` decodes a prefix one token at a
+   time, then 4 tokens as a batch or one at a time. It is exact for
+   batches ending below position 256 and KL ~2e-2 for batches reaching 256
+   or beyond, on the NPU path and the CPU path alike.
+
+**Cause:** `ggml_compute_forward_flash_attn_ext` (ggml-cpu, upstream PR
+#19209). For one query row with `nek1 >= 512` (single-token decode once
+the padded KV view reaches 512, i.e. position >= 256) it splits the KV
+range across threads and merges partial softmaxes. Batches of 2-63 rows
+take `one_chunk` over the whole range. `one_chunk` accumulates V in
+**FP16** (`VKQ16`), so the two orders round differently by ~1e-3
+relative. Through 42 layers that occasionally flips a greedy token. The
+batch is no less accurate than decode: the two are just not the same
+computation, and speculative decoding needs them to be.
+
+**Fix:** split-KV is off by default (`GGML_CPU_FA_SPLIT_KV=1` restores
+it). Decode then runs the same per-row `one_chunk` as verify batches,
+parallel over heads (8 per layer for E4B, so 4 threads stay busy).
+- `posdiff` batch vs sequential at positions 257, 300 and 400: KL exactly 0.
+- Speed, same binary: tg64 8.77 vs 8.77; tg64 at 1024 context depth 7.76
+  vs 7.66 (slightly faster without the split).
+- Holdout, 6 prompts x 256 tokens, MTP n=5 p0.6: **6/6 identical** (was
+  4/6). At 512 tokens: also 6/6.
+- MTP speed unchanged: n=5 p0.6 18.17 t/s (was 18.19), n=3 16.95.
+- Guard bit-identical (PPL32 27.2382, KLD 0.587297, FA 12/12, RoPE 5/5,
+  server 3x 4/4).
+
+The CPU *decode* path itself (routed `RKNPU_CPU_DECODE`) stays
+batch-dependent through its matmul kernels; on the NPU path the
+attention was the only source.
 
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
@@ -2096,6 +2150,7 @@ becomes a server.
 | `RKNPU_ROPE_FUSE` | 1 | 0 = RoPE runs as a separate backend op instead of inside the Q/K dequant (#1h) |
 | `RKNPU_ROPE_ANY` | unset | 1 = backend takes any F32 NORMAL/NEOX RoPE (exactness test hook) (#1h) |
 | `RKNPU_KV_WRITE` | 1 | 0 = KV-cache writes (`SET_ROWS`) of K/V stay on ggml-cpu (#1h) |
+| `GGML_CPU_FA_SPLIT_KV` | 0 | 1 = ggml-cpu flash attention splits the KV range for single-row decode at >= 512 cells (upstream default; faster only with few heads, breaks speculative-decoding identity; #1j) |
 | `RKNPU_W8A8_NATIVE` | 1 | 0 = W8A8 nodes keep NORM A/C at 1 < M <= 32 (the runtime then converts C on one thread per run; #1i) |
 | `RKNPU_FA_RANGE` | 1 | 0 = NPU attention softmax gathers all S columns and scans each row's mask (#1h step 5) |
 | `RKNPU_PROFILE` | unset | Diagnostic: prints cumulative wall time in the backend (graph / per-node / NPU run) every ~5 s to stderr; take the slope over a decode window and divide by the token rate (#1c) |

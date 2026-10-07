@@ -52,10 +52,11 @@ supersedes the older "Handover notes" section at the end of that file.
   `~/venv-convert/bin/python convert_hf_to_gguf.py ~/hf/gemma-4-E4B-it-assistant --outtype f16 --outfile ~/models/gemma-4-E4B-it-assistant-centroid-F16.gguf`),
   then run `RKNPU_EXCLUDE_TYPES=f16 taskset -c 4-7 build/bin/llama-server -m <E4B> -md <centroid drafter> --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.6 -t 4`.
   Pin the server: unpinned it loses ~25%.
-- **Open issue:** long MTP outputs can differ from no-draft at a near-tie
-  (holdout 4/6 identical at 256 tokens; the CPU path 5/6). The NPU target
-  decode is proven batch-invariant, so the cause is in the MTP serving
-  flow; see §1i.
+- **Fixed (§1j):** long MTP outputs used to differ from no-draft (holdout
+  4/6). Cause: ggml-cpu split-KV flash attention for one-row decode at >= 512
+  KV cells (upstream PR #19209) rounds differently from verify batches.
+  It is now off by default (`GGML_CPU_FA_SPLIT_KV=1` restores it); holdout 6/6
+  at 256 and 512 tokens, no speed cost. Not reported upstream yet.
 - **Open issue:** NPU attention output depends slightly on which NPU core
   serves a KV group (±0.02% PPL, first batch always identical); see §1g.
 
