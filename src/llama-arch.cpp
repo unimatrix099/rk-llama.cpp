@@ -224,6 +224,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_MOE_EVERY_N_LAYERS,                "%s.moe_every_n_layers"                },
     { LLM_KV_MOE_LATENT_SIZE,                   "%s.moe_latent_size"                   },
     { LLM_KV_NEXTN_PREDICT_LAYERS,              "%s.nextn_predict_layers"              },
+    { LLM_KV_MASKED_EMBD_N_CENTROIDS,           "%s.masked_embedding.centroid_count"   },
+    { LLM_KV_MASKED_EMBD_TOP_K,                 "%s.masked_embedding.top_k"            },
     { LLM_KV_NUM_DEEPSTACK_LAYERS,              "%s.n_deepstack_layers"                },
     { LLM_KV_DEEPSTACK_MAPPING,                 "%s.deepstack_mapping"                 },
     { LLM_KV_HIDDEN_ACT,                        "%s.hidden_activation"                 },
@@ -997,8 +999,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // latent projections feed ggml_mul_mat, the buft probe must use MUL_MAT to keep them on GPU
     {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_FFN_LATENT_UP,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
-    {LLM_TENSOR_MASKED_EMBD_CENTROIDS,      {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
-    {LLM_TENSOR_MASKED_EMBD_ORDERING,       {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
+    {LLM_TENSOR_MASKED_EMBD_CENTROIDS,      {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_MASKED_EMBD_ORDERING,       {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     // eagle3
     {LLM_TENSOR_FC,                         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_D2T,                        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},

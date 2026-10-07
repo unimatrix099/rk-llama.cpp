@@ -669,6 +669,8 @@ struct llama_model {
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;
+    struct ggml_tensor * masked_embd_centroids = nullptr;
+    struct ggml_tensor * masked_embd_ordering  = nullptr;
 
     // hrm-text initial low-cycle state
     struct ggml_tensor * hrm_z_l_init = nullptr;

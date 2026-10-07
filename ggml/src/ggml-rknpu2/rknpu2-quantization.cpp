@@ -179,6 +179,20 @@ void dequant_acc_int32_to_fp32_perchan(float * dst, const int32_t * src, size_t 
     }
 }
 
+void dequant_acc_int32_tiled_perchan(float * dst, const int32_t * src_native,
+                                     int32_t m, int32_t m_stride, int32_t outer, int32_t sub,
+                                     int32_t n_limit, float common, const float * chan_scales) {
+    for (int32_t t = 0; t < outer; ++t) {
+        const int32_t * cell = src_native + ((size_t)t * m_stride + m) * sub;
+        const int32_t n0 = t * sub;
+        const int32_t lim = std::min(sub, n_limit - n0);
+        if (lim <= 0) {
+            break;
+        }
+        dequant_acc_int32_to_fp32_perchan(dst + n0, cell, (size_t)lim, common, chan_scales + n0);
+    }
+}
+
 void dequant_acc_int16_tiled_perchan(float * dst, const int16_t * src_native,
                                      int32_t m, int32_t m_stride, int32_t outer, int32_t sub,
                                      int32_t n_limit, float common, const float * chan_scales) {

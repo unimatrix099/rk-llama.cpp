@@ -116,10 +116,14 @@ void dequant2_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const int
 /**
  * @brief Per-output-channel dequantize-accumulate for INT32 C matrices
  * (the INT8 pipelines): dst[i] += src[i] * (chan_scales[i] * common).
- * The INT8 C layout is always NORM, so no tiled variant is needed.
  */
 void dequant_acc_int32_to_fp32_perchan(float * dst, const int32_t * src, size_t n_elements,
                                        float common, const float * chan_scales);
+// Row m of a native [outer, m_stride, sub] INT32 C, cell by cell with the
+// kernel above, so each element is computed exactly as in the NORM layout
+void dequant_acc_int32_tiled_perchan(float * dst, const int32_t * src_native,
+                                     int32_t m, int32_t m_stride, int32_t outer, int32_t sub,
+                                     int32_t n_limit, float common, const float * chan_scales);
 
 // --- Dequantization to FP32 ---
 

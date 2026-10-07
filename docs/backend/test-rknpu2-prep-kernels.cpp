@@ -289,6 +289,32 @@ static void test_dequant_acc_tiled_perchan(void) {
     }
 }
 
+// native INT32 C (W8A8 with NATIVE A/C) vs the row-major kernel on the untiled row
+static void test_dequant_acc_int32_tiled_perchan(void) {
+    const float common = 0.0173f;
+    struct { int outer, m_stride, sub, n_limit; } cases[] = {
+        {16, 4, 4, 64}, {300, 2, 4, 1197}, {3, 1, 4, 10}, {9, 8, 8, 70},
+    };
+    for (auto& c : cases) {
+        size_t total = (size_t)c.outer * c.m_stride * c.sub;
+        std::vector<int32_t> native(total);
+        for (auto& v : native) v = (int32_t)(prng() % 2000001) - 1000000;
+        std::vector<float> chan(c.n_limit);
+        for (auto& v : chan) v = 0.001f + std::fabs(frand());
+        for (int m = 0; m < c.m_stride; ++m) {
+            std::vector<int32_t> row(c.n_limit);
+            for (int nn = 0; nn < c.n_limit; ++nn) row[nn] = native[((size_t)(nn / c.sub) * c.m_stride + m) * c.sub + nn % c.sub];
+            std::vector<float> a(c.n_limit), b(c.n_limit);
+            for (int i = 0; i < c.n_limit; ++i) a[i] = b[i] = frand();
+            rknpu2_quantization::dequant_acc_int32_to_fp32_perchan(a.data(), row.data(), c.n_limit, common, chan.data());
+            rknpu2_quantization::dequant_acc_int32_tiled_perchan(
+                b.data(), native.data(), m, c.m_stride, c.outer, c.sub, c.n_limit, common, chan.data());
+            CHECK(memcmp(a.data(), b.data(), (size_t)c.n_limit * 4) == 0,
+                  "dq32tiled-pc outer=%d ms=%d m=%d", c.outer, c.m_stride, m);
+        }
+    }
+}
+
 // existing conversion/dequant functions: regression-guard them too
 static void test_existing_conversions(void) {
     for (size_t si = 0; si < N_SIZES; ++si) {
@@ -570,6 +596,7 @@ int main(void) {
     test_dequant_acc_perchan();
     test_dequant_acc_int32_perchan();
     test_dequant_acc_tiled_perchan();
+    test_dequant_acc_int32_tiled_perchan();
     test_existing_conversions();
     test_hadamard();
     test_hadamard_blocked();

@@ -2222,6 +2222,20 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
         const rknn_matmul_type matmul_type = pipeline->mm_type;
         const int alignment = pipeline->n_align;
 
+        // W8A8 at small M > 1 (speculative verify batches): NATIVE A/C. With
+        // NORM the runtime converts C on one thread inside every run, which made
+        // E4B's Q8_0 output projection 4x slower at M=4 than at M=1 (RKNPU_W8A8_NATIVE)
+        static const bool w8a8_native = []() {
+            const char* env = std::getenv("RKNPU_W8A8_NATIVE");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        const rknn_matmul_layout ac_layout =
+            (w8a8_native && M > 1 && M <= 32 && pipeline->ac_layout == RKNN_MM_LAYOUT_NORM &&
+             pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8 &&
+             pipeline->npu_type_c == rknpu2_configuration::NPU_TYPE_INT32 &&
+             rknpu2_calibration::per_channel_b_scales())
+                ? RKNN_MM_LAYOUT_NATIVE : pipeline->ac_layout;
+
         // Computing specific hardware segments
         int k_limit = config.max_k_limit;
         if (pipeline->effective_k > 0) {
@@ -2376,7 +2390,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         // Getting matmul context from cache
                         matmul_ctxs[idx] = backend_ctx->get_matmul_ctx(
                             (uintptr_t)tensor_virt_addr, offset_in_dma, M_op, K_seg_op, n_seg.size_n,
-                            n_seg.core_id, matmul_type, pipeline->ac_layout, b_domain_id
+                            n_seg.core_id, matmul_type, ac_layout, b_domain_id
                         );
                         if (!matmul_ctxs[idx] || matmul_ctxs[idx]->ctx == 0) return GGML_STATUS_FAILED;
 
@@ -2860,14 +2874,14 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                     // ([K/sub, M, sub] cells) instead of row-major, skipping the
                     // runtime's serial per-run repack
                     rknpu2_native_geom a_geom = {0, 0, 0};
-                    const bool a_native = pipeline->ac_layout == RKNN_MM_LAYOUT_NATIVE &&
+                    const bool a_native = ac_layout == RKNN_MM_LAYOUT_NATIVE &&
                         rknpu2_native_geom_from_dims(matmul_ctx_0->io_attr.A.dims,
                                                      matmul_ctx_0->io_attr.A.n_dims, &a_geom) == 0;
                     // Not a fallback: the context was created with
                     // AC_layout = NATIVE, so if the geometry does not parse we
                     // would fill a row-major buffer the NPU reads as
                     // [K/sub, M, sub] tiles — silently wrong output, no error.
-                    GGML_ASSERT((pipeline->ac_layout != RKNN_MM_LAYOUT_NATIVE || a_native) &&
+                    GGML_ASSERT((ac_layout != RKNN_MM_LAYOUT_NATIVE || a_native) &&
                                 "RKNPU2: native A layout requested but io_attr.A geometry did not parse");
 
                     // hoisted: the getter guards a function-local static, and
@@ -2969,8 +2983,15 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                             scales_A[m] = rknpu2_quantization::amax_fp32(ready_row, K_seg_op) / 127.0f;
 
                             int8_t* dst_ptr = (int8_t*)dst_base;
-                            int8_t* dst_row = dst_ptr + (size_t)m * K_seg_op;
-                            rknpu2_quantization::quantize_fp32_to_int8(ready_row, dst_row, K_seg_op, scales_A[m]);
+                            if (a_native) {
+                                grow(packed_row, (size_t)K_seg_op);
+                                rknpu2_quantization::quantize_fp32_to_int8(ready_row, (int8_t*)packed_row.data(), K_seg_op, scales_A[m]);
+                                rknpu2_native_scatter_row((uint8_t*)dst_ptr, packed_row.data(), m,
+                                                          a_geom.m_stride, a_geom.outer, a_geom.sub);
+                            } else {
+                                int8_t* dst_row = dst_ptr + (size_t)m * K_seg_op;
+                                rknpu2_quantization::quantize_fp32_to_int8(ready_row, dst_row, K_seg_op, scales_A[m]);
+                            }
                         }
                         else if (pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
                             // clip < 1 saturates the far tail for finer steps
@@ -3034,7 +3055,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 // dequantization pass below (address arithmetic only)
                 std::vector<rknpu2_native_geom> c_geoms(num_active_segments);
                 std::vector<uint8_t> c_native(num_active_segments, 0);
-                if (pipeline->ac_layout == RKNN_MM_LAYOUT_NATIVE) {
+                if (ac_layout == RKNN_MM_LAYOUT_NATIVE) {
                     for (size_t idx = 0; idx < num_active_segments; idx++) {
                         c_native[idx] = rknpu2_native_geom_from_dims(
                             matmul_ctxs[idx]->io_attr.C.dims,
@@ -3065,6 +3086,14 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         }
                         case rknpu2_configuration::NPU_TYPE_INT32: {
                             int32_t* src_ptr = (int32_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
+                            if (b_per_channel && c_native[idx]) {
+                                rknpu2_quantization::dequant_acc_int32_tiled_perchan(
+                                    dst_ptr, (const int32_t*)mem_C_segments[idx]->virt_addr,
+                                    m, c_geoms[idx].m_stride, c_geoms[idx].outer, c_geoms[idx].sub,
+                                    N_segment, scales_A[m] / hadamard_divisor,
+                                    scales_B_grid->data() + k_idx * (size_t)N + N_offset);
+                                break;
+                            }
                             if (b_per_channel) {
                                 // grid layout [k_idx * N + global_n]
                                 rknpu2_quantization::dequant_acc_int32_to_fp32_perchan(

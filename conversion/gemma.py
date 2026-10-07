@@ -10,7 +10,7 @@ import torch
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import MmprojModel, ModelBase, TextModel, gguf, logger
+from .base import LazyTorchTensor, MmprojModel, ModelBase, TextModel, gguf, logger
 from .qwen import DFlashModel
 
 
@@ -935,20 +935,23 @@ class Gemma4UnifiedModel(Gemma4Model):
 class Gemma4AssistantModel(Gemma4Model):
     model_arch = gguf.MODEL_ARCH.GEMMA4_ASSISTANT
 
-    @classmethod
-    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
-        name, gen = item
-
-        if "masked_embedding" in name:
-            logger.debug(f"Skipping get tensor {name!r} in safetensors so that convert can end normally.")
-            return None
-
-        return super().filter_tensors(item)
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if "masked_embedding.token_ordering" in name:
+            # token ids grouped by centroid, written as I32 (ggml get_rows indices)
+            data = LazyTorchTensor.to_eager(data_torch).to(torch.int32).numpy()
+            self.gguf_writer.add_tensor(self.format_tensor_name(gguf.MODEL_TENSOR.MASKED_EMBD_ORDERING, suffix=""), data,
+                                        raw_dtype=gguf.GGMLQuantizationType.I32)
+            return
+        yield from super().modify_tensors(data_torch, name, bid)
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_embedding_length_out(self.hparams["backbone_hidden_size"])
         self.gguf_writer.add_nextn_predict_layers(self.block_count)
+        if self.hparams.get("use_ordered_embeddings", False):
+            arch = self.gguf_writer.arch
+            self.gguf_writer.add_uint32(gguf.Keys.LLM.MASKED_EMBD_N_CENTROIDS.format(arch=arch), self.hparams["num_centroids"])
+            self.gguf_writer.add_uint32(gguf.Keys.LLM.MASKED_EMBD_TOP_K.format(arch=arch), self.hparams["centroid_intermediate_top_k"])
 
 
 @ModelBase.register("Gemma4ForConditionalGeneration")
