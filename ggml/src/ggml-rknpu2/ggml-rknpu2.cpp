@@ -647,36 +647,39 @@ struct ggml_backend_rknpu_context {
     rknpu_w4a4_job ffn_gate, ffn_up, ffn_down;
     std::vector<std::shared_ptr<rknpu_matmul_context>> ffn_gu_ctx, ffn_gud_ctx;
 
-    // (M, K, N, B layout, core) -> attention matmul context. The KV length grows with
-    // every ubatch, so only the most recently used shapes are kept (RKNPU_FA_CTX_SHAPES):
-    // their DMA buffers grow with n_kv and otherwise exhaust the IOMMU domain
-    std::map<std::tuple<int, int, int, int, int>, std::unique_ptr<rknpu_attn_context>> attn_ctx_cache;
-    std::map<std::tuple<int, int, int, int>, uint64_t> attn_shape_use;   // shape -> last attention call
+    // (M, K, N, B layout, core, slot) -> attention matmul context; their DMA buffers grow
+    // with n_kv, so stale shapes are freed (see get_attn_ctx) or they exhaust the IOMMU domain
+    // slot: the P*V chunk index (chunks of one item run back to back on one core, each with its own buffers)
+    std::map<std::tuple<int, int, int, int, int, int>, std::unique_ptr<rknpu_attn_context>> attn_ctx_cache;
+    std::map<std::tuple<int, int, int, int, int>, uint64_t> attn_shape_use;   // shape -> last attention call
     uint64_t attn_call = 0;   // incremented per attention op; shapes of the current call are never evicted
-    rknpu_attn_context* get_attn_ctx(int M, int K, int N, int b_layout, int core_id) {
-        auto key = std::make_tuple(M, K, N, b_layout, core_id);
-        attn_shape_use[std::make_tuple(M, K, N, b_layout)] = attn_call;
+    rknpu_attn_context* get_attn_ctx(int M, int K, int N, int b_layout, int core_id, int slot = 0) {
+        auto key = std::make_tuple(M, K, N, b_layout, core_id, slot);
+        attn_shape_use[std::make_tuple(M, K, N, b_layout, slot)] = attn_call;
         auto it = attn_ctx_cache.find(key);
         if (it != attn_ctx_cache.end()) return it->second.get();
-        static const size_t max_shapes = []() {
-            const char* env = std::getenv("RKNPU_FA_CTX_SHAPES");
-            const int v = env ? std::atoi(env) : 4;
-            return (size_t)(v >= 2 ? v : 4);
+        // Shapes change with the KV length every ubatch; a shape not used in the last
+        // RKNPU_FA_CTX_AGE attention ops will not come back (Gemma-4's global-attention
+        // layers recur every 6 ops), so its contexts are freed on a miss, before the new
+        // shape's buffers are allocated (two 32k shapes do not fit the IOMMU domain)
+        static const uint64_t max_age = []() {
+            const char* env = std::getenv("RKNPU_FA_CTX_AGE");
+            const int v = env ? std::atoi(env) : 5;
+            return (uint64_t)(v >= 1 ? v : 5);
         }();
-        while (attn_shape_use.size() > max_shapes) {
-            auto oldest = attn_shape_use.begin();
-            for (auto s = attn_shape_use.begin(); s != attn_shape_use.end(); ++s) {
-                if (s->second < oldest->second) oldest = s;
-            }
-            if (oldest->second == attn_call) break;   // all in use by this call
-            for (auto c = attn_ctx_cache.begin(); c != attn_ctx_cache.end(); ) {
-                if (std::make_tuple(std::get<0>(c->first), std::get<1>(c->first), std::get<2>(c->first), std::get<3>(c->first)) == oldest->first) {
-                    c = attn_ctx_cache.erase(c);
-                } else {
-                    ++c;
+        for (auto s = attn_shape_use.begin(); s != attn_shape_use.end(); ) {
+            if (s->second + max_age < attn_call) {
+                for (auto c = attn_ctx_cache.begin(); c != attn_ctx_cache.end(); ) {
+                    if (std::make_tuple(std::get<0>(c->first), std::get<1>(c->first), std::get<2>(c->first), std::get<3>(c->first), std::get<5>(c->first)) == s->first) {
+                        c = attn_ctx_cache.erase(c);
+                    } else {
+                        ++c;
+                    }
                 }
+                s = attn_shape_use.erase(s);
+            } else {
+                ++s;
             }
-            attn_shape_use.erase(oldest);
         }
         auto c = std::make_unique<rknpu_attn_context>(M, K, N, b_layout, core_id);
         if (c->ctx == 0) return nullptr;
@@ -1837,6 +1840,12 @@ static int rknpu_fa_rows() {
 static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tensor* dst, int n_omp) {
     const struct ggml_tensor *q = dst->src[0], *k = dst->src[1], *v = dst->src[2], *mask = dst->src[3];
     ++bctx->attn_call;
+    static const int64_t pv_chunk = []() {
+        const char* env = std::getenv("RKNPU_FA_PV_CHUNK");
+        const int v = env ? std::atoi(env) : 2048;
+        return (int64_t)(v > 0 ? (v + 255) / 256 * 256 : 1 << 30);
+    }();
+    const int64_t KC = std::min<int64_t>(pv_chunk, dst->src[1]->ne[1]);
     const int64_t DK = k->ne[0], DV = v->ne[0];
     const int64_t n_q = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1], n_kvh = k->ne[2];
     const int64_t rk2 = n_head / n_kvh;
@@ -1881,14 +1890,26 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         const int64_t iv3 = i3 / (n_seq / v->ne[3]);
         const char* m_seq = mask ? m_base + (i3 % mask->ne[3]) * mask->nb[3] : nullptr;
         rknpu_attn_context* qk = bctx->get_attn_ctx((int)M, (int)DK, (int)n_kv, RKNN_MM_LAYOUT_TP_NORM, core);
-        rknpu_attn_context* pv = bctx->get_attn_ctx((int)M, (int)n_kv, (int)DV, RKNN_MM_LAYOUT_NORM, core);
-        GGML_ASSERT(qk && pv && "RKNPU2: attention matmul context creation failed");
+        // P*V in chunks of at most KC positions along K: the NPU's FP16 matmul runs ~8x slower
+        // per FLOP once K passes ~4096 (RKNPU_FA_PV_CHUNK; 0 = one run); partial outputs are summed
+        rknpu_attn_context* pvs[128];
+        const int n_pvc = (int)((n_kv + KC - 1) / KC);
+        GGML_ASSERT(n_pvc <= 128);
+        for (int c = 0; c < n_pvc; ++c) {
+            const int64_t kc = std::min(KC, n_kv - c * KC);
+            pvs[c] = bctx->get_attn_ctx((int)M, (int)kc, (int)DV, RKNN_MM_LAYOUT_NORM, core, c);
+            GGML_ASSERT(pvs[c] && "RKNPU2: attention matmul context creation failed");
+        }
+        rknpu_attn_context* pv = pvs[0];
+        GGML_ASSERT(qk && "RKNPU2: attention matmul context creation failed");
+        bool pv_native = true, pv_b_native = true;
+        for (int c = 0; c < n_pvc; ++c) { pv_native = pv_native && pvs[c]->native; pv_b_native = pv_b_native && pvs[c]->b_native && pvs[c]->b_subK == pv->b_subK && pvs[c]->b_subN == pv->b_subN; }
         (void)ik3; (void)iv3; (void)m_seq;
 
         // A = Q rows of the rk2 heads of this group, FP16, row r = hh*n_q + i
         uint16_t* a = (uint16_t*)qk->A->virt_addr;
         const int FR = rknpu_fa_rows();
-        const bool native = qk->native && pv->native && M % FR == 0;
+        const bool native = qk->native && pv_native && M % FR == 0;
         auto q_row = [&](int64_t r) {
             const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
             return (const float*)(q_base + i * q->nb[1] + h * q->nb[2] + i3 * q->nb[3]);
@@ -1912,15 +1933,15 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
             }
             // B = K rows (n_kv x DK, TP_NORM) and V rows (n_kv x DV, NORM)
             uint16_t* bk = (uint16_t*)qk->B->virt_addr;
-            uint16_t* bv = (uint16_t*)pv->B->virt_addr;
             auto k_row = [&](int64_t j) { return (const uint16_t*)(k_base + j * k->nb[1] + g * k->nb[2] + ik3 * k->nb[3]); };
             auto v_row = [&](int64_t j) { return (const uint16_t*)(v_base + j * v->nb[1] + g * v->nb[2] + iv3 * v->nb[3]); };
-            const bool nb = qk->b_native && pv->b_native;
+            const bool nb = qk->b_native && pv_b_native;
             if (nb) {
                 // Q*K^T: B(k = dim, n = position) -> runs of subK dims of one K row
                 const int sNq = qk->b_subN, sKq = qk->b_subK, kbq = (int)DK / sKq;
                 // P*V: B(k = position, n = dim) -> runs of subK positions of one dim (a transpose of V)
                 const int sNv = pv->b_subN, sKv = pv->b_subK, kbv = (int)n_kv / sKv;
+                const int kbc = (int)(KC / sKv);   // position blocks per chunk
                 #pragma omp parallel num_threads(n_omp)
                 {
                     #pragma omp for nowait
@@ -1933,8 +1954,11 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                     for (int64_t pb = 0; pb < kbv; ++pb) {   // a block of subK positions
                         const uint16_t* vr[64];
                         for (int q = 0; q < sKv; ++q) vr[q] = v_row(pb * sKv + q);
+                        const int c = (int)(pb / kbc), lpb = (int)(pb % kbc);
+                        const int kbv_c = (int)(std::min(KC, n_kv - c * KC) / sKv);
+                        uint16_t* bv = (uint16_t*)pvs[c]->B->virt_addr;
                         for (int64_t d = 0; d < DV; ++d) {
-                            uint16_t* o = bv + (((size_t)(d / sNv) * kbv + pb) * sNv + (d % sNv)) * sKv;
+                            uint16_t* o = bv + (((size_t)(d / sNv) * kbv_c + lpb) * sNv + (d % sNv)) * sKv;
                             for (int q = 0; q < sKv; ++q) o[q] = vr[q][d];
                         }
                     }
@@ -1942,18 +1966,18 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
             } else {
                 for (int64_t j = 0; j < n_kv; ++j) {
                     memcpy(bk + j * DK, k_row(j), DK * 2);
-                    memcpy(bv + j * DV, v_row(j), DV * 2);
+                    memcpy((uint16_t*)pvs[j / KC]->B->virt_addr + (j % KC) * DV, v_row(j), DV * 2);
                 }
             }
             rknn_mem_sync(qk->ctx, qk->A, RKNN_MEMORY_SYNC_TO_DEVICE);
             rknn_mem_sync(qk->ctx, qk->B, RKNN_MEMORY_SYNC_TO_DEVICE);
-            rknn_mem_sync(pv->ctx, pv->B, RKNN_MEMORY_SYNC_TO_DEVICE);
+            for (int c = 0; c < n_pvc; ++c) rknn_mem_sync(pvs[c]->ctx, pvs[c]->B, RKNN_MEMORY_SYNC_TO_DEVICE);
             if (!nb) {
                 // Re-bind B after writing it: for a non-native B the driver converts
                 // it to its internal layout at set_io_mem time, so data written into
                 // an already-bound buffer is never seen (P*V came back all zeros)
                 RKNN_CHECK(rknn_matmul_set_io_mem(qk->ctx, qk->B, &qk->io_attr.B), "set_io_mem attn K");
-                RKNN_CHECK(rknn_matmul_set_io_mem(pv->ctx, pv->B, &pv->io_attr.B), "set_io_mem attn V");
+                for (int c = 0; c < n_pvc; ++c) RKNN_CHECK(rknn_matmul_set_io_mem(pvs[c]->ctx, pvs[c]->B, &pvs[c]->io_attr.B), "set_io_mem attn V");
             }
         } else if (st == 1) {
             rknn_matmul_run(qk->ctx);
@@ -1962,7 +1986,9 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
 
             // softmax rows into P (FP16) = A of the second matmul
             const float* S = (const float*)qk->C->virt_addr;
-            uint16_t* P = (uint16_t*)pv->A->virt_addr;
+            static thread_local std::vector<uint16_t> p_full;   // row-major P when the chunks' A are not native
+            if (!native && (int64_t)p_full.size() < M * n_kv) p_full.resize(M * n_kv);
+            uint16_t* P = native ? nullptr : p_full.data();
             auto m_row = [&](int64_t r) {
                 return mask ? (const ggml_fp16_t*)(m_seq + (r % n_q) * mask->nb[1]) : nullptr;
             };
@@ -1999,7 +2025,11 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                     for (int k = 0; k < FR; ++k) {
                         rknpu_softmax_row(s_buf.data() + k * n_kv, m_row(r0 + k), n_kv, lo[k], hi[k], scale, softcap, row.data(), p_buf.data() + k * n_kv);
                     }
-                    rknpu_native_scatter_rows((uint8_t*)P, prows, FR, (int)r0, pv->a_geom, pv->a_geom.sub * 2);
+                    for (int c = 0; c < n_pvc; ++c) {
+                        uint8_t* pr[512];
+                        for (int k = 0; k < FR; ++k) pr[k] = prows[k] + (size_t)c * KC * 2;
+                        rknpu_native_scatter_rows((uint8_t*)pvs[c]->A->virt_addr, pr, FR, (int)r0, pvs[c]->a_geom, pvs[c]->a_geom.sub * 2);
+                    }
                 }
             } else {
                 #pragma omp parallel for num_threads(n_omp)
@@ -2009,12 +2039,28 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                     int64_t lo, hi;
                     rknpu_softmax_range(m_row(r), n_kv, &lo, &hi);
                     rknpu_softmax_row(S + r * n_kv, m_row(r), n_kv, lo, hi, scale, softcap, row.data(), P + r * n_kv);
+                    for (int c = 0; c < n_pvc; ++c) {
+                        const int64_t kc = std::min(KC, n_kv - c * KC);
+                        memcpy((uint16_t*)pvs[c]->A->virt_addr + r * kc, P + r * n_kv + c * KC, kc * 2);
+                    }
                 }
             }
         } else if (st == 3) {
-            rknn_mem_sync(pv->ctx, pv->A, RKNN_MEMORY_SYNC_TO_DEVICE);
-            rknn_matmul_run(pv->ctx);
-            rknn_mem_sync(pv->ctx, pv->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+            for (int c = 0; c < n_pvc; ++c) {
+                rknn_mem_sync(pvs[c]->ctx, pvs[c]->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+                rknn_matmul_run(pvs[c]->ctx);
+                rknn_mem_sync(pvs[c]->ctx, pvs[c]->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+                if (c > 0) {   // chunk 0's C accumulates the partial products (same C geometry for every chunk)
+                    float* acc = (float*)pv->C->virt_addr;
+                    const float* part = (const float*)pvs[c]->C->virt_addr;
+                    const int64_t n = (int64_t)pv->io_attr.C.size / 4;
+                    int64_t i = 0;
+#ifdef __ARM_NEON
+                    for (; i + 4 <= n; i += 4) vst1q_f32(acc + i, vaddq_f32(vld1q_f32(acc + i), vld1q_f32(part + i)));
+#endif
+                    for (; i < n; ++i) acc[i] += part[i];
+                }
+            }
         } else {
 
             // O rows -> dst (permuted: row (i*n_head + h))
@@ -2061,8 +2107,10 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
     // share contexts. The NPU runs of one item overlap the CPU stages of
     // its neighbours.
     for (int c = 0; c < std::min(n, 3); ++c) {   // create every context here: the workers only look them up
-        GGML_ASSERT(bctx->get_attn_ctx((int)M, (int)DK, (int)n_kv, RKNN_MM_LAYOUT_TP_NORM, c) &&
-                    bctx->get_attn_ctx((int)M, (int)n_kv, (int)DV, RKNN_MM_LAYOUT_NORM, c));
+        GGML_ASSERT(bctx->get_attn_ctx((int)M, (int)DK, (int)n_kv, RKNN_MM_LAYOUT_TP_NORM, c));
+        for (int64_t k0 = 0, i = 0; k0 < n_kv; k0 += KC, ++i) {
+            GGML_ASSERT(bctx->get_attn_ctx((int)M, (int)std::min(KC, n_kv - k0), (int)DV, RKNN_MM_LAYOUT_NORM, c, (int)i));
+        }
     }
     auto st_k = [&](int it, int st) { stage(it / n_kvh, it % n_kvh, st, it % 3); };
     std::vector<rknpu_fn_pool::ticket> t_qk(n), t_pv(n);

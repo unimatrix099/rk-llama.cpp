@@ -2238,7 +2238,8 @@ becomes a server.
 | `RKNPU_ROPE_ANY` | unset | 1 = backend takes any F32 NORMAL/NEOX RoPE (exactness test hook) (#1h) |
 | `RKNPU_KV_WRITE` | 1 | 0 = KV-cache writes (`SET_ROWS`) of K/V stay on ggml-cpu (#1h) |
 | `RKNPU_FA_MAX_KV` | 16384 | largest KV length that NPU attention takes; longer contexts use ggml-cpu attention (librknnrt aborts on some larger shapes; #1l) |
-| `RKNPU_FA_CTX_SHAPES` | 4 | number of attention shapes whose NPU contexts stay cached (#1l) |
+| `RKNPU_FA_CTX_AGE` | 5 | attention shapes unused for this many attention ops have their NPU contexts freed (#1l, #1m) |
+| `RKNPU_FA_PV_CHUNK` | 2048 | P*V on the NPU in chunks of this many KV positions, partial outputs summed; 0 = one run (#1m) |
 | `GGML_CPU_FA_GROUPED` | 1 | 0 = ggml-cpu flash attention handles each (query row, head) separately for small batches instead of per KV-head group (#1k) |
 | `GGML_CPU_FA_SPLIT_KV` | 0 | 1 = ggml-cpu flash attention splits the KV range for single-row decode at >= 512 cells (upstream default; faster only with few heads, breaks speculative-decoding identity; #1j) |
 | `RKNPU_W8A8_NATIVE` | 1 | 0 = W8A8 nodes keep NORM A/C at 1 < M <= 32 (the runtime then converts C on one thread per run; #1i) |
