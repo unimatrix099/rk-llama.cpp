@@ -1,0 +1,84 @@
+# Build the RKNPU2 diagnostic/benchmark tools on the target board.
+#
+#   cd docs/backend && make -f Makefile.rknpu2-tools
+#   ulimit -n 65536
+#   LD_LIBRARY_PATH=$(LIBS_DIR) ./rknpu2-matmul-layout-bench
+#
+# Tools (see RKNPU2-int4-research.md for what each one established):
+#   rknpu2-matmul-probe         dtype support probe (mixed types rejected on RK3588)
+#   rknpu2-matmul-bench         raw throughput, AC_layout=NORM (carries a WARNING - see header)
+#   rknpu2-matmul-layout-bench  NORM vs NATIVE sweep (the ~80x INT4 finding)
+#   rknpu2-layout-dims-probe    native A/C tiling formats (input for the layout plan)
+#   rknpu2-coop-decode-probe    do CPU+NPU bandwidths sum at M=1? (decode research #2)
+#   rknpu2-driver-shim.so       LD_PRELOAD wall-time accounting of librknnrt calls
+
+LIBS_DIR := ../../ggml/src/ggml-rknpu2/libs
+CFLAGS   := -O2 -I $(LIBS_DIR)/include
+LDLIBS   := $(LIBS_DIR)/librknnrt.so
+
+TOOLS := rknpu2-matmul-probe rknpu2-matmul-bench rknpu2-matmul-layout-bench rknpu2-layout-dims-probe
+
+NL_SRC := ../../ggml/src/ggml-rknpu2/rknpu2-native-layout.c
+NL_INC := -I ../../ggml/src/ggml-rknpu2
+
+# Cooperative CPU+NPU decode probe (RKNPU2-decode-research.md avenue #2).
+# +dotprod so the Q4_0 GEMV matches llama.cpp's CPU kernels (A76 has it).
+rknpu2-coop-decode-probe: rknpu2-coop-decode-probe.c
+	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -pthread $< -o $@ $(LDLIBS)
+
+# Driver-call wall-time shim (usage in the file header; no rknn deps)
+rknpu2-driver-shim.so: rknpu2-driver-shim.c
+	$(CC) -O2 -shared -fPIC $< -o $@ -ldl -lpthread
+
+all: $(TOOLS) rknpu2-coop-decode-probe test-rknpu2-native-layout test-rknpu2-native-equivalence
+
+%: %.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
+
+# Unit tests for the native-layout tiling module (pure CPU, runs anywhere)
+test-rknpu2-native-layout: test-rknpu2-native-layout.c $(NL_SRC)
+	$(CC) -O0 -g $(NL_INC) $^ -o $@
+
+# Hardware equivalence test (needs the NPU; see file header)
+test-rknpu2-native-equivalence: test-rknpu2-native-equivalence.c $(NL_SRC)
+	$(CC) $(CFLAGS) $(NL_INC) $^ -o $@ $(LDLIBS)
+
+# Prep-kernel exactness tests (quantization, hadamard, dequant vs scalar
+# references incl. rounding ties and extreme-value clamps)
+GGML_INC := -I ../../ggml/include -I ../../ggml/src
+test-rknpu2-prep-kernels: test-rknpu2-prep-kernels.cpp ../../ggml/src/ggml-rknpu2/rknpu2-quantization.cpp ../../ggml/src/ggml-rknpu2/rknpu2-calibration.cpp
+	$(CXX) -O2 $(NL_INC) $(GGML_INC) -fopenmp $^ -o $@
+
+check-prep: test-rknpu2-prep-kernels
+	./test-rknpu2-prep-kernels
+
+# Dispatch-pool protocol tests. Header-only + pthreads: no librknnrt needed,
+# so this runs anywhere, not just on the board. -fsanitize=thread is worth a
+# manual run when touching the pool (the defects it pins are races).
+test-rknpu2-dispatch-pool: test-rknpu2-dispatch-pool.cpp ../../ggml/src/ggml-rknpu2/rknpu2-dispatch-pool.h
+	$(CXX) -O2 -std=c++17 $(GGML_INC) -pthread test-rknpu2-dispatch-pool.cpp -o $@
+
+check-dispatch: test-rknpu2-dispatch-pool
+	./test-rknpu2-dispatch-pool
+
+# Run the CPU unit tests
+check: test-rknpu2-native-layout
+	./test-rknpu2-native-layout
+
+# Line/branch coverage for the tiling module (gcov)
+coverage:
+	rm -rf .cov && mkdir .cov
+	$(CC) -O0 -g --coverage $(NL_INC) test-rknpu2-native-layout.c $(NL_SRC) -o .cov/tnl
+	cd .cov && ./tnl > /dev/null
+	 cd .cov && gcov -b tnl-rknpu2-native-layout | grep -E "Lines|Branches|Taken"
+	rm -f *.gcov
+
+# Run the on-NPU equivalence test (ulimit -n 65536 first)
+check-hw: test-rknpu2-native-equivalence
+	LD_LIBRARY_PATH=$(LIBS_DIR) ./test-rknpu2-native-equivalence
+
+clean:
+	rm -f $(TOOLS) rknpu2-coop-decode-probe test-rknpu2-native-layout test-rknpu2-native-equivalence test-rknpu2-dispatch-pool
+	rm -rf .cov
+
+.PHONY: all clean check check-prep check-dispatch check-hw coverage
