@@ -1201,11 +1201,40 @@ N = 32768.
 
 **Discarded:**
 - P*V chunks spread over the 3 NPU cores (`RKNPU_FA_PV_CORES=3`): pp8192
-  201.4 vs 203.9. After chunking the NPU runs are no longer the exposed
-  part at 8k. Code removed.
+  201.4 vs 203.9; retried at 16k/32k with the online softmax: 173.7 vs
+  173.8 and 126.5 vs 125.4. No gain; code removed. (Its leftover core
+  mapping also broke the pipelined path once: contexts created lazily
+  from worker threads. Pre-create every context the pipeline uses.)
 
 - NEON 8x8 V transpose in the fill stage: pp8192 220.8 vs 221.8, pp16384
   153 vs 160; no gain (the fill is not the bottleneck). Dropped.
+
+5. **Online softmax per P*V chunk** (`RKNPU_FA_ONLINE`): at 32k the stage
+   split per run was fill 9 s, QK wait 14 s, **softmax 85 s**, PV wait
+   33 s, output 3 s (of 278 s). The softmax stage is DRAM-bound (~16-18
+   bytes per score across its intermediates, rows of 64-128 KB spilling
+   L1). Flash-attention style: each row is processed in chunk-sized pieces
+   (8 KB of scratch, L1-resident), P holds exp(s - m_chunk) unnormalized,
+   and the per-row rescaling exp(m_c - M)/L is folded into the chunk
+   accumulation the P*V path already does. Numerics change (tolerant gate).
+   Same binary: pp8192 211.9 vs 208.5; **pp16384 169.8** (165), **pp32768
+   121.5** (118). PPL at 2048 context, 2 chunks: 31.53 vs 32.41 without.
+   The unnormalized-P form failed the gate (PPL32 27.5205 > 27.41; the
+   NPU's FP16 multiply-accumulate loses precision with P values up to 1).
+   Normalizing each chunk's P by its own sum, with chunk weights
+   exp(m_c - M) l_c / L, passes: PPL32 27.2322, KLD 0.610, same top
+   70.3%, FA 12/12. Clean build: pp8192 211.5 vs 209.2 (same binary),
+   pp16384 169.7, pp32768 120.6.
+
+**A DMA hazard found on the way.** The first online version failed the
+flash-attention test intermittently (outputs near zero, same inputs,
+single-threaded and with the pipeline off). Cause: the chunk accumulation
+wrote CPU results into chunk 0's C buffer, an NPU DMA target. Dirty cache
+lines from those writes can be written back after the NPU's next run into
+that buffer and corrupt it. The committed chunk path had the same hazard
+for >1 chunk. Fix: chunk outputs are combined in a host buffer per
+in-flight slot (`fa_out`), and the DMA buffers are never written by the
+CPU. 7/7 test runs clean afterwards.
 
 **Tests still to run on the final build** (short experiments only during
 the loop): full guard with every keep on; the production suite's server
