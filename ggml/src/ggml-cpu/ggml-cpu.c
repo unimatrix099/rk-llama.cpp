@@ -1240,7 +1240,18 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
                 //}
 
-                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
+                int64_t ir0 = iir0;
+#if defined(__ARM_NEON)
+                // bf16 has no SIMD vec_dot on ARM that is free to reorder its
+                // sum; four rows at a time keeps every row bit-identical while
+                // overlapping their add chains (ggml_vec_dot_bf16_x4)
+                if (type == GGML_TYPE_BF16 && num_rows_per_vec_dot == 1) {
+                    for (; ir0 + 4 <= iir0 + blck_0 && ir0 + 4 <= ir0_end; ir0 += 4) {
+                        ggml_vec_dot_bf16_x4(ne00, &tmp[ir0 - iir0], (const ggml_bf16_t *)(src0_row + ir0 * nb01), nb01, (const ggml_bf16_t *)src1_col);
+                    }
+                }
+#endif
+                for (; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
                 }
 
