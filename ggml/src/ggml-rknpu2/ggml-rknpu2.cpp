@@ -411,7 +411,8 @@ struct rknpu_attn_context {
     // plain B on one thread at every re-bind
     bool b_native = false;
     int b_subN = 0, b_subK = 0;
-    rknpu_attn_context(int M, int K, int N, int b_layout, int core_id) {
+    bool c_fp16 = false;   // C written as FP16 (RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16)
+    rknpu_attn_context(int M, int K, int N, int b_layout, int core_id, bool fp16_c = false) : c_fp16(fp16_c) {
         static const bool want_native = []() {
             const char* env = std::getenv("RKNPU_FA_NATIVE");
             return env == nullptr || std::atoi(env) != 0;
@@ -422,7 +423,7 @@ struct rknpu_attn_context {
         }();
         memset(&info, 0, sizeof(info));
         info.M = M; info.K = K; info.N = N;
-        info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
+        info.type = fp16_c ? RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16 : RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
         info.B_layout = (int16_t)(want_native && want_native_b ? RKNN_MM_LAYOUT_NATIVE : b_layout);
         info.AC_layout = want_native ? RKNN_MM_LAYOUT_NATIVE : RKNN_MM_LAYOUT_NORM;
         if (rknn_matmul_create(&ctx, &info, &io_attr) < 0) { ctx = 0; return; }
@@ -653,7 +654,8 @@ struct ggml_backend_rknpu_context {
     std::map<std::tuple<int, int, int, int, int, int>, std::unique_ptr<rknpu_attn_context>> attn_ctx_cache;
     std::map<std::tuple<int, int, int, int, int>, uint64_t> attn_shape_use;   // shape -> last attention call
     uint64_t attn_call = 0;   // incremented per attention op; shapes of the current call are never evicted
-    rknpu_attn_context* get_attn_ctx(int M, int K, int N, int b_layout, int core_id, int slot = 0) {
+    rknpu_attn_context* get_attn_ctx(int M, int K, int N, int b_layout, int core_id, int slot = 0, bool fp16_c = false) {
+        slot += fp16_c ? 1000 : 0;   // FP16-C contexts are distinct shapes
         auto key = std::make_tuple(M, K, N, b_layout, core_id, slot);
         attn_shape_use[std::make_tuple(M, K, N, b_layout, slot)] = attn_call;
         auto it = attn_ctx_cache.find(key);
@@ -681,7 +683,7 @@ struct ggml_backend_rknpu_context {
                 ++s;
             }
         }
-        auto c = std::make_unique<rknpu_attn_context>(M, K, N, b_layout, core_id);
+        auto c = std::make_unique<rknpu_attn_context>(M, K, N, b_layout, core_id, fp16_c);
         if (c->ctx == 0) return nullptr;
         return (attn_ctx_cache[key] = std::move(c)).get();
     }
@@ -1846,6 +1848,12 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         return (int64_t)(v > 0 ? (v + 255) / 256 * 256 : 1 << 30);
     }();
     const int64_t KC = std::min<int64_t>(pv_chunk, dst->src[1]->ne[1]);
+    // Q*K^T scores as FP16 (RKNPU_FA_S16, default on): halves the score traffic the softmax
+    // reads (+10% pp8192); the scores are rounded to FP16 before the softmax (0 = FP32 scores)
+    static const bool s16 = []() {
+        const char* env = std::getenv("RKNPU_FA_S16");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
     const int64_t DK = k->ne[0], DV = v->ne[0];
     const int64_t n_q = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1], n_kvh = k->ne[2];
     const int64_t rk2 = n_head / n_kvh;
@@ -1889,7 +1897,7 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         const int64_t ik3 = i3 / (n_seq / k->ne[3]);
         const int64_t iv3 = i3 / (n_seq / v->ne[3]);
         const char* m_seq = mask ? m_base + (i3 % mask->ne[3]) * mask->nb[3] : nullptr;
-        rknpu_attn_context* qk = bctx->get_attn_ctx((int)M, (int)DK, (int)n_kv, RKNN_MM_LAYOUT_TP_NORM, core);
+        rknpu_attn_context* qk = bctx->get_attn_ctx((int)M, (int)DK, (int)n_kv, RKNN_MM_LAYOUT_TP_NORM, core, 0, s16);
         // P*V in chunks of at most KC positions along K: the NPU's FP16 matmul runs ~8x slower
         // per FLOP once K passes ~4096 (RKNPU_FA_PV_CHUNK; 0 = one run); partial outputs are summed
         rknpu_attn_context* pvs[128];
@@ -1910,6 +1918,7 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         uint16_t* a = (uint16_t*)qk->A->virt_addr;
         const int FR = rknpu_fa_rows();
         const bool native = qk->native && pv_native && M % FR == 0;
+        GGML_ASSERT((native || !qk->c_fp16) && "RKNPU2: FP16 scores need the native attention path");
         auto q_row = [&](int64_t r) {
             const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
             return (const float*)(q_base + i * q->nb[1] + h * q->nb[2] + i3 * q->nb[3]);
@@ -2019,8 +2028,29 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                     }
                     const int sub = qk->c_geom.sub;
                     if (!range_enabled) { blo = 0; bhi = n_kv; }
-                    if (bhi > blo) {
+                    if (bhi > blo && !qk->c_fp16) {
                         rknpu_native_gather_rows(srows, FR, (const uint8_t*)S, (int)r0, qk->c_geom, sub * 4, (int)(blo / sub), (int)((bhi + sub - 1) / sub));
+                    } else if (bhi > blo) {
+                        // FP16 scores: gather the cells into the second half of s_buf, then widen in place per row
+                        static thread_local std::vector<uint16_t> h_buf;
+                        if ((int64_t)h_buf.size() < FR * n_kv) h_buf.resize(FR * n_kv);
+                        uint8_t* hrows[512];
+                        for (int k = 0; k < FR; ++k) hrows[k] = (uint8_t*)(h_buf.data() + k * n_kv);
+                        rknpu_native_gather_rows(hrows, FR, (const uint8_t*)S, (int)r0, qk->c_geom, sub * 2, (int)(blo / sub), (int)((bhi + sub - 1) / sub));
+                        for (int k = 0; k < FR; ++k) {
+                            if (hi[k] <= lo[k]) continue;
+                            const uint16_t* h = h_buf.data() + k * n_kv;
+                            float* f = s_buf.data() + k * n_kv;
+                            int64_t j = lo[k];
+#ifdef __ARM_NEON
+                            for (; j + 8 <= hi[k]; j += 8) {
+                                const float16x8_t v = vreinterpretq_f16_u16(vld1q_u16(h + j));
+                                vst1q_f32(f + j, vcvt_f32_f16(vget_low_f16(v)));
+                                vst1q_f32(f + j + 4, vcvt_f32_f16(vget_high_f16(v)));
+                            }
+#endif
+                            for (; j < hi[k]; ++j) f[j] = ggml_fp16_to_fp32(h[j]);
+                        }
                     }
                     for (int k = 0; k < FR; ++k) {
                         rknpu_softmax_row(s_buf.data() + k * n_kv, m_row(r0 + k), n_kv, lo[k], hi[k], scale, softcap, row.data(), p_buf.data() + k * n_kv);
@@ -2107,7 +2137,7 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
     // share contexts. The NPU runs of one item overlap the CPU stages of
     // its neighbours.
     for (int c = 0; c < std::min(n, 3); ++c) {   // create every context here: the workers only look them up
-        GGML_ASSERT(bctx->get_attn_ctx((int)M, (int)DK, (int)n_kv, RKNN_MM_LAYOUT_TP_NORM, c));
+        GGML_ASSERT(bctx->get_attn_ctx((int)M, (int)DK, (int)n_kv, RKNN_MM_LAYOUT_TP_NORM, c, 0, s16));
         for (int64_t k0 = 0, i = 0; k0 < n_kv; k0 += KC, ++i) {
             GGML_ASSERT(bctx->get_attn_ctx((int)M, (int)std::min(KC, n_kv - k0), (int)DV, RKNN_MM_LAYOUT_NORM, c, (int)i));
         }
