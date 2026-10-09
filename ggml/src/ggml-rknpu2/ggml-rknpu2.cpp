@@ -643,6 +643,8 @@ struct ggml_backend_rknpu_context {
     // done inside its projection's dequant)
     std::unordered_set<const struct ggml_tensor*> done_nodes;
     rknpu_fn_pool fa_pool;
+    std::vector<float> fa_stats[3];   // online softmax: per in-flight item (core slot), [row][chunk][m, l]
+    std::vector<float> fa_out[3];     // host-side P*V output per slot: the chunk outputs are combined here, never in the DMA buffers
     // whole-FFN schedule (rknpu_ffn_block): gate, up and down jobs, and
     // gate's and up's chunk contexts as one runner batch
     rknpu_w4a4_job ffn_gate, ffn_up, ffn_down;
@@ -976,6 +978,59 @@ static void rknpu_softmax_row(const float* s_row, const ggml_fp16_t* mrow, int64
 #endif
     for (; j < n; ++j) tmp[j] *= inv;
     rknpu_fp32_to_fp16(tmp, out, n);
+}
+
+// One chunk of an attention row from FP16 scores: x = softcap(s*scale) + mask over n
+// elements, out = exp(x - m) as FP16 with the chunk's own max m and sum l (flash-attention
+// style; the P*V accumulation rescales the chunks). An all-masked chunk gives m = -inf, l = 0.
+static void rknpu_softmax_chunk16(const uint16_t* s16, const ggml_fp16_t* mrow, int64_t n, float scale, float softcap,
+                                  float* tmp, uint16_t* out, float* m_out, float* l_out) {
+    int64_t j = 0;
+    float mx = -INFINITY;
+#ifdef __ARM_NEON
+    float32x4_t vmx = vdupq_n_f32(-INFINITY);
+    const float32x4_t vs = vdupq_n_f32(scale), vcap = vdupq_n_f32(softcap);
+    const float32x4_t one = vdupq_n_f32(1.0f), two = vdupq_n_f32(2.0f);
+    for (; j + 4 <= n; j += 4) {
+        float32x4_t x = vmulq_f32(vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(s16 + j))), vs);
+        if (softcap != 0.0f) x = vmulq_f32(vcap, vsubq_f32(one, vdivq_f32(two, vaddq_f32(rknpu_v_expf(vmulq_f32(two, x)), one))));
+        if (mrow) x = vaddq_f32(x, vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16((const uint16_t*)mrow + j))));
+        vst1q_f32(tmp + j, x);
+        vmx = vmaxq_f32(vmx, x);
+    }
+    mx = vmaxvq_f32(vmx);
+#endif
+    for (; j < n; ++j) {
+        float x = ggml_fp16_to_fp32(s16[j]) * scale;
+        if (softcap != 0.0f) x = softcap * tanhf(x);
+        if (mrow) x += ggml_fp16_to_fp32(mrow[j]);
+        tmp[j] = x;
+        mx = std::max(mx, x);
+    }
+    if (mx == -INFINITY) {
+        memset(out, 0, n * sizeof(uint16_t));
+        *m_out = -INFINITY; *l_out = 0.0f;
+        return;
+    }
+    float sum = 0.0f;
+    j = 0;
+#ifdef __ARM_NEON
+    float32x4_t vsum = vdupq_n_f32(0.0f);
+    const float32x4_t vm = vdupq_n_f32(mx);
+    for (; j + 8 <= n; j += 8) {
+        const float32x4_t e0 = rknpu_v_expf(vsubq_f32(vld1q_f32(tmp + j), vm));
+        const float32x4_t e1 = rknpu_v_expf(vsubq_f32(vld1q_f32(tmp + j + 4), vm));
+        vsum = vaddq_f32(vsum, vaddq_f32(e0, e1));
+        vst1q_u16(out + j, vreinterpretq_u16_f16(vcombine_f16(vcvt_f16_f32(e0), vcvt_f16_f32(e1))));
+    }
+    sum = vaddvq_f32(vsum);
+#endif
+    for (; j < n; ++j) {
+        const float e = tmp[j] == -INFINITY ? 0.0f : expf(tmp[j] - mx);
+        sum += e;
+        out[j] = ggml_fp32_to_fp16(e);
+    }
+    *m_out = mx; *l_out = sum;
 }
 
 // GEGLU (gate, up) on the backend, so [up, gate, GLU, down] stay in one NPU
@@ -1850,6 +1905,13 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
     const int64_t KC = std::min<int64_t>(pv_chunk, dst->src[1]->ne[1]);
     // Q*K^T scores as FP16 (RKNPU_FA_S16, default on): halves the score traffic the softmax
     // reads (+10% pp8192); the scores are rounded to FP16 before the softmax (0 = FP32 scores)
+    // Online softmax per P*V chunk (RKNPU_FA_ONLINE, default on): the row is processed in
+    // chunk-sized pieces (L1-resident scratch) and P holds exp(s - m_chunk); the chunk sums are
+    // rescaled when the P*V outputs are accumulated. Needs FP16 scores and the native path.
+    static const bool online_env = []() {
+        const char* env = std::getenv("RKNPU_FA_ONLINE");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
     static const bool s16 = []() {
         const char* env = std::getenv("RKNPU_FA_S16");
         return env == nullptr || std::atoi(env) != 0;
@@ -1919,6 +1981,10 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         const int FR = rknpu_fa_rows();
         const bool native = qk->native && pv_native && M % FR == 0;
         GGML_ASSERT((native || !qk->c_fp16) && "RKNPU2: FP16 scores need the native attention path");
+        const bool online = online_env && native && qk->c_fp16;
+        if (online && st == 2 && (int64_t)bctx->fa_stats[core].size() < M * n_pvc * 2) bctx->fa_stats[core].resize(M * n_pvc * 2);
+        const bool host_out = online || n_pvc > 1;
+        if (host_out && st == 2 && bctx->fa_out[core].size() < pv->io_attr.C.size / 4) bctx->fa_out[core].resize(pv->io_attr.C.size / 4);
         auto q_row = [&](int64_t r) {
             const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
             return (const float*)(q_base + i * q->nb[1] + h * q->nb[2] + i3 * q->nb[3]);
@@ -2005,7 +2071,7 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                 #pragma omp parallel for num_threads(n_omp)
                 for (int64_t r0 = 0; r0 < M; r0 += FR) {
                     static thread_local std::vector<float> row, s_buf;
-                    static thread_local std::vector<uint16_t> p_buf;
+                    static thread_local std::vector<uint16_t> p_buf, h_buf;
                     if ((int64_t)row.size() < n_kv) row.resize(n_kv);
                     if ((int64_t)s_buf.size() < FR * n_kv) s_buf.resize(FR * n_kv);
                     if ((int64_t)p_buf.size() < FR * n_kv) p_buf.resize(FR * n_kv);
@@ -2031,13 +2097,12 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                     if (bhi > blo && !qk->c_fp16) {
                         rknpu_native_gather_rows(srows, FR, (const uint8_t*)S, (int)r0, qk->c_geom, sub * 4, (int)(blo / sub), (int)((bhi + sub - 1) / sub));
                     } else if (bhi > blo) {
-                        // FP16 scores: gather the cells into the second half of s_buf, then widen in place per row
-                        static thread_local std::vector<uint16_t> h_buf;
+                        // FP16 scores: gather the cells; the plain path widens them per row into s_buf
                         if ((int64_t)h_buf.size() < FR * n_kv) h_buf.resize(FR * n_kv);
                         uint8_t* hrows[512];
                         for (int k = 0; k < FR; ++k) hrows[k] = (uint8_t*)(h_buf.data() + k * n_kv);
                         rknpu_native_gather_rows(hrows, FR, (const uint8_t*)S, (int)r0, qk->c_geom, sub * 2, (int)(blo / sub), (int)((bhi + sub - 1) / sub));
-                        for (int k = 0; k < FR; ++k) {
+                        for (int k = 0; k < FR && !online; ++k) {
                             if (hi[k] <= lo[k]) continue;
                             const uint16_t* h = h_buf.data() + k * n_kv;
                             float* f = s_buf.data() + k * n_kv;
@@ -2052,8 +2117,30 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                             for (; j < hi[k]; ++j) f[j] = ggml_fp16_to_fp32(h[j]);
                         }
                     }
-                    for (int k = 0; k < FR; ++k) {
-                        rknpu_softmax_row(s_buf.data() + k * n_kv, m_row(r0 + k), n_kv, lo[k], hi[k], scale, softcap, row.data(), p_buf.data() + k * n_kv);
+                    if (online) {
+                        float* st = bctx->fa_stats[core].data();
+                        for (int k = 0; k < FR; ++k) {
+                            const uint16_t* h = h_buf.data() + k * n_kv;
+                            uint16_t* pk = p_buf.data() + k * n_kv;
+                            const ggml_fp16_t* mr = m_row(r0 + k);
+                            for (int c = 0; c < n_pvc; ++c) {
+                                const int64_t c0 = c * KC, c1 = std::min(n_kv, c0 + KC);
+                                const int64_t a = std::max(lo[k], c0), b = std::min(hi[k], c1);
+                                float* mlc = st + ((r0 + k) * n_pvc + c) * 2;
+                                if (b <= a) {
+                                    memset(pk + c0, 0, (c1 - c0) * sizeof(uint16_t));
+                                    mlc[0] = -INFINITY; mlc[1] = 0.0f;
+                                    continue;
+                                }
+                                memset(pk + c0, 0, (a - c0) * sizeof(uint16_t));
+                                memset(pk + b, 0, (c1 - b) * sizeof(uint16_t));
+                                rknpu_softmax_chunk16(h + a, mr ? mr + a : nullptr, b - a, scale, softcap, row.data(), pk + a, mlc, mlc + 1);
+                            }
+                        }
+                    } else {
+                        for (int k = 0; k < FR; ++k) {
+                            rknpu_softmax_row(s_buf.data() + k * n_kv, m_row(r0 + k), n_kv, lo[k], hi[k], scale, softcap, row.data(), p_buf.data() + k * n_kv);
+                        }
                     }
                     for (int c = 0; c < n_pvc; ++c) {
                         uint8_t* pr[512];
@@ -2076,14 +2163,49 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                 }
             }
         } else if (st == 3) {
+            // online softmax: per row, O = sum_c a_rc O_c with a_rc = exp(m_rc - M_r) / L_r,
+            // L_r = sum_c exp(m_rc - M_r) l_rc (the chunks' P are unnormalized)
+            static thread_local std::vector<float> alpha;
+            if (online) {
+                const float* st = bctx->fa_stats[core].data();
+                if ((int64_t)alpha.size() < M * n_pvc) alpha.resize(M * n_pvc);
+                for (int64_t r = 0; r < M; ++r) {
+                    float Mr = -INFINITY;
+                    for (int c = 0; c < n_pvc; ++c) Mr = std::max(Mr, st[(r * n_pvc + c) * 2]);
+                    float Lr = 0.0f;
+                    for (int c = 0; c < n_pvc; ++c) {
+                        const float m = st[(r * n_pvc + c) * 2];
+                        alpha[r * n_pvc + c] = m == -INFINITY ? 0.0f : expf(m - Mr);
+                        Lr += alpha[r * n_pvc + c] * st[(r * n_pvc + c) * 2 + 1];
+                    }
+                    const float inv = Lr > 0.0f ? 1.0f / Lr : 0.0f;
+                    for (int c = 0; c < n_pvc; ++c) alpha[r * n_pvc + c] *= inv;
+                }
+            }
             for (int c = 0; c < n_pvc; ++c) {
                 rknn_mem_sync(pvs[c]->ctx, pvs[c]->A, RKNN_MEMORY_SYNC_TO_DEVICE);
                 rknn_matmul_run(pvs[c]->ctx);
                 rknn_mem_sync(pvs[c]->ctx, pvs[c]->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
-                if (c > 0) {   // chunk 0's C accumulates the partial products (same C geometry for every chunk)
-                    float* acc = (float*)pv->C->virt_addr;
+                if (online) {   // acc = a_r0 * C_0, then acc += a_rc * C_c: cell (t, r) holds sub floats of row r
+                    float* acc = bctx->fa_out[core].data();
+                    const float* part = (const float*)pvs[c]->C->virt_addr;
+                    const int ms = pv->c_geom.m_stride, outer = pv->c_geom.outer, csub = pv->c_geom.sub;
+                    for (int t = 0; t < outer; ++t) {
+                        for (int64_t r = 0; r < M; ++r) {
+                            const float a = alpha[r * n_pvc + c];
+                            float* ac = acc + ((size_t)t * ms + r) * csub;
+                            const float* pc = part + ((size_t)t * ms + r) * csub;
+                            if (c == 0) { for (int j = 0; j < csub; ++j) ac[j] = a * pc[j]; }
+                            else        { for (int j = 0; j < csub; ++j) ac[j] += a * pc[j]; }
+                        }
+                    }
+                    continue;
+                }
+                if (n_pvc > 1) {   // the host buffer accumulates the partial products (same C geometry for every chunk)
+                    float* acc = bctx->fa_out[core].data();
                     const float* part = (const float*)pvs[c]->C->virt_addr;
                     const int64_t n = (int64_t)pv->io_attr.C.size / 4;
+                    if (c == 0) { memcpy(acc, part, n * sizeof(float)); continue; }
                     int64_t i = 0;
 #ifdef __ARM_NEON
                     for (; i + 4 <= n; i += 4) vst1q_f32(acc + i, vaddq_f32(vld1q_f32(acc + i), vld1q_f32(part + i)));
@@ -2094,7 +2216,7 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         } else {
 
             // O rows -> dst (permuted: row (i*n_head + h))
-            const float* O = (const float*)pv->C->virt_addr;
+            const float* O = host_out ? bctx->fa_out[core].data() : (const float*)pv->C->virt_addr;
             // permute(0, 2, 1, 3): row (i3*n_q*n_head + i*n_head + h)
             auto d_row = [&](int64_t r) {
                 const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
