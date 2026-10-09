@@ -1124,6 +1124,19 @@ aborted** in NPU attention (`GGML_ASSERT(get_attn_ctx(...))`).
    512-token ubatch (heads per group x n_q <= 2048). Anything beyond that
    goes to ggml-cpu's flash attention through `supports_op`.
 
+3. **Data race in `rknpu_async_runner`** (pipelined prefill). In the limit
+   tests `llama-server` segfaulted on its first prompt. It happened in 3 of
+   3 runs when the server started right after another NPU process was
+   killed, and occasionally otherwise. A core dump of the release binary,
+   resolved against an identical build with symbols, showed a worker
+   loading `(*job)[idx]` from reused memory (`0x3f80000000000004`, a float
+   1.0 pattern). Workers read the caller's context vector outside the lock.
+   A worker that is not part of the current job can wake after `wait()` has
+   returned, while the caller is already rebuilding that vector (the FFN
+   block's `gu`/`gud`, or a job's `cctx`). Fix: `start()` copies the
+   context pointers under the lock, and workers read only that copy.
+   Kill-then-start: 5/5 OK (was 0/3).
+
 After the fixes: pp8192 166.3 t/s, pp16384 112.9 t/s (both crashed
 before), pp512 unchanged at 296 t/s. The full limits are in
 `RKNPU2-production.md`.
