@@ -1190,29 +1190,22 @@ N = 32768.
    together.
 3. **NPU attention to 32k**: with P*V chunked no shape aborts, so
    `RKNPU_FA_MAX_KV` can be 32768: **pp32768 28 -> 104.7 t/s**.
-4. **FP16 scores** (`RKNPU_FA_S16`) - NOT YET IN THE TREE: Q*K^T writes FP16; the
+4. **FP16 scores** (`RKNPU_FA_S16`, default on): Q*K^T writes FP16; the
    softmax stage is DRAM-traffic-bound (~600 MB per item at 16k) and the
-   score read halves. pp8192 204 -> **224**. Numerics change (scores
-   rounded to FP16): PPL32 26.5468 (was 27.2382), KLD 0.5999, same top
-   71.1%, inside the tolerant gate; FA test 12/12. But with it on, pp16384
-   and pp32768 fail at P*V chunk context creation (8k works); cause not
-   found when the session ended. The code is parked in
-   `autoresearch/loop-pp-long/pending-s16-vt.diff`.
+   score read halves. pp8192 204 -> **224**, pp16384 160 -> **165**,
+   pp32768 105 -> **118**. Numerics change (scores rounded to FP16):
+   PPL32 26.5468 (was 27.2382), KLD 0.5999, same top 71.1%, inside the
+   tolerant gate; FA test 12/12. A first version failed at 16k with DMA
+   exhaustion: the FP16-C contexts were keyed with a shifted slot but the
+   age bookkeeping used the plain slot, so they were never freed.
 
 **Discarded:**
 - P*V chunks spread over the 3 NPU cores (`RKNPU_FA_PV_CORES=3`): pp8192
   201.4 vs 203.9. After chunking the NPU runs are no longer the exposed
   part at 8k. Code removed.
 
-- NEON 8x8 V transpose in the fill stage (`RKNPU_FA_VT`): pp8192 220.8 vs
-  221.8, no gain; in the same parked diff, to be dropped.
-
-**State at the end of the session:** the tree has keeps 1-3 (commit
-f20949be0): pp16384 160.3, pp32768 104.7 (with `RKNPU_FA_MAX_KV=32768`,
-not yet the default). Next: find why FP16 scores break context creation
-at 16k (suspect: the FP16 QK context's key or buffer sizes in the age
-eviction), then a 32k stage profile for the next lever (Q*K^T split over
-3 cores is the measured candidate: 36.9 -> 14.8 ms).
+- NEON 8x8 V transpose in the fill stage: pp8192 220.8 vs 221.8, pp16384
+  153 vs 160; no gain (the fill is not the bottleneck). Dropped.
 
 **Tests still to run on the final build** (short experiments only during
 the loop): full guard with every keep on; the production suite's server
