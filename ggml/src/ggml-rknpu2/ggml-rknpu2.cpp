@@ -1859,11 +1859,12 @@ static bool rknpu_fa_supported(const struct ggml_tensor* op) {
     const int64_t DK = k->ne[0], DV = v->ne[0], n_q = q->ne[1], n_kv = k->ne[1];
     if (n_q < 32) return false;                       // prefill only; decode stays on the CPU kernel
     if (DK % 32 != 0 || DV % 16 != 0 || n_kv % 32 != 0) return false;
-    // Validated envelope: librknnrt aborts the process ("Failed to config layer") on some FP16
-    // shapes beyond it (e.g. n_kv 16640, 16896, 17408 at M = 2048); larger runs use ggml-cpu
+    // Validated envelope: with P*V chunked (<= 2048 positions per run) every shape up to 32768
+    // works; librknnrt aborts the process ("Failed to config layer") on some larger-K FP16 shapes,
+    // so the chunk size must stay <= 2048. Beyond max_kv the attention runs on ggml-cpu.
     static const int64_t max_kv = []() {
         const char* env = std::getenv("RKNPU_FA_MAX_KV");
-        return env ? (int64_t)std::atoll(env) : (int64_t)16384;
+        return env ? (int64_t)std::atoll(env) : (int64_t)32768;
     }();
     if (n_kv > max_kv || (q->ne[2] / k->ne[2]) * n_q > 2048) return false;
     if (q->ne[2] % k->ne[2] != 0 || k->ne[2] != v->ne[2]) return false;
@@ -2001,7 +2002,10 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
 
         // A = Q rows of the rk2 heads of this group, FP16, row r = hh*n_q + i
         uint16_t* a = (uint16_t*)qk->A->virt_addr;
-        const int FR = rknpu_fa_rows();
+        // rows per block: the largest power of two <= RKNPU_FA_ROWS that divides M, so a
+        // short last ubatch (M = heads x n_q) still takes the native path
+        int FR = rknpu_fa_rows();
+        while (FR > 1 && M % FR) FR /= 2;
         const bool native = qk->native && pv_native && M % FR == 0;
         GGML_ASSERT((native || !qk->c_fp16) && "RKNPU2: FP16 scores need the native attention path");
         const bool online = online_env && native && qk->c_fp16;
