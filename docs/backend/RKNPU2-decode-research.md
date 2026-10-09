@@ -1100,6 +1100,34 @@ t/s (was 18.17), 4/4 identical. Guard bit-identical (PPL32 27.2382, KLD
 cut short by a machine shutdown: **re-run it**
 (`docs/handover/profiling-patches/mtp-holdout.sh`).
 
+### 1l. Long prompts: two crashes fixed (2026-10-09)
+
+Found by the production limit tests: **every prompt of ~8k tokens or more
+aborted** in NPU attention (`GGML_ASSERT(get_attn_ctx(...))`).
+
+1. **Unbounded attention-context cache.** `attn_ctx_cache` kept a context
+   set (QK and PV, 3 cores) for every KV length it had seen. During a long
+   prefill n_kv grows by 512 per ubatch, and each context's DMA buffers grow
+   with it (QK's C alone is M x n_kv x 4 bytes, 64 MB at n_kv 8192). The
+   IOMMU domain filled up and context creation failed near n_kv 8192. Fix:
+   the cache keeps the most recently used shapes only (`RKNPU_FA_CTX_SHAPES`,
+   default 4: QK and PV for the SWA and the global head size). Shapes in use
+   by the current attention call are never evicted.
+2. **librknnrt aborts on some FP16 shapes.** A standalone probe
+   (`fa-limit-probe.c`: create, bind and run the attention shapes at
+   M = 2048) shows that the runtime kills the process with "Failed to
+   config layer: 'matmul', Fatal Error" for some n_kv between 16384 and
+   18432 (16640, 16896, 17408 fail; 16416, 17152, 17920 work). Larger
+   values up to 32768 work again. Every multiple of 256 up to 16384 works
+   for all four shapes. Since the abort cannot be caught, NPU attention is
+   now limited to n_kv <= 16384 (`RKNPU_FA_MAX_KV`) and to the validated
+   512-token ubatch (heads per group x n_q <= 2048). Anything beyond that
+   goes to ggml-cpu's flash attention through `supports_op`.
+
+After the fixes: pp8192 166.3 t/s, pp16384 112.9 t/s (both crashed
+before), pp512 unchanged at 296 t/s. The full limits are in
+`RKNPU2-production.md`.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
@@ -2196,6 +2224,8 @@ becomes a server.
 | `RKNPU_ROPE_FUSE` | 1 | 0 = RoPE runs as a separate backend op instead of inside the Q/K dequant (#1h) |
 | `RKNPU_ROPE_ANY` | unset | 1 = backend takes any F32 NORMAL/NEOX RoPE (exactness test hook) (#1h) |
 | `RKNPU_KV_WRITE` | 1 | 0 = KV-cache writes (`SET_ROWS`) of K/V stay on ggml-cpu (#1h) |
+| `RKNPU_FA_MAX_KV` | 16384 | largest KV length that NPU attention takes; longer contexts use ggml-cpu attention (librknnrt aborts on some larger shapes; #1l) |
+| `RKNPU_FA_CTX_SHAPES` | 4 | number of attention shapes whose NPU contexts stay cached (#1l) |
 | `GGML_CPU_FA_GROUPED` | 1 | 0 = ggml-cpu flash attention handles each (query row, head) separately for small batches instead of per KV-head group (#1k) |
 | `GGML_CPU_FA_SPLIT_KV` | 0 | 1 = ggml-cpu flash attention splits the KV range for single-row decode at >= 512 cells (upstream default; faster only with few heads, breaks speculative-decoding identity; #1j) |
 | `RKNPU_W8A8_NATIVE` | 1 | 0 = W8A8 nodes keep NORM A/C at 1 < M <= 32 (the runtime then converts C on one thread per run; #1i) |
