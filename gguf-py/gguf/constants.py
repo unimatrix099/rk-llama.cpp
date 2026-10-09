@@ -133,6 +133,8 @@ class Keys:
         MOE_EVERY_N_LAYERS                = "{arch}.moe_every_n_layers"
         MOE_LATENT_SIZE                   = "{arch}.moe_latent_size"
         NEXTN_PREDICT_LAYERS              = "{arch}.nextn_predict_layers"
+        MASKED_EMBD_N_CENTROIDS           = "{arch}.masked_embedding.centroid_count"
+        MASKED_EMBD_TOP_K                 = "{arch}.masked_embedding.top_k"
         NUM_DEEPSTACK_LAYERS              = "{arch}.n_deepstack_layers"
         DEEPSTACK_MAPPING                 = "{arch}.deepstack_mapping"
         POOLING_TYPE                      = "{arch}.pooling_type"

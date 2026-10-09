@@ -16,6 +16,8 @@ void llama_model_gemma4_assistant::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,  hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_SWA,     hparams.n_embd_head_k_swa);
     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,   hparams.n_embd_head_v_swa);
+    ml.get_key(LLM_KV_MASKED_EMBD_N_CENTROIDS,      hparams.n_masked_embd_centroids, false);
+    ml.get_key(LLM_KV_MASKED_EMBD_TOP_K,            hparams.n_masked_embd_top_k,     false);
 }
 
 void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
@@ -36,8 +38,10 @@ void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
 
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
 
-    create_tensor(tn(LLM_TENSOR_MASKED_EMBD_CENTROIDS, "weight"), {}, TENSOR_NOT_REQUIRED);
-    create_tensor(tn(LLM_TENSOR_MASKED_EMBD_ORDERING),  {}, TENSOR_NOT_REQUIRED);
+    if (hparams.n_masked_embd_centroids > 0 && hparams.n_masked_embd_top_k > 0) {
+        masked_embd_centroids = create_tensor(tn(LLM_TENSOR_MASKED_EMBD_CENTROIDS, "weight"), { n_embd, hparams.n_masked_embd_centroids }, TENSOR_NOT_REQUIRED);
+        masked_embd_ordering  = create_tensor(tn(LLM_TENSOR_MASKED_EMBD_ORDERING),            { n_vocab },                                 TENSOR_NOT_REQUIRED);
+    }
 
     const int64_t n_embd_backbone = hparams.n_embd_inp();
     nextn_proj_post = create_tensor(tn(LLM_TENSOR_NEXTN_PROJ_POST, "weight"), { n_embd, n_embd_backbone }, 0);
@@ -187,7 +191,34 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
-    ggml_tensor * logits = build_lora_mm(model.output, cur);
+    ggml_tensor * logits = nullptr;
+    if (model.masked_embd_centroids && model.masked_embd_ordering &&
+        model.masked_embd_ordering->ne[0] % hparams.n_masked_embd_centroids == 0) {
+        // sparse draft logits: score only the tokens of the top-k centroids, the rest stay -inf
+        const int64_t n_vocab = model.masked_embd_ordering->ne[0];
+        const int64_t n_cent  = hparams.n_masked_embd_centroids;
+        const int64_t top_k  = hparams.n_masked_embd_top_k;
+        const int64_t n_per  = n_vocab / n_cent;
+        const int64_t n_out  = cur->ne[1];
+
+        ggml_tensor * cent = ggml_mul_mat(ctx0, model.masked_embd_centroids, cur);   // [n_cent, n_out]
+        ggml_tensor * top  = ggml_top_k(ctx0, cent, top_k);                         // [top_k, n_out]
+        ggml_tensor * ids  = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, model.masked_embd_ordering, n_per, n_cent),
+                                           ggml_reshape_1d(ctx0, top, top_k*n_out)); // [n_per, top_k*n_out]
+        ids = ggml_reshape_1d(ctx0, ids, n_per*top_k*n_out);
+        cb(ids, "draft_token_ids", -1);
+
+        ggml_tensor * emb = ggml_get_rows(ctx0, model.tok_embd, ids);                // [n_embd, n_sel*n_out]
+        emb = ggml_reshape_3d(ctx0, emb, n_embd, n_per*top_k, n_out);
+        ids = ggml_reshape_2d(ctx0, ids, n_per*top_k, n_out);                         // [n_sel, n_out]
+        ggml_tensor * sel = ggml_mul_mat(ctx0, emb, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_out)); // [n_sel, 1, n_out]
+
+        logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_out), -INFINITY);
+        logits = ggml_set_rows(ctx0, logits, ggml_reshape_3d(ctx0, sel, 1, n_per*top_k, n_out), ids);
+        logits = ggml_reshape_2d(ctx0, logits, n_vocab, n_out);
+    } else {
+        logits = build_lora_mm(model.output, cur);
+    }
     cb(logits, "result_output", -1);
     res->t_logits = logits;
 
