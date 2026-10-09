@@ -644,12 +644,37 @@ struct ggml_backend_rknpu_context {
     rknpu_w4a4_job ffn_gate, ffn_up, ffn_down;
     std::vector<std::shared_ptr<rknpu_matmul_context>> ffn_gu_ctx, ffn_gud_ctx;
 
-    // (M, K, N, B layout, core) -> attention matmul context
+    // (M, K, N, B layout, core) -> attention matmul context. The KV length grows with
+    // every ubatch, so only the most recently used shapes are kept (RKNPU_FA_CTX_SHAPES):
+    // their DMA buffers grow with n_kv and otherwise exhaust the IOMMU domain
     std::map<std::tuple<int, int, int, int, int>, std::unique_ptr<rknpu_attn_context>> attn_ctx_cache;
+    std::map<std::tuple<int, int, int, int>, uint64_t> attn_shape_use;   // shape -> last attention call
+    uint64_t attn_call = 0;   // incremented per attention op; shapes of the current call are never evicted
     rknpu_attn_context* get_attn_ctx(int M, int K, int N, int b_layout, int core_id) {
         auto key = std::make_tuple(M, K, N, b_layout, core_id);
+        attn_shape_use[std::make_tuple(M, K, N, b_layout)] = attn_call;
         auto it = attn_ctx_cache.find(key);
         if (it != attn_ctx_cache.end()) return it->second.get();
+        static const size_t max_shapes = []() {
+            const char* env = std::getenv("RKNPU_FA_CTX_SHAPES");
+            const int v = env ? std::atoi(env) : 4;
+            return (size_t)(v >= 2 ? v : 4);
+        }();
+        while (attn_shape_use.size() > max_shapes) {
+            auto oldest = attn_shape_use.begin();
+            for (auto s = attn_shape_use.begin(); s != attn_shape_use.end(); ++s) {
+                if (s->second < oldest->second) oldest = s;
+            }
+            if (oldest->second == attn_call) break;   // all in use by this call
+            for (auto c = attn_ctx_cache.begin(); c != attn_ctx_cache.end(); ) {
+                if (std::make_tuple(std::get<0>(c->first), std::get<1>(c->first), std::get<2>(c->first), std::get<3>(c->first)) == oldest->first) {
+                    c = attn_ctx_cache.erase(c);
+                } else {
+                    ++c;
+                }
+            }
+            attn_shape_use.erase(oldest);
+        }
         auto c = std::make_unique<rknpu_attn_context>(M, K, N, b_layout, core_id);
         if (c->ctx == 0) return nullptr;
         return (attn_ctx_cache[key] = std::move(c)).get();
@@ -1755,6 +1780,13 @@ static bool rknpu_fa_supported(const struct ggml_tensor* op) {
     const int64_t DK = k->ne[0], DV = v->ne[0], n_q = q->ne[1], n_kv = k->ne[1];
     if (n_q < 32) return false;                       // prefill only; decode stays on the CPU kernel
     if (DK % 32 != 0 || DV % 16 != 0 || n_kv % 32 != 0) return false;
+    // Validated envelope: librknnrt aborts the process ("Failed to config layer") on some FP16
+    // shapes beyond it (e.g. n_kv 16640, 16896, 17408 at M = 2048); larger runs use ggml-cpu
+    static const int64_t max_kv = []() {
+        const char* env = std::getenv("RKNPU_FA_MAX_KV");
+        return env ? (int64_t)std::atoll(env) : (int64_t)16384;
+    }();
+    if (n_kv > max_kv || (q->ne[2] / k->ne[2]) * n_q > 2048) return false;
     if (q->ne[2] % k->ne[2] != 0 || k->ne[2] != v->ne[2]) return false;
     if (k->nb[0] != 2 || v->nb[0] != 2 || q->nb[0] != 4 || op->nb[0] != 4) return false;
     return true;
@@ -1801,6 +1833,7 @@ static int rknpu_fa_rows() {
 
 static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tensor* dst, int n_omp) {
     const struct ggml_tensor *q = dst->src[0], *k = dst->src[1], *v = dst->src[2], *mask = dst->src[3];
+    ++bctx->attn_call;
     const int64_t DK = k->ne[0], DV = v->ne[0];
     const int64_t n_q = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1], n_kvh = k->ne[2];
     const int64_t rk2 = n_head / n_kvh;
