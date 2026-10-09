@@ -1141,6 +1141,84 @@ After the fixes: pp8192 166.3 t/s, pp16384 112.9 t/s (both crashed
 before), pp512 unchanged at 296 t/s. The full limits are in
 `RKNPU2-production.md`.
 
+### 1m. Long prompts: why prefill slows with prompt size, and the fixes (2026-10-09)
+
+Goal: keep prefill speed up for big prompts (autoresearch loop
+`autoresearch/loop-pp-long/`, metric pp16384 and pp32768; targets 170 and
+80 t/s). Start: pp512 296, pp4k 238, pp8k 166, pp16k 113, pp32k 28 t/s.
+
+**Where the time goes.** `RKNPU_PROFILE` at 16k: of 146 s per run, the
+backend's matmul nodes take 42.6 s and the attention block 94 s (it was
+4.9 s at 4k: 16.8x for 4x the tokens, i.e. quadratic). E4B has 42 layers,
+35 with a 512-token sliding window (their KV view stays <= 2560 cells) and
+7 global ones, so the growth is in those 7. A stage split of the attention
+block per run:
+
+| per run | fill | QK wait | softmax | PV wait | output |
+|---|---|---|---|---|---|
+| pp4096 | 0.4 s | 0.4 s | 1.9 s | 1.1 s | 0.3 s |
+| pp16384 | 3.0 s | 4.4 s | 27.1 s | **46.4 s** | 1.5 s |
+
+**Probe: NPU FP16 matmul time vs n_kv** (`attn-scale-probe.c`, M = 2048,
+one core):
+
+| n_kv | QK (N = n_kv) | PV (K = n_kv) | PV GFLOPS |
+|---|---|---|---|
+| 2048 | 4.9 ms | 7.5 ms | 574 |
+| 4096 | 9.5 ms | 49.7 ms | 173 |
+| 8192 | 18.7 ms | 232.6 ms | 74 |
+| 16384 | 36.9 ms | 462.3 ms | 74 |
+
+Q*K^T (n_kv as the output width) stays at ~900 GFLOPS to N = 32768, but
+P*V (n_kv as the reduction dimension K) falls to 74 GFLOPS past K ~4096:
+eight K = 2048 runs take 60 ms where one K = 16384 run takes 462 ms. The
+same probe showed an FP16-output Q*K^T ~5% faster, and the earlier
+librknnrt aborts (#1l) come from the large-K P*V shape only; Q*K^T runs to
+N = 32768.
+
+**Kept:**
+1. **P*V in K-chunks of 2048** (`RKNPU_FA_PV_CHUNK`): each chunk has its
+   own context and buffers (slot in the context key); V rows go straight
+   into the chunk layouts; chunk outputs are summed in FP32 into chunk 0's
+   C. Bit-identical at the guard (one chunk at 512 context); above 2048
+   the partial sums round differently. pp4096 238 -> 249, pp8192 166 ->
+   204, **pp16384 113 -> 160**.
+2. **Context eviction by age** (`RKNPU_FA_CTX_AGE`, 5): a count-based cache
+   leaked with the chunk slots (the §1l failure returned at 16k). Shapes
+   unused for 5 attention ops are freed on the next miss, before the new
+   shape allocates; two 32k shape sets do not fit the IOMMU domain
+   together.
+3. **NPU attention to 32k**: with P*V chunked no shape aborts, so
+   `RKNPU_FA_MAX_KV` can be 32768: **pp32768 28 -> 104.7 t/s**.
+4. **FP16 scores** (`RKNPU_FA_S16`) - NOT YET IN THE TREE: Q*K^T writes FP16; the
+   softmax stage is DRAM-traffic-bound (~600 MB per item at 16k) and the
+   score read halves. pp8192 204 -> **224**. Numerics change (scores
+   rounded to FP16): PPL32 26.5468 (was 27.2382), KLD 0.5999, same top
+   71.1%, inside the tolerant gate; FA test 12/12. But with it on, pp16384
+   and pp32768 fail at P*V chunk context creation (8k works); cause not
+   found when the session ended. The code is parked in
+   `autoresearch/loop-pp-long/pending-s16-vt.diff`.
+
+**Discarded:**
+- P*V chunks spread over the 3 NPU cores (`RKNPU_FA_PV_CORES=3`): pp8192
+  201.4 vs 203.9. After chunking the NPU runs are no longer the exposed
+  part at 8k. Code removed.
+
+- NEON 8x8 V transpose in the fill stage (`RKNPU_FA_VT`): pp8192 220.8 vs
+  221.8, no gain; in the same parked diff, to be dropped.
+
+**State at the end of the session:** the tree has keeps 1-3 (commit
+f20949be0): pp16384 160.3, pp32768 104.7 (with `RKNPU_FA_MAX_KV=32768`,
+not yet the default). Next: find why FP16 scores break context creation
+at 16k (suspect: the FP16 QK context's key or buffer sizes in the age
+eviction), then a 32k stage profile for the next lever (Q*K^T split over
+3 cores is the measured candidate: 36.9 -> 14.8 ms).
+
+**Tests still to run on the final build** (short experiments only during
+the loop): full guard with every keep on; the production suite's server
+stage (needle recall at 24.8k, MTP identity) and pp/tg tables for
+`RKNPU2-production.md`; memory headroom at 32k with 4 server slots.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
