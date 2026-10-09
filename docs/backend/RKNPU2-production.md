@@ -38,12 +38,13 @@ Server, with the MTP drafter (fastest exact setup):
 | Limit | Value | Notes |
 |---|---|---|
 | Context window (`-c`) | **32768 tested** | KV cache ~0.6 GiB at 32k (16 KiB per cell for the 4 full-attention layers + a fixed ~100 MiB sliding-window cache); 16 GB RAM is not the limit |
-| Prompt length | **up to 32k** | NPU attention up to 16384 KV cells; beyond that attention runs on the CPU (librknnrt aborts on some larger shapes), which makes prefill slow |
+| Prompt length | **up to 32k** | NPU attention for the whole window (P*V in 2048-position chunks; see decode research #1l/#1m) |
 | ubatch (`-ub`) | **512 (default)** | NPU attention is validated for this size only; larger ubatches fall back to CPU attention |
 | Parallel slots | 4 (server default), unified KV | all slots share the context window |
 
-Practical guidance: up to ~8k-token prompts prefill in under a minute;
-16k takes ~2.5 minutes; 32k takes ~19 minutes.
+Practical guidance (after the 2026-10-09 long-prompt work, decode
+research #1m): up to ~8k-token prompts prefill in under 40 s; 16k takes
+~1.5 minutes; 32k takes ~4 minutes.
 
 ## 3. Speed
 
@@ -51,8 +52,13 @@ Practical guidance: up to ~8k-token prompts prefill in under a minute;
 
 | Prompt tokens | 128 | 512 | 1k | 2k | 4k | 8k | 16k | 32k |
 |---|---|---|---|---|---|---|---|---|
-| t/s | 191.7 | 296.2 | 275.2 | 261.2 | 239.4 | 166.3 | 112.9 | 28.2 |
-| time | 0.7 s | 1.7 s | 3.7 s | 7.8 s | 17 s | 49 s | 2.4 min | 19.4 min |
+| t/s (2026-10-09 morning) | 191.7 | 296.2 | 275.2 | 261.2 | 239.4 | 166.3 | 112.9 | 28.2 |
+| t/s (after #1m, same evening) | - | 292 | - | - | 249 | **~220** | **~181** | **~134** |
+| time (after #1m) | 0.7 s | 1.8 s | 3.7 s | 7.8 s | 16 s | 37 s | 1.5 min | 4.1 min |
+
+(#1m: P*V chunking, FP16 scores, online softmax, early P*V. The 128-2k
+figures are unchanged within noise; re-measure all rows with the full
+suite before the next production tag.)
 
 ### Generation vs context already in the window (no drafter, llama-bench tg32)
 
@@ -67,8 +73,8 @@ Practical guidance: up to ~8k-token prompts prefill in under a minute;
 | 784 | 229 | 8.27 | 12.55 | 1.52x |
 | 3,428 | 192 | 7.70 | 10.50 | 1.36x |
 | 6,637 | 155 | 7.15 | 9.00 | 1.26x |
-| 12,796 | 115 | 6.27 | 7.43 | 1.19x |
-| 24,767 | 38 | 5.03 | 5.65 | 1.12x |
+| 12,796 | 115 (now 165-169) | 6.27 | 7.43 | 1.19x |
+| 24,767 | 38 (now 139) | 5.03 | 5.65 | 1.12x |
 
 Short prompts (the 4 bench prompts, 128-token answers): **18.37 t/s with MTP**
 vs 8.5 without (2.2x). MTP gains less on long contexts because every verify
@@ -123,6 +129,7 @@ did pp128 25.2 / tg 4.9.
 | MTP exactness | ggml-cpu flash attention split-KV off by default | MTP output identical to no-draft (#1j) |
 | Long context | GQA-grouped ggml-cpu attention for decode/verify | verify at 768 context -17% latency (#1k) |
 | Robustness | bounded NPU attention context cache, NPU attention limited to validated shapes, async-runner race fix | prompts >= 8k no longer crash; server no longer segfaults on prefill (#1l) |
+| Long prompts | P*V in 2048-position chunks (the NPU FP16 matmul collapses past K 4096), NPU attention to 32k, FP16 scores, online softmax per chunk, early P*V, chunk outputs combined in host memory | pp8k 166 -> ~220, pp16k 113 -> ~181, pp32k 28 -> ~134 (#1m) |
 
 Total for E4B against the original backend's default: **prefill 4.8x**
 at pp128 (39.8 -> 191.7; larger prompts gain more, pp512 is now 296), **decode 2.7x without a drafter**

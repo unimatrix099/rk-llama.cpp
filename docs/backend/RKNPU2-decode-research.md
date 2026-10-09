@@ -1226,6 +1226,23 @@ N = 32768.
    70.3%, FA 12/12. Clean build: pp8192 211.5 vs 209.2 (same binary),
    pp16384 169.7, pp32768 120.6.
 
+6. **Early P*V** (`RKNPU_FA_EARLY_PV`): the softmax runs chunk-major and
+   a per-item helper thread runs chunk c's P*V as soon as its P is written,
+   so the P*V runs overlap the softmax of the later chunks instead of
+   waiting for the whole item. Same numerics as 5 (gate: PPL32 27.2322,
+   KLD 0.610, same top 70.3%; FA 12/12 x4). pp8192 216.6 vs 211.3 (same
+   binary), **pp16384 179.4** (169.8), **pp32768 134.5** (120.6).
+
+Also discarded: Q*K^T computed per P*V chunk with Q shared between the
+chunk contexts (fd import), the runner interleaving QK(c+1) and PV(c) with
+the softmax of chunk c. Correct (12/12 x4) but no gain (pp8192 220.2 vs
+219.3, pp16384 181.2 vs 181.5, pp32768 133.9 vs 134.5): the Q*K^T wait is
+already hidden by the item pipeline. Code not kept.
+
+**Result of the loop** (12 iterations, 6 keeps): pp8192 166 -> **~220**,
+pp16384 113 -> **~181**, pp32768 28 -> **~134** t/s (the last with
+`RKNPU_FA_MAX_KV=32768`). Both targets (170 / 80) met.
+
 **A DMA hazard found on the way.** The first online version failed the
 flash-attention test intermittently (outputs near zero, same inputs,
 single-threaded and with the pipeline off). Cause: the chunk accumulation
@@ -1236,10 +1253,22 @@ for >1 chunk. Fix: chunk outputs are combined in a host buffer per
 in-flight slot (`fa_out`), and the DMA buffers are never written by the
 CPU. 7/7 test runs clean afterwards.
 
-**Tests still to run on the final build** (short experiments only during
-the loop): full guard with every keep on; the production suite's server
-stage (needle recall at 24.8k, MTP identity) and pp/tg tables for
-`RKNPU2-production.md`; memory headroom at 32k with 4 server slots.
+**Short ubatches.** The server's last ubatch of a prompt has fewer than
+512 tokens, so M is not a multiple of the 64-row block and the code fell
+back to the non-native path, which cannot read FP16 scores (assert).
+llama-bench never hits this. The block size is now the largest power of
+two dividing M.
+
+**End-of-loop checks on the final build** (`RKNPU_FA_MAX_KV` default
+32768): guard bit-for-bit as before (PPL32 27.2322, KLD 0.610, same top
+70.3%, FA 12/12, RoPE 5/5, server 3x 4/4); server with real prompts and
+NPU attention to 32k: 12.8k tokens 165-169 t/s prompt (was 115), 24.8k
+tokens 139 t/s (was 37-39), hidden code found in both, summaries coherent.
+
+**Still to run before the next production tag:** the full production
+suite (`rknpu2-production-tests/prodtest.sh`: pp/tg tables, MTP identity
+on long prompts, NPU-vs-CPU perplexity at 2k/8k) and the memory headroom
+at 32k with 4 server slots, then update `RKNPU2-production.md`'s tables.
 
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
@@ -2340,6 +2369,9 @@ becomes a server.
 | `RKNPU_FA_MAX_KV` | 16384 | largest KV length that NPU attention takes; longer contexts use ggml-cpu attention (librknnrt aborts on some larger shapes; #1l) |
 | `RKNPU_FA_CTX_AGE` | 5 | attention shapes unused for this many attention ops have their NPU contexts freed (#1l, #1m) |
 | `RKNPU_FA_PV_CHUNK` | 2048 | P*V on the NPU in chunks of this many KV positions, partial outputs summed; 0 = one run (#1m) |
+| `RKNPU_FA_S16` | 1 | 0 = Q*K^T scores in FP32 instead of FP16 (#1m) |
+| `RKNPU_FA_ONLINE` | 1 | 0 = one-pass softmax over the whole row instead of the per-chunk online softmax (#1m) |
+| `RKNPU_FA_EARLY_PV` | 1 | 0 = P*V chunks run after the whole item's softmax instead of as each chunk's P is ready (#1m) |
 | `GGML_CPU_FA_GROUPED` | 1 | 0 = ggml-cpu flash attention handles each (query row, head) separately for small batches instead of per KV-head group (#1k) |
 | `GGML_CPU_FA_SPLIT_KV` | 0 | 1 = ggml-cpu flash attention splits the KV range for single-row decode at >= 512 cells (upstream default; faster only with few heads, breaks speculative-decoding identity; #1j) |
 | `RKNPU_W8A8_NATIVE` | 1 | 0 = W8A8 nodes keep NORM A/C at 1 < M <= 32 (the runtime then converts C on one thread per run; #1i) |
