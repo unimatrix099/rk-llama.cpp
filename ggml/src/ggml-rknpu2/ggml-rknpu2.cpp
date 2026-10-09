@@ -645,6 +645,11 @@ struct ggml_backend_rknpu_context {
     rknpu_fn_pool fa_pool;
     std::vector<float> fa_stats[3];   // online softmax: per in-flight item (core slot), [row][chunk][m, l]
     std::vector<float> fa_out[3];     // host-side P*V output per slot: the chunk outputs are combined here, never in the DMA buffers
+    // early P*V (online path): per slot, a thread runs chunk c's P*V as soon as its softmax is done
+    std::thread fa_pv_thread[3];
+    std::mutex fa_pv_mu[3];
+    std::condition_variable fa_pv_cv[3];
+    int fa_pv_ready[3] = {0, 0, 0};
     // whole-FFN schedule (rknpu_ffn_block): gate, up and down jobs, and
     // gate's and up's chunk contexts as one runner batch
     rknpu_w4a4_job ffn_gate, ffn_up, ffn_down;
@@ -1923,6 +1928,13 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         const char* env = std::getenv("RKNPU_FA_ONLINE");
         return env == nullptr || std::atoi(env) != 0;
     }();
+    // Early P*V (RKNPU_FA_EARLY_PV, default on with the online softmax): the softmax runs
+    // chunk-major and each chunk's P*V starts on a helper thread as soon as its P is written,
+    // overlapping the NPU runs with the softmax of the later chunks
+    static const bool early_pv = []() {
+        const char* env = std::getenv("RKNPU_FA_EARLY_PV");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
     static const bool s16 = []() {
         const char* env = std::getenv("RKNPU_FA_S16");
         return env == nullptr || std::atoi(env) != 0;
@@ -2078,7 +2090,78 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
             auto m_row = [&](int64_t r) {
                 return mask ? (const ggml_fp16_t*)(m_seq + (r % n_q) * mask->nb[1]) : nullptr;
             };
-            if (native) {
+            if (native && online && early_pv) {
+                // chunk-major: softmax of chunk c for every row block, then chunk c's P*V starts
+                bctx->fa_pv_ready[core] = 0;
+                const int ncp = n_pvc;
+                rknpu_attn_context* pvl[128];
+                for (int c = 0; c < ncp; ++c) pvl[c] = pvs[c];
+                bctx->fa_pv_thread[core] = std::thread([bctx, core, ncp, pvl] {
+                    for (int c = 0; c < ncp; ++c) {
+                        {
+                            std::unique_lock<std::mutex> lk(bctx->fa_pv_mu[core]);
+                            bctx->fa_pv_cv[core].wait(lk, [&] { return bctx->fa_pv_ready[core] > c; });
+                        }
+                        rknn_mem_sync(pvl[c]->ctx, pvl[c]->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+                        rknn_matmul_run(pvl[c]->ctx);
+                        rknn_mem_sync(pvl[c]->ctx, pvl[c]->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+                    }
+                });
+                for (int c = 0; c < n_pvc; ++c) {
+                    const int64_t c0 = c * KC, c1 = std::min(n_kv, c0 + KC);
+                    #pragma omp parallel for num_threads(n_omp)
+                    for (int64_t r0 = 0; r0 < M; r0 += FR) {
+                        static thread_local std::vector<float> row;
+                        static thread_local std::vector<uint16_t> p_buf, h_buf;
+                        if ((int64_t)row.size() < n_kv) row.resize(n_kv);
+                        if ((int64_t)p_buf.size() < FR * n_kv) p_buf.resize(FR * n_kv);
+                        if ((int64_t)h_buf.size() < FR * n_kv) h_buf.resize(FR * n_kv);
+                        int64_t lo[512], hi[512];
+                        int64_t blo = n_kv, bhi = 0;
+                        for (int k = 0; k < FR; ++k) {
+                            if (!m_lo.empty()) {
+                                const int64_t x = (i3 % mask->ne[3]) * n_q + (r0 + k) % n_q;
+                                lo[k] = m_lo[x]; hi[k] = m_hi[x];
+                            } else {
+                                rknpu_softmax_range(m_row(r0 + k), n_kv, &lo[k], &hi[k]);
+                            }
+                            if (hi[k] > lo[k]) { blo = std::min(blo, lo[k]); bhi = std::max(bhi, hi[k]); }
+                        }
+                        const int sub = qk->c_geom.sub;
+                        if (!range_enabled) { blo = 0; bhi = n_kv; }
+                        const int64_t ga = std::max(blo, c0), gb = std::min(bhi, c1);
+                        if (gb > ga) {
+                            uint8_t* hrows[512];
+                            for (int k = 0; k < FR; ++k) hrows[k] = (uint8_t*)(h_buf.data() + k * n_kv);
+                            rknpu_native_gather_rows(hrows, FR, (const uint8_t*)S, (int)r0, qk->c_geom, sub * 2, (int)(ga / sub), (int)((gb + sub - 1) / sub));
+                        }
+                        float* st = bctx->fa_stats[core].data();
+                        uint8_t* pr[512];
+                        for (int k = 0; k < FR; ++k) {
+                            const uint16_t* h = h_buf.data() + k * n_kv;
+                            uint16_t* pk = p_buf.data() + k * n_kv;
+                            const ggml_fp16_t* mr = m_row(r0 + k);
+                            const int64_t a = std::max(lo[k], c0), b = std::min(hi[k], c1);
+                            float* mlc = st + ((r0 + k) * n_pvc + c) * 2;
+                            if (b <= a) {
+                                memset(pk + c0, 0, (c1 - c0) * sizeof(uint16_t));
+                                mlc[0] = -INFINITY; mlc[1] = 0.0f;
+                            } else {
+                                memset(pk + c0, 0, (a - c0) * sizeof(uint16_t));
+                                memset(pk + b, 0, (c1 - b) * sizeof(uint16_t));
+                                rknpu_softmax_chunk16(h + a, mr ? mr + a : nullptr, b - a, scale, softcap, row.data(), pk + a, mlc, mlc + 1);
+                            }
+                            pr[k] = (uint8_t*)(pk + c0);
+                        }
+                        rknpu_native_scatter_rows((uint8_t*)pvs[c]->A->virt_addr, pr, FR, (int)r0, pvs[c]->a_geom, pvs[c]->a_geom.sub * 2);
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(bctx->fa_pv_mu[core]);
+                        bctx->fa_pv_ready[core] = c + 1;
+                    }
+                    bctx->fa_pv_cv[core].notify_all();
+                }
+            } else if (native) {
                 #pragma omp parallel for num_threads(n_omp)
                 for (int64_t r0 = 0; r0 < M; r0 += FR) {
                     static thread_local std::vector<float> row, s_buf;
@@ -2193,10 +2276,14 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                     for (int c = 0; c < n_pvc; ++c) alpha[r * n_pvc + c] *= inv;
                 }
             }
+            const bool ran_early = native && online && early_pv;
+            if (ran_early) bctx->fa_pv_thread[core].join();
             for (int c = 0; c < n_pvc; ++c) {
-                rknn_mem_sync(pvs[c]->ctx, pvs[c]->A, RKNN_MEMORY_SYNC_TO_DEVICE);
-                rknn_matmul_run(pvs[c]->ctx);
-                rknn_mem_sync(pvs[c]->ctx, pvs[c]->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+                if (!ran_early) {
+                    rknn_mem_sync(pvs[c]->ctx, pvs[c]->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+                    rknn_matmul_run(pvs[c]->ctx);
+                    rknn_mem_sync(pvs[c]->ctx, pvs[c]->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+                }
                 if (online) {   // acc = a_r0 * C_0, then acc += a_rc * C_c: cell (t, r) holds sub floats of row r
                     float* acc = bctx->fa_out[core].data();
                     const float* part = (const float*)pvs[c]->C->virt_addr;
