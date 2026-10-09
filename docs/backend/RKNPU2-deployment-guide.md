@@ -6,6 +6,10 @@ an Orange Pi 5 Ultra; the numbers in "Verify" are what that board
 produces and are what a correct build should reproduce within a few
 percent.
 
+> For the Gemma-4 E4B production setup (server command, MTP drafter, tested
+> context and prompt limits, speeds and accuracy), see
+> `RKNPU2-production.md`.
+
 Research background lives in `RKNPU2-decode-research.md` (what was tried
 and why) and `RKNPU2-optimization-notes.md` (what shipped). This document
 assumes you just want it running.

@@ -60,6 +60,15 @@ supersedes the older "Handover notes" section at the end of that file.
 - **Open issue:** NPU attention output depends slightly on which NPU core
   serves a KV group (±0.02% PPL, first batch always identical); see §1g.
 
+## Production (2026-10-09)
+
+The production setup, limits and measured speeds are in
+`docs/backend/RKNPU2-production.md`. Branch `main` is the clean topic stack
+for production and for cutting upstream PRs; this branch keeps the full
+history. The 2026-10-09 limit tests found and fixed three crashes (#1l):
+prompts of 8k+ tokens, librknnrt aborting on some attention shapes past
+16k, and a race in the async NPU runner.
+
 ## Setting up the new machine
 
 1. **Clone and check out the branch:**
