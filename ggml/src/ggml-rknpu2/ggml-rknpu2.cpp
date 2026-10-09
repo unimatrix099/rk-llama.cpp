@@ -488,7 +488,11 @@ struct rknpu_async_runner {
             const uint64_t seed = generation;
             threads.emplace_back([this, idx, seed] { worker(idx, seed); });
         }
-        job = &ctxs;
+        // the workers read this copy, never the caller's vector: a worker that
+        // is not part of the job can wake after wait() returned, while the
+        // caller already rebuilds its vector (crashed the server on prefill)
+        job.clear();
+        for (const auto& c : ctxs) job.push_back(c.get());
         pending = (int)ctxs.size();
         ++generation;
         cv_start.notify_all();
@@ -497,7 +501,6 @@ struct rknpu_async_runner {
         const auto t0 = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lock(mutex);
         cv_done.wait(lock, [this] { return pending == 0; });
-        job = nullptr;
         g_rknpu_wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
     }
     ~rknpu_async_runner() {
@@ -511,16 +514,16 @@ struct rknpu_async_runner {
   private:
     void worker(int idx, uint64_t seen) {
         for (;;) {
-            const std::vector<std::shared_ptr<rknpu_matmul_context>>* j;
+            rknpu_matmul_context* ctx = nullptr;
             {
                 std::unique_lock<std::mutex> lock(mutex);
                 cv_start.wait(lock, [&] { return quit || generation != seen; });
                 if (quit) return;
                 seen = generation;
-                j = job;
+                if (idx < (int)job.size()) ctx = job[idx];
             }
-            if (j && idx < (int)j->size()) {
-                (*j)[idx]->run();
+            if (ctx) {
+                ctx->run();
                 std::lock_guard<std::mutex> lock(mutex);
                 if (--pending == 0) cv_done.notify_all();
             }
@@ -529,7 +532,7 @@ struct rknpu_async_runner {
     std::vector<std::thread> threads;
     std::mutex mutex;
     std::condition_variable cv_start, cv_done;
-    const std::vector<std::shared_ptr<rknpu_matmul_context>>* job = nullptr;
+    std::vector<rknpu_matmul_context*> job;   // the current job's contexts (cached for the backend's life)
     uint64_t generation = 0;
     int pending = 0;
     bool quit = false;
