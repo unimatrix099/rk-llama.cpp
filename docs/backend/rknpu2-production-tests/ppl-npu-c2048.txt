@@ -1,0 +1,13 @@
+0.02.491.983 W load: control-looking token:    212 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.02.492.997 W load: control-looking token:     50 '<|tool_response>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.02.557.696 W load: '</s>' is a normal token here, removing it from EOG list
+0.11.625.769 I cmn          init: llama threadpool init, n_threads = 4
+0.12.331.399 I 
+0.12.331.523 I system_info: n_threads = 4 (n_threads_batch = 4) / 8 | CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | DOTPROD = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.12.331.545 I perplexity: tokenizing the input ..
+0.13.953.442 I perplexity: tokenization took 1621.89 ms
+0.13.953.559 I perplexity: calculating perplexity over 8 chunks, n_ctx=2048, batch_size=2048, n_seq=1
+0.49.956.104 I perplexity: 36.00 seconds per pass - ETA 4.80 minutes
+[1]22.2384,[2]32.5916,[3]34.2856,[4]32.7996,[5]31.7752,[6]26.4041,[7]23.0369,[8]22.7849,
+4.40.050.141 I Final estimate: PPL = 22.7849 +/- 0.86681
+

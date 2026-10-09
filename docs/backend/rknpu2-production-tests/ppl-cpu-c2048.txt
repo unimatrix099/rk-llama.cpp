@@ -1,0 +1,14 @@
+0.02.449.476 W load: control-looking token:    212 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.02.450.480 W load: control-looking token:     50 '<|tool_response>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.02.514.117 W load: '</s>' is a normal token here, removing it from EOG list
+0.05.448.491 I cmn          init: llama threadpool init, n_threads = 4
+0.05.662.932 I 
+0.05.663.074 I system_info: n_threads = 4 (n_threads_batch = 4) / 8 | CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | DOTPROD = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.05.663.168 I perplexity: saving all logits to /home/pi/bench-logs/2026-10-09-prod/kld-cpu-c2048.bin
+0.05.663.176 I perplexity: tokenizing the input ..
+0.07.212.721 I perplexity: tokenization took 1549.54 ms
+0.07.212.843 I perplexity: calculating perplexity over 8 chunks, n_ctx=2048, batch_size=2048, n_seq=1
+1.20.101.183 I perplexity: 72.46 seconds per pass - ETA 9.65 minutes
+[1]23.8463,[2]36.3797,[3]38.7231,[4]36.7401,[5]34.5684,[6]28.6528,[7]25.3992,[8]25.1064,
+10.35.895.971 I Final estimate: PPL = 25.1064 +/- 1.05780
+

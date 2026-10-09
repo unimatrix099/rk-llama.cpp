@@ -1,0 +1,21 @@
+{
+  "version": "2.1.0",
+  "source": "loop",
+  "timestamp": "2026-10-05T23:00:00+00:00",
+  "status": "BOUNDED",
+  "results_tsv": "autoresearch/loop-261005-1946/results.tsv",
+  "findings": [
+    "pp512 161.6 -> 207.3 t/s in loop (final validation 203.4, pp128 169.7, tg64 8.65); 6 keeps of 25, all bit-identical (PPL32 27.2432, KLD 0.587297)",
+    "Biggest wins: GEGLU in backend (+7.3%), FFN gate dequant deferred into up's fused GEGLU (+3.5%), RKNPU buffers is_host (+3.3%)",
+    "Dequant of native INT16 C at N=10240 is ~3.5x slower per element than at N<=2560 (mixed page-hopping reads + strided writes); avoiding writes beats re-blocking",
+    "Code alignment sensitivity: pin -falign-functions=64 -falign-loops=64; use same-binary env A/B for small effects",
+    "MTP n=1 on pure NPU: 8.65 t/s, output identical 4/4 with host-flagged buffers"
+  ],
+  "config": {
+    "goal": "reduce CPU processing time in the NPU prefill pipeline / move work into the NPU backend",
+    "scope": "ggml/src/ggml-rknpu2, ggml-cpu, src/models (llama graph)",
+    "metric": "E4B pure-NPU W4A4 pp512 t/s",
+    "direction": "higher_is_better",
+    "verify": "autoresearch/loop-261005-1946/verify.sh"
+  }
+}

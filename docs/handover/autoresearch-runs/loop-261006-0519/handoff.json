@@ -1,0 +1,23 @@
+{
+  "version": "2.1.0",
+  "source": "loop",
+  "timestamp": "2026-10-06T12:00:00+00:00",
+  "status": "BOUNDED",
+  "note": "stopped at iteration 30 of 40 on a plateau (last ten: 3 small keeps); remaining ideas need structural work",
+  "results_tsv": "autoresearch/loop-261006-0519/results.tsv",
+  "findings": [
+    "pp512 208.3 -> 275.1 t/s (+32%); final validation pp128 188.7, pp512 273.7-276.1, tg64 8.78, MTP n=1 9.29 identical 4/4; 15 keeps",
+    "Biggest wins: NPU attention pipelined over KV groups (+5.2%), FA output as whole rows (+2.8%), FA native A/C (+3.1%), whole-FFN block scheduling (three steps, ~+7%), ggml-cpu norm+add(+scale)(+next norm) fusion (+6.6%)",
+    "FFN now near NPU/CPU balance (~850 ms NPU vs ~750 ms CPU per pp512); attention and single matmul nodes are CPU-bound with idle NPU",
+    "GCC contracts vmulq+vaddq intrinsics into FMA: fused ops need an asm register barrier to stay bit-identical",
+    "Open: NPU attention output depends on which core serves a KV group (pre-existing, +-0.02% PPL, first batch always identical)",
+    "Q/K/V sharing one Hadamard sign vector per layer costs +9.7% PPL on E4B"
+  ],
+  "config": {
+    "goal": "reduce CPU work / move processing to the NPU in E4B prefill",
+    "scope": "ggml/src/ggml-rknpu2, ggml-cpu, src/models (llama graph)",
+    "metric": "E4B pure-NPU W4A4 pp512 t/s",
+    "direction": "higher_is_better",
+    "verify": "autoresearch/loop-261006-0519/verify.sh"
+  }
+}

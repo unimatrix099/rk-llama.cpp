@@ -1,0 +1,52 @@
+[11:49:48] pp128
+[11:50:08] pp512
+[11:50:32] pp1024
+[11:51:02] pp2048
+[11:51:45] pp4096
+[11:52:56] pp8192
+[11:53:59] pp16384
+[12:48:30] restart after long-context fixes (pp stage done separately: 8192 166.3, 16384 112.9, 32768 28.2)
+[12:48:31] tg32 @ depth 0
+[12:48:52] tg32 @ depth 1024
+[12:49:18] tg32 @ depth 2048
+[12:49:49] tg32 @ depth 4096
+[12:50:31] tg32 @ depth 8192
+[12:51:44] tg32 @ depth 16384
+[12:54:34] tg32 @ depth 32000
+[13:13:26] server base
+[13:13:52] server mtp
+[13:14:23] ppl c=2048 chunks=8 NPU
+[14:06:53] resume after async-runner race fix (fedbcd615)
+[14:06:53] server base
+base 1000 needle 792 137.0 8.3 True
+base 1000 summary 784 225.4 8.27 None
+base 4000 needle 3436 192.9 7.7 True
+base 4000 summary 3428 191.9 7.7 None
+base 8000 needle 6645 153.7 7.16 True
+base 8000 summary 6637 154.7 7.15 None
+base 16000 needle 12804 115.3 6.29 True
+base 16000 summary 12796 115.3 6.27 None
+base 30000 needle 24775 37.4 5.07 True
+base 30000 summary 24767 37.4 5.03 None
+[14:38:29] server mtp
+mtp 1000 needle 792 134.7 7.56 True
+mtp 1000 summary 784 229.2 12.55 None
+mtp 4000 needle 3436 192.5 14.18 True
+mtp 4000 summary 3428 191.1 10.5 None
+mtp 8000 needle 6645 153.8 11.97 True
+mtp 8000 summary 6637 154.3 9.0 None
+mtp 16000 needle 12804 115.2 12.47 True
+mtp 16000 summary 12796 114.5 7.43 None
+mtp 30000 needle 24775 38.7 7.53 True
+mtp 30000 summary 24767 38.7 5.65 None
+[15:08:47] ppl c=2048 chunks=8 NPU
+[15:09:46] paused ppl stage for MTP long-context diagnosis
+[15:21:49] resume ppl stage
+[15:21:49] ppl c=2048 chunks=8 NPU
+[15:26:31] ppl c=2048 chunks=8 CPU
+[15:37:08] ppl c=8192 chunks=2 NPU
+[15:43:26] ppl c=8192 chunks=2 CPU
+[15:55:09] ppl c=32768 chunks=1 NPU
+[15:55:47] ppl c=32768 chunks=1 CPU
+[15:55:55] kld NPU vs CPU c=2048
+[16:01:52] done

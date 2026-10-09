@@ -1,0 +1,28 @@
+# metric_direction: higher_is_better
+iteration	timestamp	commit	metric	delta	guard	guard-metric	status	description
+0	2026-10-05T13:20:04+00:00	f9bf58201	68.428	0.0	pass	35.0480	baseline	initial state (post decode loop + server fix)
+1	2026-10-05T13:24:17+00:00	b001a9cfe	97.421	+28.993	FAIL	ppl 35.1168 (+0.196%)	discard	BF16 weights on NPU as W8A8: +42% but PPL outside 0.1%
+2	2026-10-05T13:27:59+00:00	516f64b64	97.424	+28.996	FAIL	ppl 34.2145 (-2.38%)	discard	BF16 weights on NPU as W16A16: same speed, PPL shift too large (suspect fp16 range/subnormals; W16A16 path unvalidated)
+3	2026-10-05T13:41:03+00:00	7c55f0903	90.603	+22.175	FAIL	ppl8 35.9984 (+2.7%); ppl32 26.8168 (-0.22%); op exact to 5e-8	discard	4x4 NEON bf16 GEMM: correct op, but 8-chunk PPL under W4A4 scatters +-3% for any perturbation -> guard cannot pass non-identical changes
+4	2026-10-05T15:06:20+00:00	a2b64bcb9	97.776	+29.348	pass	ppl32 26.7924 kld 0.5795 top 70.98 server 3/3	keep	BF16 weights on NPU as W8A8 (re-gated under KLD/32-chunk guard)
+5	2026-10-05T15:20:23+00:00	e074373d0	108.016	+10.240	pass	ppl32 26.7924 kld 0.5795 top 70.98 server 3/3 (identical to #4)	keep	native INT16 dequant four rows per tile (element-exact)
+6	2026-10-05T15:24:10+00:00	88030eb4b	101.042	-6.974	-	-	discard	store on first K-seg + skip M x N memset: slower (memset's streaming warm-up beats strided cold stores)
+7	2026-10-05T15:27:07+00:00	77f49941e	106.325	-1.691	-	-	discard	FA Q tile 64->128: slower (128x256 f32 Q tile = 128 KB > 64 KB L1)
+8	2026-10-05T15:28:26+00:00	ecd7dd89b	106.541	-1.475	-	-	discard	FA Q tile 64->32: slower; 64 is the optimum
+9	2026-10-05T15:42:35+00:00	2d5cb7221	109.635	+1.619	pass	ppl32 26.7924 kld 0.5795 top 70.98 server 3/3 (identical)	keep	per-thread scratch for A-prep rows, transformed row read in place
+10	2026-10-05T16:01:42+00:00	9f7c4cc68	120.342	+10.707	pass	ppl32 26.7924 kld 0.5795 top 70.98 server 3/3 (identical)	keep	pipelined W4A4 prefill: 256-row chunks, CPU prep/dequant overlap NPU runs (async runner)
+11	2026-10-05T16:45:09+00:00	e4dabf070	139.098	+18.756	pass	ppl32 26.6502 kld 0.5974 top 71.47 server 3/3; FA test 5/5	keep	prefill flash attention on NPU (FP16 QK^T TP_NORM + PV NORM per KV head, softmax on CPU). First guard run invalid (n_seq>1 rejected -> CPU path); first version wrong (NORM B converted at bind: re-bind fixed)
+12	2026-10-05T16:49:06+00:00	f3de5ab7e	124.724	-14.374	-	-	discard	tile-major dequant over all chunk rows: slower (strided dst rows thrash instead of C)
+13	2026-10-05T16:50:53+00:00	4e2eec1c4	132.011	-7.087	-	FA test 5/5	discard	NPU attention phase-by-phase, heads concurrent on 2 cores: correct but slower
+14	2026-10-05T17:04:57+00:00	a7ab88dda	143.729	+4.631	pass	ppl32 27.3165 (+1.6% of 2% budget) kld 0.6008 top 69.90 FA 5/5 server 3/3	keep	NEON tanh-GELU for geglu (was scalar fp16 table gather). Uses most of the PPL budget; KLD barely moved
+15	2026-10-05T17:17:58+00:00	df1b6842a	146.827	+3.098	pass	ppl32 27.3165 kld 0.6008 (identical to #14) FA 5/5 server 3/3	keep	radix-4 FWHT, two stages per pass (bit-identical)
+16	2026-10-05T17:30:51+00:00	64ec00f2b	154.519	+7.692	pass	ppl32 27.2432 kld 0.5873 top 72.06 FA 5/5 server 3/3	keep	NEON softmax for NPU attention rows (vector exp/tanh)
+17	2026-10-05T17:45:58+00:00	816c6812f	158.175	+3.656	pass	ppl32 27.2432 kld 0.5873 (identical to #16) FA 5/5 server 3/3	keep	pipelined prefill stores on first K-seg, skips serial M x N memset (retry of #6 inside the pipeline)
+18	2026-10-05T17:58:50+00:00	cd268d815	159.438	+1.263	pass	ppl32 27.2432 (identical) FA 5/5 server 3/3	keep	fused sign multiply + Hadamard transform in A-prep (bit-identical)
+19	2026-10-05T17:59:55+00:00	51fb2449d	158.906	-0.532	-	-	discard	pipeline chunk 128 rows: no gain (256 stays)
+20	2026-10-05T18:01:50+00:00	e49909e88	145.586	-13.852	-	FA test 5/5	discard	NPU attention: next head QK^T on helper thread overlapping softmax: correct but slower (thread oversubscription vs spinning OMP team)
+21	2026-10-05T18:15:27+00:00	f57387985	160.224	+0.786	pass	ppl32 27.2432 (identical) FA 5/5 server 3/3	keep	NEON rms_norm sum of squares (4 double accumulators) + fused mul
+22	2026-10-05T18:16:39+00:00	2d476111e	159.270	-0.954	-	-	discard	GELU reciprocal-estimate instead of vdivq: no gain, and NaN on exp overflow (recpe(inf)=0 -> inf*0)
+23	2026-10-05T18:29:53+00:00	cd20b6c2b	161.478	+1.254	pass	ppl32 27.2432 (identical) FA 5/5 server 3/3	keep	radix-8 FWHT, three stages per pass (bit-identical)
+24	2026-10-05T18:32:10+00:00	aa79aa0fc	156.505	-4.973	-	-	discard	dequant 8 rows/block + hoisted chan scales: slower
+25	2026-10-05T18:33:20+00:00	214bd0f89	161.859	+0.381	-	-	discard	dequant chan scales hoisted per tile (4-row blocks): below noise threshold

@@ -1,0 +1,22 @@
+{
+  "version": "2.1.0",
+  "source": "loop",
+  "timestamp": "2026-10-05T20:30:00Z",
+  "status": "BOUNDED",
+  "results_tsv": "autoresearch/loop-261005-1311/results.tsv",
+  "findings": [
+    "E4B pp512 68.4 -> 161.5 t/s (2.36x), pp128 85.4 -> 150.4, decode tg64 8.24 -> 8.63; quality PPL32 +1.4%, KLD vs CPU 0.587 (baseline 0.591)",
+    "Largest wins: BF16 per_layer_model_proj on NPU (+43%), NPU flash attention (+16%), pipelined prefill chunks (+10%), row-block dequant (+10%)",
+    "8-chunk PPL cannot gate W4A4 changes (chaotic: 1e-7 perturbation moves it +-3%); replaced with 32-chunk PPL + KLD vs CPU",
+    "RKNN driver converts non-native B at set_io_mem: data written to a bound B buffer is ignored (P*V zeros until re-bound)",
+    "Guard must exercise the changed path: first NPU-attention guard pass was invalid (perplexity batched 4 sequences, op rejected)",
+    "Remaining prefill limit: CPU dequant of NPU INT16 output (~31% of samples)"
+  ],
+  "config": {
+    "goal": "improve E4B prefill speed using the NPU, including rewriting code for NPU",
+    "scope": "ggml/src/ggml-rknpu2/**, ggml/src/ggml-cpu/**, src/**, docs/backend/**",
+    "metric": "llama-bench -p 512 -n 0 -r 3 -t 4 (taskset 4-7) t/s, E4B Q4_0 default W4A4",
+    "direction": "higher_is_better",
+    "verify": "autoresearch/loop-261005-1311/verify.sh"
+  }
+}

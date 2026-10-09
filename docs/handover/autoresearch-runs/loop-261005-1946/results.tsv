@@ -1,0 +1,29 @@
+# metric_direction: higher_is_better
+iteration	timestamp	commit	metric	delta	guard	guard-metric	status	description
+0	2026-10-05T19:51:48+00:00	e8b229c4a	161.592	0.0	pass	ppl32 27.2432 kld 0.5873 top 72.06 (prefill loop #23 code)	baseline	post prefill loop part 2
+1	2026-10-05T20:03:09+00:00	67a5563c9	173.415	+11.823	pass	ppl32 27.2432 (identical) FA 5/5 server 3/3	keep	GEGLU on the NPU backend: FFN [up,gate,glu,down] in one split
+2	2026-10-05T20:04:42+00:00	185fbe649	156.084	-17.331	-	-	discard	GEGLU fused per 8-element tile cell into gate dequant: slower (per-cell call overhead, short vectors)
+3	2026-10-05T20:15:15+00:00	5f3b62051	156.186	-17.229	-	-	discard	GEGLU fusion on gate via row buffer: never triggered (llama order is gate, up, GLU); build ~10% slower even with fusion off (codegen)
+4	2026-10-05T20:15:15+00:00	ebf4abc30	158.571	-14.844	-	-	discard	GEGLU fusion on up (triggers: +1.6% vs fusion off), still below #1 because of the inlined-code slowdown
+5	2026-10-05T20:24:16+00:00	cd92e5ccc	158.834	-14.581	-	-	discard	fused GEGLU out of line (noinline): no change - slowdown was not inlining
+5b	2026-10-05T20:24:16+00:00	0acc90dd9	158.401	-15.014	-	-	discard	fused collect as separate lambda: still slow with fusion off -> code layout (with -falign-*=64: #1 172.2, this 179.9)
+6	2026-10-05T20:41:14+00:00	ad13c7371	179.933	+6.518	pass	ppl32 27.2432 (identical) FA 5/5 server 3/3	keep	GEGLU fused into up dequant (separate lambda) + pinned 64B function/loop alignment
+7	2026-10-05T20:43:05+00:00	f62c1891d	167.067	-12.866	-	-	discard	RMS_NORM/ADD/MUL on NPU: slower - MUL by norm weight stays on CPU (weight buffer), so RMS_NORM on NPU adds a split boundary
+8	2026-10-05T20:56:08+00:00	bc58ab75c	184.672	+4.739	pass	ppl32 27.2432 (identical) FA 5/5 server 3/3	keep	supports_buft accepts host buffers: no scheduler copies of CPU-resident inputs (matmul guards weight buffer)
+9	2026-10-05T20:57:19+00:00	7f7494884	176.007	-8.665	-	-	discard	RMS_NORM/ADD/MUL on NPU with host buffers: still slower (sched keeps weight-owning MUL on CPU)
+10	2026-10-05T21:12:09+00:00	98193f38d	189.158	+4.486	pass	ppl32 27.2432 (identical) FA 5/5 server 3/3	keep	DC ZVA destination lines in dequant store path (no read-for-ownership)
+11	2026-10-05T21:13:14+00:00	181dfac3a	185.329	-3.829	-	-	discard	DC ZVA on GEGLU output lines: slower (compute-bound loop)
+12	2026-10-05T21:14:46+00:00	83d0c6b11	185.748	-3.410	-	-	discard	NEON f32 binary ops in ggml-cpu: slower (already vectorized and/or layout shift in ggml-cpu)
+13	2026-10-05T21:16:21+00:00	50b788a72	186.825	-2.333	-	-	discard	pin 64B alignment in ggml-cpu: no gain
+14	2026-10-05T21:18:16+00:00	2205be1b0	189.192	+0.034	-	-	discard	sign multiply + FWHT h=1,2 in one pass: no change - A-prep overlaps NPU runs, off the critical path
+15	2026-10-05T21:20:47+00:00	526616fce	188.439	-0.719	-	-	discard	defer last dequant into next same-input matmul (gate->up): no gain - CPU dequant and NPU contend for DRAM bandwidth
+16	2026-10-05T21:33:50+00:00	91b29b2c1	195.376	+6.218	pass	ppl32 27.2432 (identical) FA 5/5 server 3/3	keep	RKNPU buffers advertised as host: CPU reads NPU outputs in place (no copy-back at splits)
+17	2026-10-05T21:37:31+00:00	7b4e5e66f	192.912	-2.464	-	-	discard	Gemma-4 Q/K/V projections emitted back to back (one split): no gain
+18	2026-10-05T21:50:37+00:00	04e915350	200.349	+4.973	pass	ppl32 27.2432 (identical) FA 5/5 server 3/3	keep	K-segmented weights (ffn_down) transform only their own Hadamard blocks
+19	2026-10-05T21:51:50+00:00	8bbb02dd5	188.805	-11.544	-	-	discard	RMS_NORM/ADD/MUL on NPU re-tested without copies: still slower (separate passes vs ggml-cpu fused rms_norm_mul)
+20	2026-10-05T21:53:17+00:00	f89dfff07	197.439	-2.910	-	-	discard	pipeline chunk 128 re-tested: slower (B re-reads compete for DRAM)
+21	2026-10-05T22:02:37+00:00	135607ac0	200.603	+0.254	-	-	discard	ffn_down K-segments merged into one pipelined pass (dequant2): fires (verified) but A/B 200.7/201.3 off vs 200.7/201.8 on — noise; the saved output RMW is small
+22	2026-10-05T22:07:50+00:00	b15a9d033	187.829	-12.520	-	-	discard	dequant row blocks of 16 (sweep 4/8/16/32/64 = 200.8/190.9/187.8/191.5/187.9): 4 rows stays best, page-stride hypothesis wrong
+23	2026-10-05T22:24:23+00:00	e421f1070	207.262	+6.913	pass	ppl32 27.2432 (identical) FA 5/5 server 3/3	keep	FFN gate dequant deferred into up's fused GEGLU: gate FP32 never written/read back (microbench: N=10240 dequant ~3.5x slower/elem than N<=2560)
+24	2026-10-05T22:28:52+00:00	8ab7d0cab	207.254	-0.008	-	-	discard	gate+up+GEGLU single tile pass (no row buffers): same-binary A/B +0.8% (205.5/205.7 off vs 207.3/206.7 on) but below keep threshold vs best
+25	2026-10-05T22:30:27+00:00	f63fa95f0	197.499	-9.763	-	-	discard	GEGLU divide -> recpe+2 Newton: slower (layout effect or FRECPS chain latency); not guarded
