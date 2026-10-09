@@ -9201,6 +9201,133 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     }
 }
 
+// Rows [ir0, ir1) that share one K/V head (same ik2, ik3): each K/V row is loaded once
+// and applied to every row of the group. Per row, the operations and their order are
+// exactly those of ggml_compute_forward_flash_attn_ext_f16_one_chunk, so results match it bit for bit.
+#define GGML_FA_GROUP_MAX 12
+static void ggml_compute_forward_flash_attn_ext_f16_grouped(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        int ir0, int ir1) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+    const int G = ir1 - ir0;
+    GGML_ASSERT(G >= 1 && G <= GGML_FA_GROUP_MAX);
+    GGML_ASSERT(v->type == GGML_TYPE_F16 && DK <= 1024 && DV <= 1024);
+
+    const int64_t rk2 = neq2/nek2;
+    const int64_t rk3 = neq3/nek3;
+    const int64_t rv2 = neq2/nev2;
+    const int64_t rv3 = neq3/nev3;
+
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0) {
+        scale /= logit_softcap;
+    }
+
+    const uint32_t n_head      = neq2;
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
+    ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
+    ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
+    const size_t q_row_size = ggml_row_size(k_vec_dot_type, DK);
+
+    float               S[GGML_FA_GROUP_MAX];
+    float               M[GGML_FA_GROUP_MAX];
+    float               slope[GGML_FA_GROUP_MAX];
+    const ggml_fp16_t * mp[GGML_FA_GROUP_MAX];
+    int                 iq1s[GGML_FA_GROUP_MAX], iq2s[GGML_FA_GROUP_MAX];
+    alignas(64) ggml_fp16_t VKQ16[GGML_FA_GROUP_MAX][1024];
+    alignas(64) char        Q_q[GGML_FA_GROUP_MAX][1024*sizeof(float)];
+
+    const int iq3 = ir0/(neq2*neq1);
+    for (int g = 0; g < G; ++g) {
+        const int ir  = ir0 + g;
+        const int iq2 = (ir - iq3*neq2*neq1)/neq1;
+        const int iq1 = (ir - iq3*neq2*neq1 - iq2*neq1);
+        iq1s[g] = iq1; iq2s[g] = iq2;
+        const uint32_t h = iq2;
+        slope[g] = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
+        S[g] = 0.0f;
+        M[g] = -INFINITY;
+        memset(VKQ16[g], 0, DV*sizeof(ggml_fp16_t));
+        mp[g] = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        GGML_ASSERT(q_row_size <= sizeof(Q_q[g]));
+        q_to_vec_dot((const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3)), Q_q[g], DK);
+    }
+
+    const int ik3 = iq3 / rk3;
+    const int ik2 = iq2s[0] / rk2;
+    const int iv3 = iq3 / rv3;
+    const int iv2 = iq2s[0] / rv2;
+
+    for (int64_t ic = 0; ic < nek1; ++ic) {
+        const char * k_data = (const char *) k->data + (ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+        const char * v_data = (const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3);
+        for (int g = 0; g < G; ++g) {
+            const float mv = mp[g] ? slope[g]*GGML_CPU_FP16_TO_FP32(mp[g][ic]) : 0.0f;
+            if (mv == -INFINITY) {
+                continue;
+            }
+
+            float s;
+            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q[g], 0, 1);
+
+            s = s*scale;
+            if (logit_softcap != 0.0f) {
+                s = logit_softcap*tanhf(s);
+            }
+            s += mv;
+
+            const float Mold = M[g];
+            float ms = 1.0f;
+            float vs = 1.0f;
+            if (s > M[g]) {
+                M[g] = s;
+                ms = expf(Mold - M[g]);
+                ggml_vec_scale_f16(DV, VKQ16[g], ms);
+            } else {
+                vs = expf(s - M[g]);
+            }
+            ggml_vec_mad_f16(DV, VKQ16[g], (const ggml_fp16_t *) v_data, vs);
+
+            S[g] = S[g]*ms + vs;
+        }
+    }
+
+    float * VKQ32 = (float *) params->wdata + params->ith*(1*DK + 2*DV + CACHE_LINE_SIZE_F32);
+    for (int g = 0; g < G; ++g) {
+        for (int64_t d = 0; d < DV; ++d) {
+            VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[g][d]);
+        }
+        const float S_inv = S[g] == 0.0f ? 0.0f : 1.0f/S[g];
+        ggml_vec_scale_f32(DV, VKQ32, S_inv);
+        memcpy((char *) dst->data + (iq3*ne2*ne1 + iq2s[g] + iq1s[g]*ne1)*nb1, VKQ32, nb1);
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_tiled(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -9610,7 +9737,14 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    // Split-KV is off by default: single-row decode then takes the same path as small
+    // batches, so speculative verify batches reproduce one-token decode bit for bit
+    // (with it, the FP16 accumulation order differs once nek1 >= 512). GGML_CPU_FA_SPLIT_KV=1 enables it.
+    static const bool split_kv_enabled = []() {
+        const char * env = getenv("GGML_CPU_FA_SPLIT_KV");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    const bool use_split_kv_path = !use_ref && split_kv_enabled && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9680,6 +9814,34 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 #endif
         use_tiled &= (DV % f32_epr == 0);
 #endif
+        // Small batches with F16 K/V: work items are parts of one K/V head's rows, so the
+        // grouped kernel loads each K/V row once per part (GGML_CPU_FA_GROUPED=0 disables)
+        static const bool grouped_enabled = []() {
+            const char * env = getenv("GGML_CPU_FA_GROUPED");
+            return env == nullptr || atoi(env) != 0;
+        }();
+        const int64_t rows_per_group = (neq2/nek2)*neq1;
+        const bool use_grouped = grouped_enabled && !use_tiled && !use_ref && !dst->src[4] &&
+                                 q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+                                 DK <= 1024 && DV <= 1024 && neq2 % nek2 == 0 && rows_per_group > 1;
+        if (use_grouped) {
+            const int64_t n_groups = nr / rows_per_group;
+            const int64_t parts    = MAX((nth + n_groups - 1) / n_groups, (rows_per_group + GGML_FA_GROUP_MAX - 1) / GGML_FA_GROUP_MAX);
+            const int64_t part_len = (rows_per_group + parts - 1) / parts;
+            const int64_t n_items  = n_groups * parts;
+            int current_item = ith;
+            while (current_item < n_items) {
+                const int64_t grp = current_item / parts;
+                const int64_t ir0 = grp*rows_per_group + (current_item % parts)*part_len;
+                const int64_t ir1 = MIN(ir0 + part_len, (grp + 1)*rows_per_group);
+                if (ir1 > ir0) {
+                    ggml_compute_forward_flash_attn_ext_f16_grouped(params, dst, ir0, ir1);
+                }
+                current_item = ggml_threadpool_chunk_add(params->threadpool, 1);
+            }
+            return;
+        }
+
         int current_chunk = ith;
 
         while (current_chunk < nchunk) {
