@@ -981,8 +981,10 @@ static void rknpu_softmax_row(const float* s_row, const ggml_fp16_t* mrow, int64
 }
 
 // One chunk of an attention row from FP16 scores: x = softcap(s*scale) + mask over n
-// elements, out = exp(x - m) as FP16 with the chunk's own max m and sum l (flash-attention
-// style; the P*V accumulation rescales the chunks). An all-masked chunk gives m = -inf, l = 0.
+// elements, out = exp(x - m) / l as FP16 with the chunk's own max m and sum l (flash-attention
+// style; the P*V accumulation weights the chunks by exp(m - M) l / L). P is normalized per
+// chunk so its magnitudes match the one-pass softmax (unnormalized P cost 1% perplexity on
+// the NPU's FP16 multiply-accumulate). An all-masked chunk gives m = -inf, l = 0.
 static void rknpu_softmax_chunk16(const uint16_t* s16, const ggml_fp16_t* mrow, int64_t n, float scale, float softcap,
                                   float* tmp, uint16_t* out, float* m_out, float* l_out) {
     int64_t j = 0;
@@ -1017,19 +1019,28 @@ static void rknpu_softmax_chunk16(const uint16_t* s16, const ggml_fp16_t* mrow, 
 #ifdef __ARM_NEON
     float32x4_t vsum = vdupq_n_f32(0.0f);
     const float32x4_t vm = vdupq_n_f32(mx);
-    for (; j + 8 <= n; j += 8) {
-        const float32x4_t e0 = rknpu_v_expf(vsubq_f32(vld1q_f32(tmp + j), vm));
-        const float32x4_t e1 = rknpu_v_expf(vsubq_f32(vld1q_f32(tmp + j + 4), vm));
-        vsum = vaddq_f32(vsum, vaddq_f32(e0, e1));
-        vst1q_u16(out + j, vreinterpretq_u16_f16(vcombine_f16(vcvt_f16_f32(e0), vcvt_f16_f32(e1))));
+    for (; j + 4 <= n; j += 4) {
+        const float32x4_t e = rknpu_v_expf(vsubq_f32(vld1q_f32(tmp + j), vm));
+        vst1q_f32(tmp + j, e);
+        vsum = vaddq_f32(vsum, e);
     }
     sum = vaddvq_f32(vsum);
 #endif
     for (; j < n; ++j) {
         const float e = tmp[j] == -INFINITY ? 0.0f : expf(tmp[j] - mx);
+        tmp[j] = e;
         sum += e;
-        out[j] = ggml_fp32_to_fp16(e);
     }
+    const float inv = sum == 0.0f ? 0.0f : 1.0f / sum;
+    j = 0;
+#ifdef __ARM_NEON
+    const float32x4_t vinv = vdupq_n_f32(inv);
+    for (; j + 8 <= n; j += 8) {
+        const float32x4_t p0 = vmulq_f32(vld1q_f32(tmp + j), vinv), p1 = vmulq_f32(vld1q_f32(tmp + j + 4), vinv);
+        vst1q_u16(out + j, vreinterpretq_u16_f16(vcombine_f16(vcvt_f16_f32(p0), vcvt_f16_f32(p1))));
+    }
+#endif
+    for (; j < n; ++j) out[j] = ggml_fp32_to_fp16(tmp[j] * inv);
     *m_out = mx; *l_out = sum;
 }
 
@@ -2163,8 +2174,8 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                 }
             }
         } else if (st == 3) {
-            // online softmax: per row, O = sum_c a_rc O_c with a_rc = exp(m_rc - M_r) / L_r,
-            // L_r = sum_c exp(m_rc - M_r) l_rc (the chunks' P are unnormalized)
+            // online softmax: per row, O = sum_c a_rc O_c with a_rc = exp(m_rc - M_r) l_rc / L_r,
+            // L_r = sum_c exp(m_rc - M_r) l_rc (each chunk's P is normalized by its own l_rc)
             static thread_local std::vector<float> alpha;
             if (online) {
                 const float* st = bctx->fa_stats[core].data();
@@ -2175,8 +2186,8 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                     float Lr = 0.0f;
                     for (int c = 0; c < n_pvc; ++c) {
                         const float m = st[(r * n_pvc + c) * 2];
-                        alpha[r * n_pvc + c] = m == -INFINITY ? 0.0f : expf(m - Mr);
-                        Lr += alpha[r * n_pvc + c] * st[(r * n_pvc + c) * 2 + 1];
+                        alpha[r * n_pvc + c] = m == -INFINITY ? 0.0f : expf(m - Mr) * st[(r * n_pvc + c) * 2 + 1];
+                        Lr += alpha[r * n_pvc + c];
                     }
                     const float inv = Lr > 0.0f ? 1.0f / Lr : 0.0f;
                     for (int c = 0; c < n_pvc; ++c) alpha[r * n_pvc + c] *= inv;
