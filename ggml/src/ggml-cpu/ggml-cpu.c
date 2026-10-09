@@ -3074,6 +3074,7 @@ struct ggml_cplan ggml_graph_plan(
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
+static bool ggml_cpu_disable_chain = false;   // GGML_CPU_DISABLE_FUSION_CHAIN: no second norm in a fused post-norm pass
 
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
@@ -3088,6 +3089,73 @@ static int ggml_cpu_try_fuse_ops(
     struct ggml_tensor * node = cgraph->nodes[node_n];
 
     if (node->op == GGML_OP_RMS_NORM) {
+        // RMS_NORM + MUL + ADD (+ MUL by a one-element tensor) fusion: a
+        // post-norm followed by its residual add (and a layer scale)
+        const enum ggml_op fuse_ops4[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL };
+        const enum ggml_op fuse_ops3[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
+        const bool fuse4 = ggml_can_fuse(cgraph, node_n, fuse_ops4, 4);
+        if (fuse4 || ggml_can_fuse(cgraph, node_n, fuse_ops3, 3)) {
+            struct ggml_tensor * mul_node = cgraph->nodes[node_n + 1];
+            struct ggml_tensor * add_node = cgraph->nodes[node_n + 2];
+            const struct ggml_tensor * mul_w = (mul_node->src[0] == node) ? mul_node->src[1] : mul_node->src[0];
+            const struct ggml_tensor * res   = (add_node->src[0] == mul_node) ? add_node->src[1] : add_node->src[0];
+            if (node->src[0]->type  == GGML_TYPE_F32 &&
+                mul_node->type      == GGML_TYPE_F32 &&
+                mul_w->type         == GGML_TYPE_F32 &&
+                mul_w->ne[0]        == node->ne[0]   &&
+                mul_w->nb[0]        == sizeof(float) &&
+                add_node->type      == GGML_TYPE_F32 &&
+                res->type           == GGML_TYPE_F32 &&
+                ggml_are_same_shape(res, add_node) &&
+                ggml_are_same_shape(mul_node, add_node) &&
+                res->nb[0]          == sizeof(float)) {
+
+                // the next RMS_NORM + MUL of the result, when it follows
+                // directly: done per row in the same pass
+                const enum ggml_op norm_mul[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
+                struct ggml_tensor * nx_norm = NULL;
+                struct ggml_tensor * nx_mul  = NULL;
+                const int nf = fuse4 ? 4 : 3;
+                struct ggml_tensor * last = cgraph->nodes[node_n + nf - 1];
+                if (!ggml_cpu_disable_chain && ggml_can_fuse(cgraph, node_n + nf, norm_mul, 2)) {
+                    struct ggml_tensor * n2 = cgraph->nodes[node_n + nf];
+                    struct ggml_tensor * m2 = cgraph->nodes[node_n + nf + 1];
+                    const struct ggml_tensor * w2 = (m2->src[0] == n2) ? m2->src[1] : m2->src[0];
+                    if (n2->src[0] == last && w2->type == GGML_TYPE_F32 && w2->ne[0] == n2->ne[0] &&
+                        w2->nb[0] == sizeof(float) && m2->type == GGML_TYPE_F32 && ggml_are_same_shape(m2, last)) {
+                        nx_norm = n2;
+                        nx_mul  = m2;
+                    }
+                }
+                if (fuse4) {
+                    struct ggml_tensor * sc_node = cgraph->nodes[node_n + 3];
+                    const struct ggml_tensor * kt = (sc_node->src[0] == add_node) ? sc_node->src[1] : sc_node->src[0];
+                    if (kt->type == GGML_TYPE_F32 && ggml_nelements(kt) == 1 && sc_node->type == GGML_TYPE_F32 &&
+                        ggml_are_same_shape(sc_node, add_node)) {
+                        ggml_compute_forward_rms_norm_mul_add_scale_fused(params, node, mul_node, add_node, sc_node, nx_norm, nx_mul);
+                        return nx_mul ? 5 : 3;
+                    }
+                    if (nx_mul && nf == 4) { nx_norm = NULL; nx_mul = NULL; }   // the chain was against the 4-op result
+                }
+                if (nx_mul == NULL) {
+                    // a chain after the 3-op result (when the 4th op is not a scale)
+                    struct ggml_tensor * n2 = cgraph->nodes[node_n + 3];
+                    if (!ggml_cpu_disable_chain && node_n + 4 < cgraph->n_nodes && ggml_can_fuse(cgraph, node_n + 3, norm_mul, 2) &&
+                        n2->src[0] == add_node) {
+                        struct ggml_tensor * m2 = cgraph->nodes[node_n + 4];
+                        const struct ggml_tensor * w2 = (m2->src[0] == n2) ? m2->src[1] : m2->src[0];
+                        if (w2->type == GGML_TYPE_F32 && w2->ne[0] == n2->ne[0] && w2->nb[0] == sizeof(float) &&
+                            m2->type == GGML_TYPE_F32 && ggml_are_same_shape(m2, add_node)) {
+                            nx_norm = n2;
+                            nx_mul  = m2;
+                        }
+                    }
+                }
+                ggml_compute_forward_rms_norm_mul_add_fused(params, node, mul_node, add_node, nx_norm, nx_mul);
+                return nx_mul ? 4 : 2;
+            }
+        }
+
         // RMS_NORM + MUL fusion
         const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
         if (ggml_can_fuse(cgraph, node_n, fuse_ops, 2)) {
@@ -3938,6 +4006,8 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+            const char * env_chain = getenv("GGML_CPU_DISABLE_FUSION_CHAIN");
+            ggml_cpu_disable_chain = (env_chain != NULL && atoi(env_chain) == 1);
         }
 
         is_first_call = false;
