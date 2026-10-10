@@ -1374,31 +1374,34 @@ static void rknpu_mirror_validate(rknpu_kv_mirror* m, int64_t n_kv) {
     }
 }
 
+// V: the P*V context of chunk c. K: one Q*K^T context over chunks 0..c (positions are outermost
+// in the K layout, so those chunks are one contiguous B), so a decode step is one run per head
 static rknpu_dec_ctx* rknpu_dec_get_ctx(rknpu_kv_mirror* m, int64_t h, int64_t c) {
     std::unique_ptr<rknpu_dec_ctx>& slot = m->ctxs[h * m->n_chunks + c];
     if (slot) return slot.get();
     std::unique_ptr<rknpu_dec_ctx> d(new rknpu_dec_ctx());
+    const int64_t span = m->is_v ? 1 : c + 1;   // chunks covered by B
     rknn_matmul_info info;
     memset(&info, 0, sizeof(info));
     info.M = RKNPU_DEC_M;
     info.K = m->is_v ? RKNPU_DEC_CHUNK : RKNPU_DEC_DK;
-    info.N = m->is_v ? RKNPU_DEC_DK : RKNPU_DEC_CHUNK;
+    info.N = m->is_v ? RKNPU_DEC_DK : (int32_t)(span * RKNPU_DEC_CHUNK);
     info.type = m->is_v ? RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32 : RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16;
     info.B_layout = RKNN_MM_LAYOUT_NATIVE;
     info.AC_layout = RKNN_MM_LAYOUT_NATIVE;
     info.iommu_domain_id = m->domain;
     if (rknn_matmul_create(&d->ctx, &info, &d->io) < 0) { d->ctx = 0; return nullptr; }
     const auto& bd = d->io.B.dims;
-    const size_t chunk_bytes = (size_t)RKNPU_DEC_CHUNK * RKNPU_DEC_DK * 2;
+    const size_t chunk_bytes = (size_t)RKNPU_DEC_CHUNK * RKNPU_DEC_DK * 2, b_bytes = span * chunk_bytes;
     if (rknpu2_native_geom_from_dims(d->io.A.dims, d->io.A.n_dims, &d->a_geom) != 0 ||
         rknpu2_native_geom_from_dims(d->io.C.dims, d->io.C.n_dims, &d->c_geom) != 0 ||
         d->a_geom.m_stride != RKNPU_DEC_M || d->c_geom.m_stride != RKNPU_DEC_M ||
-        d->io.B.n_dims != 4 || (int)bd[2] != m->sN || (int)bd[3] != m->sK || d->io.B.size != chunk_bytes) {
+        d->io.B.n_dims != 4 || (int)bd[2] != m->sN || (int)bd[3] != m->sK || d->io.B.size != b_bytes) {
         return nullptr;
     }
     rknn_matmul_set_core_mask(d->ctx, h % 3 == 0 ? RKNN_NPU_CORE_0 : h % 3 == 1 ? RKNN_NPU_CORE_1 : RKNN_NPU_CORE_2);
-    const size_t off = h * m->head_bytes + (size_t)c * chunk_bytes;
-    d->B = rknn_create_mem_from_fd(d->ctx, m->mem->fd, (uint8_t*)m->mem->virt_addr + off, chunk_bytes, off);
+    const size_t off = h * m->head_bytes + (m->is_v ? (size_t)c * chunk_bytes : 0);
+    d->B = rknn_create_mem_from_fd(d->ctx, m->mem->fd, (uint8_t*)m->mem->virt_addr + off, b_bytes, off);
     d->A = rknn_create_mem(d->ctx, d->io.A.size);
     d->C = rknn_create_mem(d->ctx, d->io.C.size);
     if (!d->A || !d->B || !d->C) return nullptr;
@@ -1538,11 +1541,14 @@ static void rknpu_flash_attn_decode(struct ggml_tensor* dst, int n_omp) {
         }
         if (bad) { fprintf(stderr, "RKNPU2: KV mirror differs from the cache in %lld values (%s)\n", (long long)bad, dst->name); GGML_ABORT("KV mirror out of sync"); }
     }
-    std::vector<rknpu_dec_ctx*> qk(n_kvh * nc), pv(n_kvh * nc);
-    for (int64_t g = 0; g < n_kvh; ++g) for (int64_t c = 0; c < nc; ++c) {
-        qk[g * nc + c] = rknpu_dec_get_ctx(mk, g, c);
-        pv[g * nc + c] = rknpu_dec_get_ctx(mv, g, c);
-        GGML_ASSERT(qk[g * nc + c] && pv[g * nc + c] && "RKNPU2: decode attention context creation failed");
+    std::vector<rknpu_dec_ctx*> qk(n_kvh), pv(n_kvh * nc);
+    for (int64_t g = 0; g < n_kvh; ++g) {
+        qk[g] = rknpu_dec_get_ctx(mk, g, nc - 1);
+        GGML_ASSERT(qk[g] && "RKNPU2: decode attention context creation failed");
+        for (int64_t c = 0; c < nc; ++c) {
+            pv[g * nc + c] = rknpu_dec_get_ctx(mv, g, c);
+            GGML_ASSERT(pv[g * nc + c] && "RKNPU2: decode attention context creation failed");
+        }
     }
     const char* q_base = (const char*)get_tensor_real_ptr(q);
     const char* m_base = (const char*)get_tensor_real_ptr(mask);
@@ -1555,18 +1561,14 @@ static void rknpu_flash_attn_decode(struct ggml_tensor* dst, int n_omp) {
     #pragma omp parallel for num_threads(std::min<int64_t>(n_kvh, n_omp))
     for (int64_t g = 0; g < n_kvh; ++g) {
         uint16_t qh[RKNPU_DEC_DK];
-        rknpu_dec_ctx* c0 = qk[g * nc];
+        rknpu_dec_ctx* d = qk[g];
         for (int64_t r = 0; r < R; ++r) {
             rknpu_fp32_to_fp16(q_row(g, r), qh, RKNPU_DEC_DK);
-            rknpu2_native_scatter_row((uint8_t*)c0->A->virt_addr, (const uint8_t*)qh, (int32_t)r, c0->a_geom.m_stride, c0->a_geom.outer, c0->a_geom.sub * 2);
+            rknpu2_native_scatter_row((uint8_t*)d->A->virt_addr, (const uint8_t*)qh, (int32_t)r, d->a_geom.m_stride, d->a_geom.outer, d->a_geom.sub * 2);
         }
-        for (int64_t c = 0; c < nc; ++c) {
-            rknpu_dec_ctx* d = qk[g * nc + c];
-            if (c > 0) memcpy(d->A->virt_addr, c0->A->virt_addr, d->io.A.size);
-            rknn_mem_sync(d->ctx, d->A, RKNN_MEMORY_SYNC_TO_DEVICE);
-            RKNN_CHECK(rknn_matmul_run(d->ctx), "decode Q*K^T");
-            rknn_mem_sync(d->ctx, d->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
-        }
+        rknn_mem_sync(d->ctx, d->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+        RKNN_CHECK(rknn_matmul_run(d->ctx), "decode Q*K^T");
+        rknn_mem_sync(d->ctx, d->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
     }
     // 2. softmax per (KV head, row) over [0, n_kv); P into the A of every P*V chunk context
     #pragma omp parallel for num_threads(n_omp)
@@ -1579,11 +1581,10 @@ static void rknpu_flash_attn_decode(struct ggml_tensor* dst, int n_omp) {
         const ggml_fp16_t* mr = m_row(r);
         int64_t lo, hi;
         rknpu_softmax_range(mr, n_kv, &lo, &hi);
-        for (int64_t j = lo; j < hi; ++j) {
-            const rknpu_dec_ctx* d = qk[g * nc + j / RKNPU_DEC_CHUNK];
-            const int64_t n = j % RKNPU_DEC_CHUNK, sub = d->c_geom.sub;
-            s[j] = ggml_fp16_to_fp32(((const ggml_fp16_t*)d->C->virt_addr)[((size_t)(n / sub) * RKNPU_DEC_M + r) * sub + n % sub]);
-        }
+        const rknpu_dec_ctx* dq = qk[g];
+        const ggml_fp16_t* S = (const ggml_fp16_t*)dq->C->virt_addr;
+        const int64_t sub = dq->c_geom.sub;
+        for (int64_t j = lo; j < hi; ++j) s[j] = ggml_fp16_to_fp32(S[((size_t)(j / sub) * RKNPU_DEC_M + r) * sub + j % sub]);
         rknpu_softmax_row(s.data(), mr, n_kv, lo, hi, scale, softcap, tmp.data(), p.data());
         memset(p.data() + n_kv, 0, (np - n_kv) * sizeof(uint16_t));
         for (int64_t c = 0; c < nc; ++c) {
