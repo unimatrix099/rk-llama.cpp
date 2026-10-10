@@ -1241,6 +1241,365 @@ static void rknpu_rope_op(struct ggml_tensor* dst, int n_omp) {
     }
 }
 
+static inline int64_t rknpu_row_index(const struct ggml_tensor* idx, const void* base, int64_t i) {
+    return idx->type == GGML_TYPE_I64 ? ((const int64_t*)base)[i] : (int64_t)((const int32_t*)base)[i];
+}
+
+// ---------------------------------------------------------------------------
+// NPU decode/verify attention for head-dim-512 layers (RKNPU_FA_DEC, decode research #1o).
+// A persistent mirror of each such K and V cache is kept in the NPU's native B layout, so a
+// decode step does not repack the whole cache: per KV head, K is [chunk][N/subN][K/subK][subN][subK]
+// (positions outermost) and V is [chunk][DV/subN][2048/subK][subN][subK], 2048 positions per chunk.
+// The mirror is filled once from the cache when a decode attention first uses it, then updated by
+// every KV-cache write this backend does (SET_ROWS, fused or not); written lines are cleaned to
+// memory with `dc cvac` (a view sync does not flush, and "non-cacheable" memory is not coherent).
+// Decode and verify batches use the same fixed M = 32 contexts, and NPU results do not depend on M
+// or on a row's position in M, so a verify row equals the one-token row (MTP stays exact).
+// The mirror is global: an MTP drafter attends to the target's cache from its own backend.
+#define RKNPU_DEC_DK 512
+#define RKNPU_DEC_CHUNK 2048
+#define RKNPU_DEC_M 32
+
+static bool rknpu_fa_dec_enabled() {
+    static const bool v = []() {
+        const char* env = std::getenv("RKNPU_FA_DEC");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return v;
+}
+
+static inline void rknpu_clean_line(const void* p) {
+#if defined(__aarch64__)
+    __asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
+#else
+    (void)p;
+#endif
+}
+static inline void rknpu_clean_fence() {
+#if defined(__aarch64__)
+    __asm__ volatile("dsb sy" ::: "memory");
+#endif
+}
+
+struct rknpu_dec_ctx {   // one chunk's matmul: QK (A = Q, B = K chunk view, C = S) or PV (A = P, B = V chunk view, C = O)
+    rknn_matmul_ctx ctx = 0;
+    rknn_matmul_io_attr io;
+    rknn_tensor_mem *A = nullptr, *B = nullptr, *C = nullptr;
+    rknpu2_native_geom a_geom = {0, 0, 0}, c_geom = {0, 0, 0};
+    ~rknpu_dec_ctx() {
+        if (!ctx) return;
+        if (A) rknn_destroy_mem(ctx, A);
+        if (B) rknn_destroy_mem(ctx, B);
+        if (C) rknn_destroy_mem(ctx, C);
+        rknn_matmul_destroy(ctx);
+    }
+};
+
+struct rknpu_kv_mirror {   // one cache tensor (K or V), all its KV heads
+    const struct ggml_tensor* cache = nullptr;
+    bool is_v = false;
+    int64_t n_kvh = 0, kv_size = 0, n_chunks = 0;
+    size_t head_bytes = 0;   // bytes per KV head (n_chunks chunks)
+    int32_t domain = 0;
+    rknn_matmul_ctx alloc_ctx = 0;
+    rknn_tensor_mem* mem = nullptr;   // all heads, head h at h * head_bytes
+    int sN = 0, sK = 0;               // native B cell geometry
+    std::vector<std::unique_ptr<rknpu_dec_ctx>> ctxs;   // [head][chunk], created on first use
+};
+
+struct rknpu_kv_mirrors {
+    std::mutex mu;
+    std::unordered_map<const struct ggml_tensor*, std::unique_ptr<rknpu_kv_mirror>> by_cache[2];   // [is_v]
+};
+static rknpu_kv_mirrors g_kv_mirrors;
+
+static uint16_t* rknpu_mirror_head(rknpu_kv_mirror* m, int64_t h) { return (uint16_t*)((uint8_t*)m->mem->virt_addr + h * m->head_bytes); }
+
+// element offsets (in FP16 units) inside one head's buffer
+static inline size_t rknpu_mirror_k_off(const rknpu_kv_mirror* m, int64_t pos, int64_t d) {
+    const int64_t c = pos / RKNPU_DEC_CHUNK, n = pos % RKNPU_DEC_CHUNK, kb = RKNPU_DEC_DK / m->sK;
+    return (size_t)c * RKNPU_DEC_CHUNK * RKNPU_DEC_DK + ((((size_t)(n / m->sN) * kb + d / m->sK) * m->sN + n % m->sN) * m->sK + d % m->sK);
+}
+static inline size_t rknpu_mirror_v_off(const rknpu_kv_mirror* m, int64_t pos, int64_t d) {
+    const int64_t c = pos / RKNPU_DEC_CHUNK, n = pos % RKNPU_DEC_CHUNK, kb = RKNPU_DEC_CHUNK / m->sK;
+    return (size_t)c * RKNPU_DEC_CHUNK * RKNPU_DEC_DK + ((((size_t)(d / m->sN) * kb + n / m->sK) * m->sN + d % m->sN) * m->sK + n % m->sK);
+}
+
+// copy cache cell `pos` (all heads) into the mirror; clean=true also cleans the written lines
+static void rknpu_mirror_store(rknpu_kv_mirror* m, int64_t pos, bool clean) {
+    const struct ggml_tensor* t = m->cache;
+    const uint16_t* row = (const uint16_t*)((const char*)get_tensor_real_ptr(t) + pos * t->nb[1]);
+    for (int64_t h = 0; h < m->n_kvh; ++h) {
+        uint16_t* hb = rknpu_mirror_head(m, h);
+        const uint16_t* src = row + h * RKNPU_DEC_DK;
+        if (!m->is_v) {   // runs of sK dims are contiguous
+            for (int64_t d = 0; d < RKNPU_DEC_DK; d += m->sK) {
+                uint16_t* p = hb + rknpu_mirror_k_off(m, pos, d);
+                memcpy(p, src + d, m->sK * 2);
+                if (clean) for (int b = 0; b < m->sK * 2; b += 64) rknpu_clean_line((uint8_t*)p + b);
+            }
+        } else {          // one element per (dim, position) cell run
+            for (int64_t d = 0; d < RKNPU_DEC_DK; ++d) {
+                uint16_t* p = hb + rknpu_mirror_v_off(m, pos, d);
+                *p = src[d];
+                if (clean) rknpu_clean_line(p);
+            }
+        }
+    }
+}
+
+static rknpu_dec_ctx* rknpu_dec_get_ctx(rknpu_kv_mirror* m, int64_t h, int64_t c) {
+    std::unique_ptr<rknpu_dec_ctx>& slot = m->ctxs[h * m->n_chunks + c];
+    if (slot) return slot.get();
+    std::unique_ptr<rknpu_dec_ctx> d(new rknpu_dec_ctx());
+    rknn_matmul_info info;
+    memset(&info, 0, sizeof(info));
+    info.M = RKNPU_DEC_M;
+    info.K = m->is_v ? RKNPU_DEC_CHUNK : RKNPU_DEC_DK;
+    info.N = m->is_v ? RKNPU_DEC_DK : RKNPU_DEC_CHUNK;
+    info.type = m->is_v ? RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32 : RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16;
+    info.B_layout = RKNN_MM_LAYOUT_NATIVE;
+    info.AC_layout = RKNN_MM_LAYOUT_NATIVE;
+    info.iommu_domain_id = m->domain;
+    if (rknn_matmul_create(&d->ctx, &info, &d->io) < 0) { d->ctx = 0; return nullptr; }
+    const auto& bd = d->io.B.dims;
+    const size_t chunk_bytes = (size_t)RKNPU_DEC_CHUNK * RKNPU_DEC_DK * 2;
+    if (rknpu2_native_geom_from_dims(d->io.A.dims, d->io.A.n_dims, &d->a_geom) != 0 ||
+        rknpu2_native_geom_from_dims(d->io.C.dims, d->io.C.n_dims, &d->c_geom) != 0 ||
+        d->a_geom.m_stride != RKNPU_DEC_M || d->c_geom.m_stride != RKNPU_DEC_M ||
+        d->io.B.n_dims != 4 || (int)bd[2] != m->sN || (int)bd[3] != m->sK || d->io.B.size != chunk_bytes) {
+        return nullptr;
+    }
+    rknn_matmul_set_core_mask(d->ctx, h % 3 == 0 ? RKNN_NPU_CORE_0 : h % 3 == 1 ? RKNN_NPU_CORE_1 : RKNN_NPU_CORE_2);
+    const size_t off = h * m->head_bytes + (size_t)c * chunk_bytes;
+    d->B = rknn_create_mem_from_fd(d->ctx, m->mem->fd, (uint8_t*)m->mem->virt_addr + off, chunk_bytes, off);
+    d->A = rknn_create_mem(d->ctx, d->io.A.size);
+    d->C = rknn_create_mem(d->ctx, d->io.C.size);
+    if (!d->A || !d->B || !d->C) return nullptr;
+    memset(d->A->virt_addr, 0, d->io.A.size);
+    rknn_mem_sync(d->ctx, d->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+    rknn_matmul_set_io_mem(d->ctx, d->A, &d->io.A);
+    rknn_matmul_set_io_mem(d->ctx, d->B, &d->io.B);
+    rknn_matmul_set_io_mem(d->ctx, d->C, &d->io.C);
+    slot = std::move(d);
+    return slot.get();
+}
+
+// the mirror of a K or V cache tensor; created and filled from the cache on first use
+static rknpu_kv_mirror* rknpu_mirror_get(const struct ggml_tensor* cache, bool is_v, int64_t n_kvh) {
+    std::lock_guard<std::mutex> lock(g_kv_mirrors.mu);
+    auto& map = g_kv_mirrors.by_cache[is_v];
+    auto it = map.find(cache);
+    if (it != map.end()) return it->second.get();
+    std::unique_ptr<rknpu_kv_mirror> m(new rknpu_kv_mirror());
+    m->cache = cache;
+    m->is_v = is_v;
+    m->n_kvh = n_kvh;
+    m->kv_size = cache->ne[1];
+    m->n_chunks = (m->kv_size + RKNPU_DEC_CHUNK - 1) / RKNPU_DEC_CHUNK;
+    m->head_bytes = (size_t)m->n_chunks * RKNPU_DEC_CHUNK * RKNPU_DEC_DK * 2;
+    // the native B cell geometry, from a throwaway context of the chunk shape
+    {
+        rknn_matmul_info info;
+        memset(&info, 0, sizeof(info));
+        info.M = RKNPU_DEC_M;
+        info.K = is_v ? RKNPU_DEC_CHUNK : RKNPU_DEC_DK;
+        info.N = is_v ? RKNPU_DEC_DK : RKNPU_DEC_CHUNK;
+        info.type = is_v ? RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32 : RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16;
+        info.B_layout = RKNN_MM_LAYOUT_NATIVE;
+        info.AC_layout = RKNN_MM_LAYOUT_NATIVE;
+        rknn_matmul_ctx ctx = 0;
+        rknn_matmul_io_attr io;
+        if (rknn_matmul_create(&ctx, &info, &io) < 0) return nullptr;
+        const bool ok = io.B.n_dims == 4 && io.B.dims[2] > 0 && io.B.dims[3] > 0 && RKNPU_DEC_DK % io.B.dims[3] == 0 &&
+                        RKNPU_DEC_CHUNK % io.B.dims[3] == 0 && RKNPU_DEC_CHUNK % io.B.dims[2] == 0 && RKNPU_DEC_DK % io.B.dims[2] == 0;
+        m->sN = (int)io.B.dims[2];
+        m->sK = (int)io.B.dims[3];
+        rknn_matmul_destroy(ctx);
+        if (!ok) return nullptr;
+    }
+    const size_t bytes = m->head_bytes * n_kvh;
+    m->domain = g_domain_manager.assign_domain_memory(bytes);
+    m->alloc_ctx = g_domain_manager.get_allocator_context(m->domain);
+    m->mem = rknn_create_mem(m->alloc_ctx, bytes);
+    if (!m->mem) {
+        fprintf(stderr, "RKNPU2: could not allocate the %zu MiB KV mirror\n", bytes >> 20);
+        g_domain_manager.release_domain_memory(m->domain, bytes);
+        return nullptr;
+    }
+    memset(m->mem->virt_addr, 0, bytes);   // unwritten cells must be finite (P = 0 there)
+    m->ctxs.resize(n_kvh * m->n_chunks);
+    // fill from the cache: every cell, written or not, so later reads never see stale bytes
+    #pragma omp parallel for
+    for (int64_t pos = 0; pos < m->kv_size; ++pos) rknpu_mirror_store(m.get(), pos, false);
+    rknn_mem_sync(m->alloc_ctx, m->mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+    rknpu_kv_mirror* r = m.get();
+    map.emplace(cache, std::move(m));
+    return r;
+}
+
+static rknpu_kv_mirror* rknpu_mirror_find(const struct ggml_tensor* cache, bool is_v) {
+    std::lock_guard<std::mutex> lock(g_kv_mirrors.mu);
+    auto& map = g_kv_mirrors.by_cache[is_v];
+    auto it = map.find(cache);
+    return it == map.end() ? nullptr : it->second.get();
+}
+
+// after a KV-cache write (SET_ROWS into a view of `sr->view_src`): update its mirrors, if any
+static void rknpu_mirror_after_set_rows(const struct ggml_tensor* sr, int n_omp) {
+    const struct ggml_tensor* cache = sr->view_src;
+    if (!cache) return;
+    rknpu_kv_mirror* ms[2] = { rknpu_mirror_find(cache, false), rknpu_mirror_find(cache, true) };
+    if (!ms[0] && !ms[1]) return;
+    GGML_ASSERT(sr->view_offs == 0 && sr->nb[1] == cache->nb[1] && "RKNPU2: KV mirror expects a whole-row cache write");
+    const struct ggml_tensor* idx = sr->src[1];
+    const void* ip = get_tensor_real_ptr(idx);
+    const int64_t n = idx->ne[0];
+    for (rknpu_kv_mirror* m : ms) {
+        if (!m) continue;
+        // write all rows, then clean: V rows share cache lines, so no line is cleaned while another thread writes it
+        #pragma omp parallel for num_threads(n_omp) if(n > 8)
+        for (int64_t i = 0; i < n; ++i) rknpu_mirror_store(m, rknpu_row_index(idx, ip, i), false);
+        // a line clean writes the line back on its own (~us each): for a prompt batch one whole-buffer sync is cheaper
+        if (n > 8) {
+            rknn_mem_sync(m->alloc_ctx, m->mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+            continue;
+        }
+        #pragma omp parallel for num_threads(n_omp) if(n > 8)
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t pos = rknpu_row_index(idx, ip, i);
+            for (int64_t h = 0; h < m->n_kvh; ++h) {
+                uint16_t* hb = rknpu_mirror_head(m, h);
+                if (!m->is_v) for (int64_t d = 0; d < RKNPU_DEC_DK; d += 32) rknpu_clean_line(hb + rknpu_mirror_k_off(m, pos, d));
+                else          for (int64_t d = 0; d < RKNPU_DEC_DK; ++d) rknpu_clean_line(hb + rknpu_mirror_v_off(m, pos, d));
+            }
+        }
+    }
+    rknpu_clean_fence();
+}
+
+static bool rknpu_fa_dec_supported(const struct ggml_tensor* op) {
+    const struct ggml_tensor *q = op->src[0], *k = op->src[1], *v = op->src[2], *mask = op->src[3];
+    if (!rknpu_fa_dec_enabled() || !mask || !k->view_src || !v->view_src) return false;
+    const int64_t n_q = q->ne[1], n_kvh = k->ne[2];
+    if (k->ne[0] != RKNPU_DEC_DK || v->ne[0] != RKNPU_DEC_DK || n_q < 1) return false;
+    if (q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || mask->ne[3] != 1 || mask->ne[2] != 1) return false;
+    if ((q->ne[2] / n_kvh) * n_q > RKNPU_DEC_M) return false;
+    // K and V are views of whole cache rows: cell j at j * nb[1], head h at h * DK
+    for (const struct ggml_tensor* t : { k, v }) {
+        const struct ggml_tensor* c = t->view_src;
+        if (c->type != GGML_TYPE_F16 || t->view_offs != 0 || t->nb[1] != c->nb[1] || t->nb[2] != RKNPU_DEC_DK * 2 ||
+            c->ne[0] != t->ne[2] * RKNPU_DEC_DK || t->ne[1] > c->ne[1]) return false;
+    }
+    return true;
+}
+
+static void rknpu_flash_attn_decode(struct ggml_tensor* dst, int n_omp) {
+    const struct ggml_tensor *q = dst->src[0], *k = dst->src[1], *v = dst->src[2], *mask = dst->src[3];
+    const int64_t n_q = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1], n_kvh = k->ne[2];
+    const int64_t rk2 = n_head / n_kvh, R = rk2 * n_q;
+    const int64_t nc = (n_kv + RKNPU_DEC_CHUNK - 1) / RKNPU_DEC_CHUNK;
+    float scale = 1.0f, softcap = 0.0f;
+    memcpy(&scale,   (const float*)dst->op_params + 0, sizeof(float));
+    memcpy(&softcap, (const float*)dst->op_params + 2, sizeof(float));
+    if (softcap != 0.0f) scale /= softcap;
+    rknpu_kv_mirror* mk = rknpu_mirror_get(k->view_src, false, n_kvh);
+    rknpu_kv_mirror* mv = rknpu_mirror_get(v->view_src, true, n_kvh);
+    GGML_ASSERT(mk && mv && "RKNPU2: KV mirror unavailable");
+    static const bool check = []() { const char* e = std::getenv("RKNPU_FA_DEC_CHECK"); return e && std::atoi(e) != 0; }();
+    if (check) {   // debug: the mirror must equal the cache over [0, n_kv)
+        int64_t bad = 0;
+        for (rknpu_kv_mirror* m : { mk, mv }) {
+            const struct ggml_tensor* t = m->cache;
+            for (int64_t pos = 0; pos < n_kv; ++pos) {
+                const uint16_t* row = (const uint16_t*)((const char*)get_tensor_real_ptr(t) + pos * t->nb[1]);
+                for (int64_t h = 0; h < n_kvh; ++h) for (int64_t d = 0; d < RKNPU_DEC_DK; ++d) {
+                    const size_t o = m->is_v ? rknpu_mirror_v_off(m, pos, d) : rknpu_mirror_k_off(m, pos, d);
+                    bad += rknpu_mirror_head(m, h)[o] != row[h * RKNPU_DEC_DK + d];
+                }
+            }
+        }
+        if (bad) { fprintf(stderr, "RKNPU2: KV mirror differs from the cache in %lld values (%s)\n", (long long)bad, dst->name); GGML_ABORT("KV mirror out of sync"); }
+    }
+    std::vector<rknpu_dec_ctx*> qk(n_kvh * nc), pv(n_kvh * nc);
+    for (int64_t g = 0; g < n_kvh; ++g) for (int64_t c = 0; c < nc; ++c) {
+        qk[g * nc + c] = rknpu_dec_get_ctx(mk, g, c);
+        pv[g * nc + c] = rknpu_dec_get_ctx(mv, g, c);
+        GGML_ASSERT(qk[g * nc + c] && pv[g * nc + c] && "RKNPU2: decode attention context creation failed");
+    }
+    const char* q_base = (const char*)get_tensor_real_ptr(q);
+    const char* m_base = (const char*)get_tensor_real_ptr(mask);
+    char* d_base = (char*)get_tensor_real_ptr(dst);
+    // row r of a KV head's batch = (head-in-group hh, query i): r = hh * n_q + i (as in the prefill path)
+    auto q_row = [&](int64_t g, int64_t r) { return (const float*)(q_base + (r % n_q) * q->nb[1] + (g * rk2 + r / n_q) * q->nb[2]); };
+    auto m_row = [&](int64_t r) { return (const ggml_fp16_t*)(m_base + (r % n_q) * mask->nb[1]); };
+
+    // 1. Q -> A of every QK chunk context, then the Q*K^T runs (one thread per KV head, on its own core)
+    #pragma omp parallel for num_threads(std::min<int64_t>(n_kvh, n_omp))
+    for (int64_t g = 0; g < n_kvh; ++g) {
+        uint16_t qh[RKNPU_DEC_DK];
+        rknpu_dec_ctx* c0 = qk[g * nc];
+        for (int64_t r = 0; r < R; ++r) {
+            rknpu_fp32_to_fp16(q_row(g, r), qh, RKNPU_DEC_DK);
+            rknpu2_native_scatter_row((uint8_t*)c0->A->virt_addr, (const uint8_t*)qh, (int32_t)r, c0->a_geom.m_stride, c0->a_geom.outer, c0->a_geom.sub * 2);
+        }
+        for (int64_t c = 0; c < nc; ++c) {
+            rknpu_dec_ctx* d = qk[g * nc + c];
+            if (c > 0) memcpy(d->A->virt_addr, c0->A->virt_addr, d->io.A.size);
+            rknn_mem_sync(d->ctx, d->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+            RKNN_CHECK(rknn_matmul_run(d->ctx), "decode Q*K^T");
+            rknn_mem_sync(d->ctx, d->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+        }
+    }
+    // 2. softmax per (KV head, row) over [0, n_kv); P into the A of every P*V chunk context
+    #pragma omp parallel for num_threads(n_omp)
+    for (int64_t x = 0; x < n_kvh * R; ++x) {
+        const int64_t g = x / R, r = x % R;
+        static thread_local std::vector<float> s, tmp;
+        static thread_local std::vector<uint16_t> p;
+        const int64_t np = nc * RKNPU_DEC_CHUNK;
+        if ((int64_t)s.size() < np) { s.resize(np); tmp.resize(np); p.resize(np); }
+        const ggml_fp16_t* mr = m_row(r);
+        int64_t lo, hi;
+        rknpu_softmax_range(mr, n_kv, &lo, &hi);
+        for (int64_t j = lo; j < hi; ++j) {
+            const rknpu_dec_ctx* d = qk[g * nc + j / RKNPU_DEC_CHUNK];
+            const int64_t n = j % RKNPU_DEC_CHUNK, sub = d->c_geom.sub;
+            s[j] = ggml_fp16_to_fp32(((const ggml_fp16_t*)d->C->virt_addr)[((size_t)(n / sub) * RKNPU_DEC_M + r) * sub + n % sub]);
+        }
+        rknpu_softmax_row(s.data(), mr, n_kv, lo, hi, scale, softcap, tmp.data(), p.data());
+        memset(p.data() + n_kv, 0, (np - n_kv) * sizeof(uint16_t));
+        for (int64_t c = 0; c < nc; ++c) {
+            rknpu_dec_ctx* d = pv[g * nc + c];
+            rknpu2_native_scatter_row((uint8_t*)d->A->virt_addr, (const uint8_t*)(p.data() + c * RKNPU_DEC_CHUNK), (int32_t)r, d->a_geom.m_stride, d->a_geom.outer, d->a_geom.sub * 2);
+        }
+    }
+    // 3. P*V runs, outputs summed over the chunks in chunk order, rows to dst
+    #pragma omp parallel for num_threads(std::min<int64_t>(n_kvh, n_omp))
+    for (int64_t g = 0; g < n_kvh; ++g) {
+        for (int64_t c = 0; c < nc; ++c) {
+            rknpu_dec_ctx* d = pv[g * nc + c];
+            rknn_mem_sync(d->ctx, d->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+            RKNN_CHECK(rknn_matmul_run(d->ctx), "decode P*V");
+            rknn_mem_sync(d->ctx, d->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+        }
+        for (int64_t r = 0; r < R; ++r) {
+            float* o = (float*)(d_base + ((r % n_q) * n_head + g * rk2 + r / n_q) * dst->nb[1]);
+            for (int64_t c = 0; c < nc; ++c) {
+                const rknpu_dec_ctx* d = pv[g * nc + c];
+                const float* C = (const float*)d->C->virt_addr;
+                const int sub = d->c_geom.sub;
+                for (int64_t t = 0; t < RKNPU_DEC_DK / sub; ++t) {
+                    const float* cell = C + ((size_t)t * RKNPU_DEC_M + r) * sub;
+                    if (c == 0) memcpy(o + t * sub, cell, sub * sizeof(float));
+                    else for (int e = 0; e < sub; ++e) o[t * sub + e] += cell[e];
+                }
+            }
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+
 // KV-cache writes of the fused K (normed + roped) and V (normed) rows:
 // SET_ROWS from a view of those outputs into an F16 (or F32) cache, with
 // ggml-cpu's conversion (round to nearest even) (RKNPU_KV_WRITE)
@@ -1261,9 +1620,6 @@ static bool rknpu_set_rows_supported(const struct ggml_tensor* op) {
     const struct ggml_tensor* src = b->view_src ? b->view_src : b;
     return (src->op == GGML_OP_ROPE && rknpu_rope_supported(src)) ||
            (src->op == GGML_OP_RMS_NORM && rknpu_head_norm_supported(src));
-}
-static inline int64_t rknpu_row_index(const struct ggml_tensor* idx, const void* base, int64_t i) {
-    return idx->type == GGML_TYPE_I64 ? ((const int64_t*)base)[i] : (int64_t)((const int32_t*)base)[i];
 }
 // one row into the cache
 static inline void rknpu_kv_store_row(const struct ggml_tensor* sr, char* cache, const void* idxp, int64_t i, const float* row) {
@@ -1857,7 +2213,7 @@ static bool rknpu_fa_supported(const struct ggml_tensor* op) {
     if (q->ne[3] % k->ne[3] != 0 || q->ne[3] % v->ne[3] != 0) return false;
     if (mask && q->ne[3] % mask->ne[3] != 0) return false;
     const int64_t DK = k->ne[0], DV = v->ne[0], n_q = q->ne[1], n_kv = k->ne[1];
-    if (n_q < 32) return false;                       // prefill only; decode stays on the CPU kernel
+    if (n_q < 32) return rknpu_fa_dec_supported(op);  // decode / verify: the KV-mirror path (head dim 512), else the CPU kernel
     if (DK % 32 != 0 || DV % 16 != 0 || n_kv % 32 != 0) return false;
     // Validated envelope: with P*V chunked (<= 2048 positions per run) every shape up to 32768
     // works; librknnrt aborts the process ("Failed to config layer") on some larger-K FP16 shapes,
@@ -1912,6 +2268,10 @@ static int rknpu_fa_rows() {
 }
 
 static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tensor* dst, int n_omp) {
+    if (dst->src[0]->ne[1] < 32) {   // decode / verify: NPU attention over the KV mirror (supports_op only lets these through)
+        rknpu_flash_attn_decode(dst, n_omp);
+        return;
+    }
     const struct ggml_tensor *q = dst->src[0], *k = dst->src[1], *v = dst->src[2], *mask = dst->src[3];
     ++bctx->attn_call;
     static const int64_t pv_chunk = []() {
@@ -2445,6 +2805,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
         if (!backend_ctx->done_nodes.empty() && backend_ctx->done_nodes.erase(node)) continue;
         if (node->op == GGML_OP_SET_ROWS) {   // KV-cache write not fused into its projection's dequant
             rknpu_set_rows_op(node, n_omp);
+            rknpu_mirror_after_set_rows(node, n_omp);
             continue;
         }
         if (node->op == GGML_OP_ROPE) {   // RoPE not fused into a projection's dequant
@@ -3571,7 +3932,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
             ++node_i;   // the GLU was computed inside this node's dequant
         }
         if (hn_last_node >= 0) node_i = hn_last_node;   // the norm (and MUL) were computed in its dequant
-        if (hn_kv_node) backend_ctx->done_nodes.insert(hn_kv_node);   // its cache write too
+        if (hn_kv_node) {   // its cache write too
+            backend_ctx->done_nodes.insert(hn_kv_node);
+            rknpu_mirror_after_set_rows(hn_kv_node, n_omp);
+        }
     }
     rknpu_materialize_deferred_gate(backend_ctx->deferred_gate, n_omp);
     backend_ctx->done_nodes.clear();   // pointers are only meaningful within this graph

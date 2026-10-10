@@ -205,7 +205,40 @@ static int check(void) {
     return 0;
 }
 
+// CHECK=2: does a row's result depend on its index within M (M=32 context, same row at index 0 and at 1..31)?
+static int check_rowpos(void) {
+    const int N = 2048, M = 32;
+    mm q, v;
+    if (mm_create(&q, M, DK, N, RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16, 0) || mm_create(&v, M, PVC, DV, RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32, 0)) { printf("create failed\n"); return 1; }
+    srand(7);
+    __fp16 * bq = q.B->virt_addr; for (size_t i = 0; i < q.io.B.size / 2; ++i) bq[i] = (__fp16)((rand() % 2001 - 1000) / 1000.0f);
+    __fp16 * bv = v.B->virt_addr; for (size_t i = 0; i < v.io.B.size / 2; ++i) bv[i] = (__fp16)((rand() % 2001 - 1000) / 1000.0f);
+    const int sq = q.io.A.dims[2], sv = v.io.A.dims[2], cq = q.io.C.dims[2], cv = v.io.C.dims[2];
+    __fp16 * aq = q.A->virt_addr; __fp16 * av = v.A->virt_addr;
+    // every row holds the same data (row 0's), so each output row must equal row 0's if position does not matter
+    srand(11);
+    __fp16 rq[DK], rv[PVC];
+    for (int k = 0; k < DK; ++k) rq[k] = (__fp16)((rand() % 2001 - 1000) / 4000.0f);
+    for (int k = 0; k < PVC; ++k) rv[k] = (__fp16)((rand() % 1000) / 1000000.0f);
+    for (int r = 0; r < M; ++r) {
+        for (int k = 0; k < DK; ++k) aq[((size_t)(k / sq) * M + r) * sq + k % sq] = rq[k];
+        for (int k = 0; k < PVC; ++k) av[((size_t)(k / sv) * M + r) * sv + k % sv] = rv[k];
+    }
+    rknn_mem_sync(q.ctx, q.A, RKNN_MEMORY_SYNC_TO_DEVICE); rknn_mem_sync(q.ctx, q.B, RKNN_MEMORY_SYNC_TO_DEVICE);
+    rknn_mem_sync(v.ctx, v.A, RKNN_MEMORY_SYNC_TO_DEVICE); rknn_mem_sync(v.ctx, v.B, RKNN_MEMORY_SYNC_TO_DEVICE);
+    rknn_matmul_run(q.ctx); rknn_matmul_run(v.ctx);
+    rknn_mem_sync(q.ctx, q.C, RKNN_MEMORY_SYNC_FROM_DEVICE); rknn_mem_sync(v.ctx, v.C, RKNN_MEMORY_SYNC_FROM_DEVICE);
+    int dq = 0, dv = 0;
+    for (int r = 1; r < M; ++r) {
+        for (int n = 0; n < N; ++n) dq += ((uint16_t *)q.C->virt_addr)[((size_t)(n / cq) * M + r) * cq + n % cq] != ((uint16_t *)q.C->virt_addr)[((size_t)(n / cq) * M) * cq + n % cq];
+        for (int n = 0; n < DV; ++n) dv += memcmp(&((float *)v.C->virt_addr)[((size_t)(n / cv) * M + r) * cv + n % cv], &((float *)v.C->virt_addr)[((size_t)(n / cv) * M) * cv + n % cv], 4) != 0;
+    }
+    printf("row-position invariance (M=32, identical rows): Q*K^T %d / %d differ from row 0, P*V %d / %d\n", dq, 31 * N, dv, 31 * DV);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (getenv("CHECK") && atoi(getenv("CHECK")) == 2) return check_rowpos();
     if (getenv("CHECK")) return check();
     const int reps = 10;
     if (getenv("SMT")) SMT = atoi(getenv("SMT"));
