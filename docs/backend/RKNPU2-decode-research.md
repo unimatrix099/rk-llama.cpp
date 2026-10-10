@@ -1388,6 +1388,59 @@ Design for the implementation:
 - Numerics change against the CPU path (FP32 accumulation on the NPU): the
   tolerant quality gate applies.
 
+#### 1o implementation status (2026-10-10 night, branch `wip/npu-decode-attn`, NOT production)
+
+Done (commits on `wip/npu-decode-attn`, on top of `rebase/w4a4-on-upstream` 0719a6579):
+- `RKNPU_FA_DEC` (default on in the wip branch): FLASH_ATTN with n_q < 32 and head dim 512
+  runs `rknpu_flash_attn_decode` over a global KV mirror (`g_kv_mirrors`, keyed by cache tensor).
+  K mirror: one Q*K^T run per KV head over all chunks (positions outermost -> one contiguous B);
+  V mirror: 2048-position P*V chunks; M = 32 contexts for decode and verify (n_q <= 8).
+- Mirror updated inside `rknpu_kv_store_row` (both the fused and the standalone KV write);
+  <= 8 rows clean their lines (`dc cvac`, 12 us per row), bigger writes set `needs_sync`
+  (one whole-buffer sync before the next decode). An update after the node was wrong: decode
+  collects are deferred, so the cache rows were not written yet.
+- Spot check per call (8 cells): a cache changed behind the backend's back (llama-bench clears
+  the KV cache between repetitions; a new context can reuse a tensor address) triggers a refill.
+  `RKNPU_FA_DEC_CHECK=1` compares the whole mirror with the cache every call (debug; passes).
+- `src/llama-context.cpp`: the auto flash-attention probe disabled FA for the whole model when
+  RKNPU took the 1-token attention from a CPU layer (pp512 fell to 177); now allowed.
+- Probe additions: rows are bit-identical for M = 4 vs 24 and at any row position in M = 32.
+
+Measured (llama-bench tg32, t/s; tg includes one mirror refill per repetition):
+
+| depth | CPU attention (before) | NPU decode attention |
+|---|---|---|
+| 0 | 8.98 | 8.60 (-4%: fixed per-call overhead) |
+| 4096 | 7.52 | 7.71 |
+| 16384 | 5.63 | 6.59 (+17%) |
+| 32768 | 4.31 | 5.52-5.58 (+29%) |
+
+Per global layer at 32k: Q*K^T 3.4 ms, softmax 1.0, P*V 4.0 (17 chunk runs per head) = 8.4 ms
+(probe: 7.2). pp512 300, pp16384 182 (unchanged).
+
+To do next (in order):
+1. MTP exactness on the server with the decode path: `~/ident.sh` (base1 vs mtp1, 12.8k
+   summary) and the 10-request server stage (`STAGES=server ~/prodtest.sh`); then the 6-prompt
+   holdout. Decode now differs numerically from the CPU path (expected), but MTP vs no-draft must
+   stay byte-identical.
+2. Quality: guard (PPL/KLD unaffected - prefill only - but run it), plus a long-context check:
+   needle + summaries at 12.8k/24.8k vs the CPU-attention outputs (coherent, needle found).
+3. Speed: P*V is now the largest part (17 runs per head at 32k, each with A/C syncs): try 4096-
+   position V chunks (the FP16 K-collapse starts past 4096), or spread the P*V chunks over all 3
+   cores; drop the per-call vector allocations. Fixed overhead at short context (-4% at depth 0):
+   consider using the CPU below ~2k cells ONLY if it can be done without breaking MTP identity
+   (the choice must not depend on the batch; n_kv is the same for... check), otherwise accept.
+4. Teardown: "failed to destroy handle" at exit (the from_fd B views are destroyed after the
+   mirror memory / domain contexts); destroy views before the mirror buffer.
+5. Context shift (`--context-shift`) rewrites the cache without this backend: the spot check
+   may miss it; document or hook ROPE-on-cache.
+6. Then: production suite with RKNPU_FA_DEC on, docs, fold into `main` as its own `rknpu2:`
+   commit (+ the llama-context commit as a generic one), push after review.
+
+Board state at shutdown: checkout = wip commit 46462ce68 (decode path ON by default), clean
+tree. **Before production use, check out `main` (d73e89936) and rebuild** - or run with
+`RKNPU_FA_DEC=0`.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
