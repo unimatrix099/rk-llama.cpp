@@ -1305,6 +1305,7 @@ struct rknpu_kv_mirror {   // one cache tensor (K or V), all its KV heads
     rknn_tensor_mem* mem = nullptr;   // all heads, head h at h * head_bytes
     int sN = 0, sK = 0;               // native B cell geometry
     std::vector<std::unique_ptr<rknpu_dec_ctx>> ctxs;   // [head][chunk], created on first use
+    std::atomic<bool> needs_sync{false};                // bulk writes: one whole-buffer sync before the next use
 };
 
 struct rknpu_kv_mirrors {
@@ -1343,6 +1344,31 @@ static void rknpu_mirror_store(rknpu_kv_mirror* m, int64_t pos, bool clean) {
                 uint16_t* p = hb + rknpu_mirror_v_off(m, pos, d);
                 *p = src[d];
                 if (clean) rknpu_clean_line(p);
+            }
+        }
+    }
+}
+
+// (re)fill the whole mirror from the cache: every cell, written or not, so no read sees stale bytes
+static void rknpu_mirror_fill(rknpu_kv_mirror* m) {
+    #pragma omp parallel for
+    for (int64_t pos = 0; pos < m->kv_size; ++pos) rknpu_mirror_store(m, pos, false);
+    rknn_mem_sync(m->alloc_ctx, m->mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+    m->needs_sync = false;
+}
+
+// spot check: a few cells of [0, n_kv) equal in cache and mirror (a new cache at a reused tensor
+// address, or a write that bypassed this backend, would differ); refill when not
+static void rknpu_mirror_validate(rknpu_kv_mirror* m, int64_t n_kv) {
+    const struct ggml_tensor* t = m->cache;
+    const int64_t probes[8] = { 0, n_kv / 7, 2 * n_kv / 7, 3 * n_kv / 7, 4 * n_kv / 7, 5 * n_kv / 7, 6 * n_kv / 7, n_kv - 1 };
+    for (int64_t pos : probes) {
+        const uint16_t* row = (const uint16_t*)((const char*)get_tensor_real_ptr(t) + pos * t->nb[1]);
+        for (int64_t h = 0; h < m->n_kvh; ++h) for (int64_t d = 0; d < RKNPU_DEC_DK; d += 61) {
+            const size_t o = m->is_v ? rknpu_mirror_v_off(m, pos, d) : rknpu_mirror_k_off(m, pos, d);
+            if (rknpu_mirror_head(m, h)[o] != row[h * RKNPU_DEC_DK + d]) {
+                rknpu_mirror_fill(m);
+                return;
             }
         }
     }
@@ -1427,12 +1453,9 @@ static rknpu_kv_mirror* rknpu_mirror_get(const struct ggml_tensor* cache, bool i
         g_domain_manager.release_domain_memory(m->domain, bytes);
         return nullptr;
     }
-    memset(m->mem->virt_addr, 0, bytes);   // unwritten cells must be finite (P = 0 there)
+    memset(m->mem->virt_addr, 0, bytes);   // cells past kv_size must be finite (P = 0 there)
     m->ctxs.resize(n_kvh * m->n_chunks);
-    // fill from the cache: every cell, written or not, so later reads never see stale bytes
-    #pragma omp parallel for
-    for (int64_t pos = 0; pos < m->kv_size; ++pos) rknpu_mirror_store(m.get(), pos, false);
-    rknn_mem_sync(m->alloc_ctx, m->mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+    rknpu_mirror_fill(m.get());
     rknpu_kv_mirror* r = m.get();
     map.emplace(cache, std::move(m));
     return r;
@@ -1445,37 +1468,26 @@ static rknpu_kv_mirror* rknpu_mirror_find(const struct ggml_tensor* cache, bool 
     return it == map.end() ? nullptr : it->second.get();
 }
 
-// after a KV-cache write (SET_ROWS into a view of `sr->view_src`): update its mirrors, if any
-static void rknpu_mirror_after_set_rows(const struct ggml_tensor* sr, int n_omp) {
+// the mirrors of the cache a KV-cache write (SET_ROWS into a view of `sr->view_src`) goes to
+static void rknpu_mirrors_of(const struct ggml_tensor* sr, rknpu_kv_mirror* out[2]) {
+    out[0] = out[1] = nullptr;
     const struct ggml_tensor* cache = sr->view_src;
     if (!cache) return;
-    rknpu_kv_mirror* ms[2] = { rknpu_mirror_find(cache, false), rknpu_mirror_find(cache, true) };
-    if (!ms[0] && !ms[1]) return;
-    GGML_ASSERT(sr->view_offs == 0 && sr->nb[1] == cache->nb[1] && "RKNPU2: KV mirror expects a whole-row cache write");
-    const struct ggml_tensor* idx = sr->src[1];
-    const void* ip = get_tensor_real_ptr(idx);
-    const int64_t n = idx->ne[0];
-    for (rknpu_kv_mirror* m : ms) {
-        if (!m) continue;
-        // write all rows, then clean: V rows share cache lines, so no line is cleaned while another thread writes it
-        #pragma omp parallel for num_threads(n_omp) if(n > 8)
-        for (int64_t i = 0; i < n; ++i) rknpu_mirror_store(m, rknpu_row_index(idx, ip, i), false);
-        // a line clean writes the line back on its own (~us each): for a prompt batch one whole-buffer sync is cheaper
-        if (n > 8) {
-            rknn_mem_sync(m->alloc_ctx, m->mem, RKNN_MEMORY_SYNC_TO_DEVICE);
-            continue;
-        }
-        #pragma omp parallel for num_threads(n_omp) if(n > 8)
-        for (int64_t i = 0; i < n; ++i) {
-            const int64_t pos = rknpu_row_index(idx, ip, i);
-            for (int64_t h = 0; h < m->n_kvh; ++h) {
-                uint16_t* hb = rknpu_mirror_head(m, h);
-                if (!m->is_v) for (int64_t d = 0; d < RKNPU_DEC_DK; d += 32) rknpu_clean_line(hb + rknpu_mirror_k_off(m, pos, d));
-                else          for (int64_t d = 0; d < RKNPU_DEC_DK; ++d) rknpu_clean_line(hb + rknpu_mirror_v_off(m, pos, d));
-            }
-        }
+    out[0] = rknpu_mirror_find(cache, false);
+    out[1] = rknpu_mirror_find(cache, true);
+    if (out[0] || out[1]) GGML_ASSERT(sr->view_offs == 0 && sr->nb[1] == cache->nb[1] && "RKNPU2: KV mirror expects a whole-row cache write");
+}
+// cell `pos` was just written to the cache: copy it to the mirrors. Up to 8 rows (decode, verify)
+// clean their own lines (a clean only writes back, so rows sharing a V line on other threads are
+// safe); bigger writes leave one whole-buffer sync to the next decode attention
+static inline void rknpu_mirrors_store(rknpu_kv_mirror* const m[2], int64_t pos, int64_t n_rows) {
+    for (int t = 0; t < 2; ++t) {
+        if (!m[t]) continue;
+        const bool clean = n_rows <= 8;
+        rknpu_mirror_store(m[t], pos, clean);
+        if (clean) rknpu_clean_fence();
+        else m[t]->needs_sync = true;
     }
-    rknpu_clean_fence();
 }
 
 static bool rknpu_fa_dec_supported(const struct ggml_tensor* op) {
@@ -1506,6 +1518,11 @@ static void rknpu_flash_attn_decode(struct ggml_tensor* dst, int n_omp) {
     rknpu_kv_mirror* mk = rknpu_mirror_get(k->view_src, false, n_kvh);
     rknpu_kv_mirror* mv = rknpu_mirror_get(v->view_src, true, n_kvh);
     GGML_ASSERT(mk && mv && "RKNPU2: KV mirror unavailable");
+    for (rknpu_kv_mirror* m : { mk, mv }) {
+        rknpu_mirror_validate(m, n_kv);
+        if (m->needs_sync.exchange(false)) rknn_mem_sync(m->alloc_ctx, m->mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+    }
+    rknpu_clean_fence();
     static const bool check = []() { const char* e = std::getenv("RKNPU_FA_DEC_CHECK"); return e && std::atoi(e) != 0; }();
     if (check) {   // debug: the mirror must equal the cache over [0, n_kv)
         int64_t bad = 0;
@@ -1622,20 +1639,24 @@ static bool rknpu_set_rows_supported(const struct ggml_tensor* op) {
            (src->op == GGML_OP_RMS_NORM && rknpu_head_norm_supported(src));
 }
 // one row into the cache
-static inline void rknpu_kv_store_row(const struct ggml_tensor* sr, char* cache, const void* idxp, int64_t i, const float* row) {
+static inline void rknpu_kv_store_row(const struct ggml_tensor* sr, char* cache, const void* idxp, int64_t i, const float* row,
+                                      rknpu_kv_mirror* const mirrors[2]) {
     const int64_t c = rknpu_row_index(sr->src[1], idxp, i);
     GGML_ASSERT(c >= 0 && c < sr->ne[1]);
     char* d = cache + c * sr->nb[1];
     if (sr->type == GGML_TYPE_F16) rknpu_fp32_to_fp16(row, (uint16_t*)d, sr->ne[0]);
     else memcpy(d, row, sr->ne[0] * sizeof(float));
+    if (mirrors[0] || mirrors[1]) rknpu_mirrors_store(mirrors, c, sr->src[1]->ne[0]);
 }
 static void rknpu_set_rows_op(struct ggml_tensor* sr, int n_omp) {
     const struct ggml_tensor* b = sr->src[0];
     const char* bp = (const char*)get_tensor_real_ptr(b);
     const void* ip = get_tensor_real_ptr(sr->src[1]);
     char* cache = (char*)get_tensor_real_ptr(sr);
+    rknpu_kv_mirror* mirrors[2];
+    rknpu_mirrors_of(sr, mirrors);
     #pragma omp parallel for num_threads(n_omp)
-    for (int64_t i = 0; i < b->ne[1]; ++i) rknpu_kv_store_row(sr, cache, ip, i, (const float*)(bp + i * b->nb[1]));
+    for (int64_t i = 0; i < b->ne[1]; ++i) rknpu_kv_store_row(sr, cache, ip, i, (const float*)(bp + i * b->nb[1]), mirrors);
 }
 
 static bool rknpu_glu_supported(const struct ggml_tensor* op) {
@@ -2805,7 +2826,6 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
         if (!backend_ctx->done_nodes.empty() && backend_ctx->done_nodes.erase(node)) continue;
         if (node->op == GGML_OP_SET_ROWS) {   // KV-cache write not fused into its projection's dequant
             rknpu_set_rows_op(node, n_omp);
-            rknpu_mirror_after_set_rows(node, n_omp);
             continue;
         }
         if (node->op == GGML_OP_ROPE) {   // RoPE not fused into a projection's dequant
@@ -3482,6 +3502,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                         const float* rff = nullptr;
                         char* kv_cache = hn_kv ? (char*)get_tensor_real_ptr(hn_kv) : nullptr;
                         const void* kv_idx = hn_kv ? get_tensor_real_ptr(hn_kv->src[1]) : nullptr;
+                        rknpu_kv_mirror* kv_mirrors[2] = { nullptr, nullptr };
+                        if (hn_kv) rknpu_mirrors_of(hn_kv, kv_mirrors);
                         if (hn_rope) {
                             rp = rknpu_rope_get(hn_rope);
                             rpos = (const int32_t*)get_tensor_real_ptr(hn_rope->src[1]);
@@ -3515,7 +3537,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                                     rknpu_head_norm(y + h, x + h, hd, hn_eps, hn_w);
                                     if (hn_rope) rknpu_rope_head(y + h, y + h, rcache.data(), hd, rp);
                                 }
-                                if (hn_kv) rknpu_kv_store_row(hn_kv, kv_cache, kv_idx, m0 + r0 + r, y);
+                                if (hn_kv) rknpu_kv_store_row(hn_kv, kv_cache, kv_idx, m0 + r0 + r, y, kv_mirrors);
                             }
                         }
                     };
@@ -3932,10 +3954,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
             ++node_i;   // the GLU was computed inside this node's dequant
         }
         if (hn_last_node >= 0) node_i = hn_last_node;   // the norm (and MUL) were computed in its dequant
-        if (hn_kv_node) {   // its cache write too
-            backend_ctx->done_nodes.insert(hn_kv_node);
-            rknpu_mirror_after_set_rows(hn_kv_node, n_omp);
-        }
+        if (hn_kv_node) backend_ctx->done_nodes.insert(hn_kv_node);   // its cache write too
     }
     rknpu_materialize_deferred_gate(backend_ctx->deferred_gate, n_omp);
     backend_ctx->done_nodes.clear();   // pointers are only meaningful within this graph
