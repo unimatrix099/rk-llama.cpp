@@ -533,7 +533,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // but is still wrong for cases like --no-kv-offload.
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
 
-            if (device_fused != device_layer) {
+            // a CPU layer whose fused op an accelerator backend takes (e.g. RKNPU2 decode attention)
+            // is supported; the check is for an op falling back from the layer's device
+            const bool taken_from_cpu = device_fused && device_layer &&
+                ggml_backend_dev_type(device_layer) == GGML_BACKEND_DEVICE_TYPE_CPU;
+
+            if (device_fused != device_layer && !taken_from_cpu) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
                         "is assigned to device %s (usually due to missing support)\n",
                         func, node.il,
