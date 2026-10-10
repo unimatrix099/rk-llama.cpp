@@ -73,6 +73,11 @@ struct Rknpu2HardwarePipeline {
 
     int effective_k;            // Specific K limit for matrix tiling
     bool use_hadamard;          // Flag for using Hadamard Transform
+
+    // Layout for the A/C matrices. NATIVE avoids the runtime's per-run
+    // repacking, which costs ~80x for INT4 (see
+    // docs/backend/RKNPU2-int4-research.md). B is always NATIVE.
+    rknn_matmul_layout ac_layout;
 };
 
 /**

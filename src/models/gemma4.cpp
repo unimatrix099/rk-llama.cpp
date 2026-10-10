@@ -222,7 +222,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
 
             Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
 
-            Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+            // rms_norm + mul as build_norm does, but without its "norm" name:
+            // llama pins tensors named "norm" to the layer's device, which keeps
+            // a backend that runs the projection from fusing the head norm
+            Qcur = ggml_mul(ctx0, ggml_rms_norm(ctx0, Qcur, hparams.f_norm_rms_eps), model.layers[il].attn_q_norm);
             cb(Qcur, "Qcur_normed", il);
 
             Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
@@ -253,7 +256,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
-            Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+            Kcur = ggml_mul(ctx0, ggml_rms_norm(ctx0, Kcur, hparams.f_norm_rms_eps), model.layers[il].attn_k_norm);   // as Qcur
             Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
 
             cb(Kcur, "Kcur_normed", il);

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <arm_neon.h>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 
 namespace {
@@ -62,9 +63,50 @@ const std::vector<std::string>* Rknpu2DeviceConfig::get_active_pattern(int tenso
     return &it->second;
 }
 
+// RKNPU_EXCLUDE=<substr>[,<substr>...] - diagnostic filter. Any weight
+// whose name contains one of the substrings is never offloaded: it keeps
+// its original bytes (get_tensor_packed_size falls back to ggml_nbytes and
+// set_tensor to a plain memcpy) and its ops are rejected by supports_op, so
+// the CPU computes from valid data. Exists because `--override-tensor` does
+// not move tensors out of this backend's buffers - the RKNPU allocation is
+// unchanged by `-ot ".*=CPU"` - which makes it useless for bisecting which
+// tensor class is responsible for a wrong-output bug.
+static const std::vector<std::string>& excluded_name_substrings() {
+    static const std::vector<std::string> list = []() {
+        std::vector<std::string> v;
+        const char* env = std::getenv("RKNPU_EXCLUDE");
+        if (env != nullptr) v = split_string(env, ',');
+        return v;
+    }();
+    return list;
+}
+
+// RKNPU_EXCLUDE_TYPES=<type>[,<type>...] - same as RKNPU_EXCLUDE, but keyed
+// on the weight's ggml type name (e.g. "f16"). Exists for speculative
+// decoding: an MTP drafter shares block names with its target (blk.0 ...),
+// so a name filter cannot keep the drafter on the CPU without also taking
+// the target's first layers with it, while the type cleanly separates an
+// F16 drafter from a Q4_0 target.
+static const std::vector<std::string>& excluded_type_names() {
+    static const std::vector<std::string> list = []() {
+        std::vector<std::string> v;
+        const char* env = std::getenv("RKNPU_EXCLUDE_TYPES");
+        if (env != nullptr) v = split_string(env, ',');
+        return v;
+    }();
+    return list;
+}
+
 const Rknpu2HardwarePipeline* Rknpu2DeviceConfig::resolve_op_support(const struct ggml_tensor* w_tensor) const {
     if (!w_tensor) return nullptr;
 
+    // NOTE: the RKNPU_EXCLUDE test is applied *after* the sequence number is
+    // assigned, further down. Rejecting here would skip the
+    // tensor_sequence_map insert, shifting the sequence number of every
+    // later tensor and therefore its position in a cyclic pattern (Q6_K maps
+    // to {W8A8_STANDARD, W4A4_HADAMARD}). A bisection tool that silently
+    // re-assigns the pipelines of the tensors it is *not* excluding measures
+    // the wrong thing.
     auto find_pipeline = [this](const std::string& name) -> const Rknpu2HardwarePipeline* {
         for (const auto& pipe : hardware_pipelines) {
             if (pipe.pipeline_name == name) return &pipe;
@@ -94,6 +136,18 @@ const Rknpu2HardwarePipeline* Rknpu2DeviceConfig::resolve_op_support(const struc
     // Assigning the next sequence number if this tensor is seen for the first time
     if (tensor_sequence_map.find(name) == tensor_sequence_map.end()) {
         tensor_sequence_map[name] = global_tensor_counter++;
+    }
+
+    // Diagnostic exclusion, applied only now that the sequence number is
+    // fixed, so excluding a tensor cannot change any other tensor's pipeline
+    const auto& excludes = excluded_name_substrings();
+    if (!excludes.empty() && w_tensor->name[0] != '\0') {
+        for (const auto& sub : excludes) {
+            if (std::strstr(w_tensor->name, sub.c_str()) != nullptr) return nullptr;
+        }
+    }
+    for (const auto& type_name : excluded_type_names()) {
+        if (type_name == ggml_type_name(w_tensor->type)) return nullptr;
     }
 
     // Selecting the pipeline cyclically based on the defined pattern
@@ -129,6 +183,20 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
         custom_cores = parse_int_list(env_cores);
     }
 
+    // Native A/C layout for the INT4 pipelines (default on; set
+    // RKNPU_AC_NATIVE=0 to opt out). Removes the runtime's serial per-run
+    // A repack that caps INT4 matmul throughput at ~44 GOPS with the NORM
+    // layout; with NATIVE the same matmuls reach 3.6-3.9 TOPS (E4B Q4_0
+    // prefill 7.7 -> 31.9 t/s end to end, bit-identical results - see
+    // docs/backend/RKNPU2-native-layout-plan.md). Read once - the value
+    // must not change at runtime because created matmul contexts and
+    // cached A/C buffers depend on it.
+    const char* env_ac_native = std::getenv("RKNPU_AC_NATIVE");
+    const rknn_matmul_layout w4a4_ac_layout =
+        (env_ac_native != nullptr && std::atoi(env_ac_native) == 0)
+            ? RKNN_MM_LAYOUT_NORM
+            : RKNN_MM_LAYOUT_NATIVE;
+
     // --- Define RK3588 Configuration ---
     Rknpu2DeviceConfig rk3588_config;
     rk3588_config.device_name = "RK3588";
@@ -144,7 +212,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 16,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ false
+            /* .use_hadamard  = */ false,
+            /* .ac_layout     = */ RKNN_MM_LAYOUT_NORM
         },
         {
             /* .pipeline_name = */ "W16A16_HADAMARD",
@@ -155,7 +224,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 16,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ true
+            /* .use_hadamard  = */ true,
+            /* .ac_layout     = */ RKNN_MM_LAYOUT_NORM
         },
         {
             /* .pipeline_name = */ "W8A8_STANDARD",
@@ -166,7 +236,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 32,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ false
+            /* .use_hadamard  = */ false,
+            /* .ac_layout     = */ RKNN_MM_LAYOUT_NORM
         },
         {
             /* .pipeline_name = */ "W8A8_HADAMARD",
@@ -177,7 +248,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 32,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ true
+            /* .use_hadamard  = */ true,
+            /* .ac_layout     = */ RKNN_MM_LAYOUT_NORM
         },
         {
             /* .pipeline_name = */ "W4A4_STANDARD",
@@ -188,7 +260,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 64,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ false
+            /* .use_hadamard  = */ false,
+            /* .ac_layout     = */ w4a4_ac_layout
         },
         {
             /* .pipeline_name = */ "W4A4_HADAMARD",
@@ -199,7 +272,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 64,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ true
+            /* .use_hadamard  = */ true,
+            /* .ac_layout     = */ w4a4_ac_layout
         }
     };
 
@@ -210,6 +284,11 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
     // Defining default quantization sequences for each supported ggml_type
     rk3588_config.default_patterns[(int)GGML_TYPE_F16]  = {"W16A16_STANDARD"};
     rk3588_config.default_patterns[(int)GGML_TYPE_Q8_0] = {"W8A8_STANDARD"};
+    // BF16 weights (Gemma-4's per_layer_model_proj, 2560x10752) otherwise
+    // run on the CPU, where ggml has no SIMD bf16 GEMM: at pp512 that one
+    // tensor was a third of all CPU samples. int8 per-channel is the
+    // pipeline that measures ~2% from CPU quality on every model tried.
+    rk3588_config.default_patterns[(int)GGML_TYPE_BF16] = {"W8A8_STANDARD"};
     rk3588_config.default_patterns[(int)GGML_TYPE_Q6_K] = {"W8A8_STANDARD", "W4A4_HADAMARD"};
     rk3588_config.default_patterns[(int)GGML_TYPE_Q4_0] = {"W4A4_HADAMARD"};
 

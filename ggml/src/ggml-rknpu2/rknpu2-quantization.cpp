@@ -25,24 +25,296 @@ void convert_fp32_to_fp16(const float * src, uint16_t * dst, size_t n_elements) 
 
 void quantize_fp32_to_int8(const float * src, int8_t * dst, size_t n_elements, float scale) {
     const float iscale = (scale == 0.0f) ? 0.0f : 1.0f / scale;
-    for (size_t i = 0; i < n_elements; ++i) {
+    size_t i = 0;
+#ifdef __ARM_NEON
+    // vcvtaq rounds half away from zero, matching roundf exactly
+    const float32x4_t vi = vdupq_n_f32(iscale);
+    for (; i + 16 <= n_elements; i += 16) {
+        int32x4_t a = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i),      vi));
+        int32x4_t b = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i + 4),  vi));
+        int32x4_t c = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i + 8),  vi));
+        int32x4_t d = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i + 12), vi));
+        int16x8_t ab = vcombine_s16(vmovn_s32(a), vmovn_s32(b));
+        int16x8_t cd = vcombine_s16(vmovn_s32(c), vmovn_s32(d));
+        vst1q_s8(dst + i, vcombine_s8(vmovn_s16(ab), vmovn_s16(cd)));
+    }
+#endif
+    for (; i < n_elements; ++i) {
         dst[i] = (int8_t)roundf(src[i] * iscale);
     }
 }
 
 void quantize_fp32_to_int4_packed(const float * src, uint8_t * dst, size_t n_elements, float scale) {
     const float iscale = (scale == 0.0f) ? 0.0f : 1.0f / scale;
-    for (size_t i = 0; i < n_elements / 2; ++i) {
+    size_t i2 = 0;   // element index (pairs consumed below as i2/2)
+#ifdef __ARM_NEON
+    const float32x4_t vi = vdupq_n_f32(iscale);
+    const int32x4_t lo = vdupq_n_s32(-7), hi = vdupq_n_s32(7);
+    for (; i2 + 16 <= n_elements; i2 += 16) {
+        int32x4_t a = vmaxq_s32(lo, vminq_s32(hi, vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i2),      vi))));
+        int32x4_t b = vmaxq_s32(lo, vminq_s32(hi, vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i2 + 4),  vi))));
+        int32x4_t c = vmaxq_s32(lo, vminq_s32(hi, vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i2 + 8),  vi))));
+        int32x4_t d = vmaxq_s32(lo, vminq_s32(hi, vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src + i2 + 12), vi))));
+        int16x8_t ab = vcombine_s16(vmovn_s32(a), vmovn_s32(b));
+        int16x8_t cd = vcombine_s16(vmovn_s32(c), vmovn_s32(d));
+        uint8x16_t u = vreinterpretq_u8_s8(vcombine_s8(vmovn_s16(ab), vmovn_s16(cd)));
+        uint8x8x2_t z = vuzp_u8(vget_low_u8(u), vget_high_u8(u));
+        uint8x8_t packed = vorr_u8(vand_u8(z.val[0], vdup_n_u8(0x0F)),
+                                   vshl_n_u8(vand_u8(z.val[1], vdup_n_u8(0x0F)), 4));
+        vst1_u8(dst + i2 / 2, packed);
+    }
+#endif
+    for (size_t i = i2 / 2; i < n_elements / 2; ++i) {
         float v0_f = src[i * 2 + 0] * iscale;
         float v1_f = src[i * 2 + 1] * iscale;
 
-        int8_t v0_i = std::max((int8_t)-7, std::min((int8_t)7, (int8_t)roundf(v0_f)));
-        int8_t v1_i = std::max((int8_t)-7, std::min((int8_t)7, (int8_t)roundf(v1_f)));
+        // clamp in int32 before narrowing (the previous int8 cast wrapped
+        // for |v| >= 127.5, sign-flipping extreme outliers before the
+        // clamp; matches the NEON body above)
+        int32_t v0_i = std::max(-7, std::min(7, (int32_t)roundf(v0_f)));
+        int32_t v1_i = std::max(-7, std::min(7, (int32_t)roundf(v1_f)));
 
         dst[i] = ((uint8_t)v0_i & 0x0F) | (((uint8_t)v1_i & 0x0F) << 4);
     }
 }
 
+
+// --- Row helpers for the activation prep path ---
+
+float amax_fp32(const float * src, size_t n_elements) {
+    float m = 0.0f;
+    size_t i = 0;
+#ifdef __ARM_NEON
+    float32x4_t vm = vdupq_n_f32(0.0f);
+    for (; i + 4 <= n_elements; i += 4) {
+        vm = vmaxq_f32(vm, vabsq_f32(vld1q_f32(src + i)));
+    }
+    m = vmaxvq_f32(vm);
+#endif
+    for (; i < n_elements; ++i) {
+        m = std::max(m, std::abs(src[i]));
+    }
+    return m;
+}
+
+void mul_fp32(float * dst, const float * a, const float * b, size_t n_elements) {
+    size_t i = 0;
+#ifdef __ARM_NEON
+    for (; i + 4 <= n_elements; i += 4) {
+        vst1q_f32(dst + i, vmulq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
+    }
+#endif
+    for (; i < n_elements; ++i) {
+        dst[i] = a[i] * b[i];
+    }
+}
+
+void dequant_acc_int16_to_fp32(float * dst, const int16_t * src, size_t n_elements, float scale) {
+    size_t i = 0;
+#ifdef __ARM_NEON
+    const float32x4_t vs = vdupq_n_f32(scale);
+    for (; i + 8 <= n_elements; i += 8) {
+        int16x8_t s16 = vld1q_s16(src + i);
+        float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16)));
+        float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16)));
+        vst1q_f32(dst + i,     vfmaq_f32(vld1q_f32(dst + i),     f0, vs));
+        vst1q_f32(dst + i + 4, vfmaq_f32(vld1q_f32(dst + i + 4), f1, vs));
+    }
+#endif
+    for (; i < n_elements; ++i) {
+        // explicitly fused to match the vector body (vfmaq) at any
+        // optimization level
+        dst[i] = fmaf((float)src[i], scale, dst[i]);
+    }
+}
+
+void dequant_acc_int16_tiled(float * dst, const int16_t * src_native,
+                             int32_t m, int32_t m_stride, int32_t outer, int32_t sub,
+                             int32_t n_limit, float scale) {
+    for (int32_t t = 0; t < outer; ++t) {
+        const int16_t * cell = src_native + ((size_t)t * m_stride + m) * sub;
+        const int32_t n0 = t * sub;
+        const int32_t lim = std::min(sub, n_limit - n0);
+        if (lim <= 0) {
+            break;
+        }
+        dequant_acc_int16_to_fp32(dst + n0, cell, (size_t)lim, scale);
+    }
+}
+
+void dequant_acc_int16_to_fp32_perchan(float * dst, const int16_t * src, size_t n_elements,
+                                       float common, const float * chan_scales) {
+    size_t i = 0;
+#ifdef __ARM_NEON
+    const float32x4_t vc = vdupq_n_f32(common);
+    for (; i + 8 <= n_elements; i += 8) {
+        int16x8_t s16 = vld1q_s16(src + i);
+        float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16)));
+        float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16)));
+        float32x4_t sc0 = vmulq_f32(vld1q_f32(chan_scales + i),     vc);
+        float32x4_t sc1 = vmulq_f32(vld1q_f32(chan_scales + i + 4), vc);
+        vst1q_f32(dst + i,     vfmaq_f32(vld1q_f32(dst + i),     f0, sc0));
+        vst1q_f32(dst + i + 4, vfmaq_f32(vld1q_f32(dst + i + 4), f1, sc1));
+    }
+#endif
+    for (; i < n_elements; ++i) {
+        // mul-then-fma, matching the vector body exactly
+        dst[i] = fmaf((float)src[i], chan_scales[i] * common, dst[i]);
+    }
+}
+
+void dequant_acc_int32_to_fp32_perchan(float * dst, const int32_t * src, size_t n_elements,
+                                       float common, const float * chan_scales) {
+    size_t i = 0;
+#ifdef __ARM_NEON
+    const float32x4_t vc = vdupq_n_f32(common);
+    for (; i + 4 <= n_elements; i += 4) {
+        float32x4_t f = vcvtq_f32_s32(vld1q_s32(src + i));
+        float32x4_t sc = vmulq_f32(vld1q_f32(chan_scales + i), vc);
+        vst1q_f32(dst + i, vfmaq_f32(vld1q_f32(dst + i), f, sc));
+    }
+#endif
+    for (; i < n_elements; ++i) {
+        dst[i] = fmaf((float)src[i], chan_scales[i] * common, dst[i]);
+    }
+}
+
+void dequant_acc_int32_tiled_perchan(float * dst, const int32_t * src_native,
+                                     int32_t m, int32_t m_stride, int32_t outer, int32_t sub,
+                                     int32_t n_limit, float common, const float * chan_scales) {
+    for (int32_t t = 0; t < outer; ++t) {
+        const int32_t * cell = src_native + ((size_t)t * m_stride + m) * sub;
+        const int32_t n0 = t * sub;
+        const int32_t lim = std::min(sub, n_limit - n0);
+        if (lim <= 0) {
+            break;
+        }
+        dequant_acc_int32_to_fp32_perchan(dst + n0, cell, (size_t)lim, common, chan_scales + n0);
+    }
+}
+
+void dequant_acc_int16_tiled_perchan(float * dst, const int16_t * src_native,
+                                     int32_t m, int32_t m_stride, int32_t outer, int32_t sub,
+                                     int32_t n_limit, float common, const float * chan_scales) {
+    for (int32_t t = 0; t < outer; ++t) {
+        const int16_t * cell = src_native + ((size_t)t * m_stride + m) * sub;
+        const int32_t n0 = t * sub;
+        const int32_t lim = std::min(sub, n_limit - n0);
+        if (lim <= 0) {
+            break;
+        }
+        dequant_acc_int16_to_fp32_perchan(dst + n0, cell, (size_t)lim, common, chan_scales + n0);
+    }
+}
+
+// Same arithmetic as dequant_acc_int16_tiled_perchan, row block at a time:
+// rows m0 .. m0+nrows-1 of the native [outer, m_stride, sub] C, written to
+// dst rows spaced dst_stride floats apart, each with its own common scale.
+// Consecutive rows of one tile are adjacent in the native layout, so walking
+// tile-major over a row block reads C sequentially instead of one cell per
+// cache line, and the per-cell body is inlined instead of a call per cell.
+// Per element it is exactly dequant_acc_int16_to_fp32_perchan (same vector
+// body for full 8-groups, same mul-then-fma tail), so results are identical.
+void dequant_acc_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const int16_t * src_native,
+                                          int32_t m0, int32_t nrows, int32_t m_stride, int32_t outer, int32_t sub,
+                                          int32_t n_limit, const float * common, const float * chan_scales, bool store) {
+    for (int32_t t = 0; t < outer; ++t) {
+        const int32_t n0 = t * sub;
+        const int32_t lim = std::min(sub, n_limit - n0);
+        if (lim <= 0) {
+            break;
+        }
+        for (int32_t r = 0; r < nrows; ++r) {
+            const int16_t * cell = src_native + ((size_t)t * m_stride + m0 + r) * sub;
+            float * d = dst + (size_t)r * dst_stride + n0;
+            const float * cs = chan_scales + n0;
+            size_t i = 0;
+#if defined(__aarch64__)
+            // Storing (first K-segment, dst not zeroed): zero-allocate each
+            // 64-byte destination line with DC ZVA before writing it, so the
+            // line is not first read from DRAM only to be overwritten (the
+            // read-for-ownership was ~40% of this kernel's traffic). Only for
+            // lines that are aligned and fully overwritten here: with 8-wide
+            // cells, tiles t and t+1 write the 16 floats of the line zeroed
+            // at even t. DCZID_EL0 on RK3588: 64-byte blocks, ZVA permitted.
+            if (store && sub == 8 && (n0 & 15) == 0 && n0 + 16 <= n_limit && ((uintptr_t)d & 63) == 0) {
+                __asm__ volatile("dc zva, %0" : : "r"(d) : "memory");
+            }
+#endif
+#ifdef __ARM_NEON
+            const float32x4_t vc = vdupq_n_f32(common[r]);
+            for (; i + 8 <= (size_t)lim; i += 8) {
+                int16x8_t s16 = vld1q_s16(cell + i);
+                float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16)));
+                float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(s16)));
+                float32x4_t sc0 = vmulq_f32(vld1q_f32(cs + i),     vc);
+                float32x4_t sc1 = vmulq_f32(vld1q_f32(cs + i + 4), vc);
+                if (store) {
+                    vst1q_f32(d + i,     vmulq_f32(f0, sc0));
+                    vst1q_f32(d + i + 4, vmulq_f32(f1, sc1));
+                } else {
+                    vst1q_f32(d + i,     vfmaq_f32(vld1q_f32(d + i),     f0, sc0));
+                    vst1q_f32(d + i + 4, vfmaq_f32(vld1q_f32(d + i + 4), f1, sc1));
+                }
+            }
+#endif
+            for (; i < (size_t)lim; ++i) {
+                d[i] = store ? (float)cell[i] * (cs[i] * common[r])
+                             : fmaf((float)cell[i], cs[i] * common[r], d[i]);
+            }
+        }
+    }
+}
+
+void dequant2_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const int16_t * src0, const int16_t * src1,
+                                       int32_t m0, int32_t nrows, int32_t m_stride, int32_t outer, int32_t sub,
+                                       int32_t n_limit, const float * common0, const float * common1,
+                                       const float * chan0, const float * chan1) {
+    for (int32_t t = 0; t < outer; ++t) {
+        const int32_t n0 = t * sub;
+        const int32_t lim = std::min(sub, n_limit - n0);
+        if (lim <= 0) {
+            break;
+        }
+        for (int32_t r = 0; r < nrows; ++r) {
+            const size_t cell_off = ((size_t)t * m_stride + m0 + r) * sub;
+            const int16_t * a = src0 + cell_off;
+            const int16_t * b = src1 + cell_off;
+            float * d = dst + (size_t)r * dst_stride + n0;
+            const float * cs0 = chan0 + n0;
+            const float * cs1 = chan1 + n0;
+            size_t i = 0;
+#if defined(__aarch64__)
+            // see dequant_acc_int16_tiled_perchan_rows (store path)
+            if (sub == 8 && (n0 & 15) == 0 && n0 + 16 <= n_limit && ((uintptr_t)d & 63) == 0) {
+                __asm__ volatile("dc zva, %0" : : "r"(d) : "memory");
+            }
+#endif
+#ifdef __ARM_NEON
+            const float32x4_t vc0 = vdupq_n_f32(common0[r]);
+            const float32x4_t vc1 = vdupq_n_f32(common1[r]);
+            for (; i + 8 <= (size_t)lim; i += 8) {
+                const int16x8_t a16 = vld1q_s16(a + i);
+                const int16x8_t b16 = vld1q_s16(b + i);
+                const float32x4_t fa0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(a16)));
+                const float32x4_t fa1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(a16)));
+                const float32x4_t fb0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(b16)));
+                const float32x4_t fb1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(b16)));
+                const float32x4_t sa0 = vmulq_f32(vld1q_f32(cs0 + i),     vc0);
+                const float32x4_t sa1 = vmulq_f32(vld1q_f32(cs0 + i + 4), vc0);
+                const float32x4_t sb0 = vmulq_f32(vld1q_f32(cs1 + i),     vc1);
+                const float32x4_t sb1 = vmulq_f32(vld1q_f32(cs1 + i + 4), vc1);
+                vst1q_f32(d + i,     vfmaq_f32(vmulq_f32(fa0, sa0), fb0, sb0));
+                vst1q_f32(d + i + 4, vfmaq_f32(vmulq_f32(fa1, sa1), fb1, sb1));
+            }
+#endif
+            for (; i < (size_t)lim; ++i) {
+                const float v = (float)a[i] * (cs0[i] * common0[r]);
+                d[i] = fmaf((float)b[i], cs1[i] * common1[r], v);
+            }
+        }
+    }
+}
 
 // --- Dequantization to FP32 ---
 

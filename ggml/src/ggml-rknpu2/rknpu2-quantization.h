@@ -54,6 +54,77 @@ void quantize_fp32_to_int8(const float * src, int8_t * dst, size_t n_elements, f
 void quantize_fp32_to_int4_packed(const float * src, uint8_t * dst, size_t n_elements, float scale);
 
 
+// --- Row helpers for the activation prep path ---
+
+/**
+ * @brief Returns max(|src[i]|) over the row (0 for an empty row).
+ */
+float amax_fp32(const float * src, size_t n_elements);
+
+/**
+ * @brief Elementwise multiply: dst[i] = a[i] * b[i].
+ * Used for the Hadamard sign-vector application.
+ */
+void mul_fp32(float * dst, const float * a, const float * b, size_t n_elements);
+
+/**
+ * @brief Dequantize-accumulate a row of INT16: dst[i] += src[i] * scale.
+ */
+void dequant_acc_int16_to_fp32(float * dst, const int16_t * src, size_t n_elements, float scale);
+
+/**
+ * @brief Dequantize-accumulate one row out of a native-layout INT16 C matrix
+ * ([outer, m_stride, sub] cells; see rknpu2-native-layout.h):
+ * dst[t*sub + j] += cell(t, m)[j] * scale, for t in [0, outer) and
+ * t*sub + j < n_limit.
+ */
+void dequant_acc_int16_tiled(float * dst, const int16_t * src_native,
+                             int32_t m, int32_t m_stride, int32_t outer, int32_t sub,
+                             int32_t n_limit, float scale);
+
+/**
+ * @brief Per-output-channel variant of dequant_acc_int16_to_fp32:
+ * dst[i] += src[i] * (chan_scales[i] * common). Used by the INT4 pipeline's
+ * per-channel weight scales (decode research #3b follow-up): the channel
+ * scale factors out of the K summation, so applying it here upgrades the
+ * weight-scale granularity from one-per-segment to one-per-output-channel
+ * at zero NPU cost.
+ */
+void dequant_acc_int16_to_fp32_perchan(float * dst, const int16_t * src, size_t n_elements,
+                                       float common, const float * chan_scales);
+
+/**
+ * @brief Per-output-channel variant of dequant_acc_int16_tiled.
+ * chan_scales is indexed by the segment-local output channel (t*sub + j).
+ */
+void dequant_acc_int16_tiled_perchan(float * dst, const int16_t * src_native,
+                                     int32_t m, int32_t m_stride, int32_t outer, int32_t sub,
+                                     int32_t n_limit, float common, const float * chan_scales);
+void dequant_acc_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const int16_t * src_native,
+                                          int32_t m0, int32_t nrows, int32_t m_stride, int32_t outer, int32_t sub,
+                                          int32_t n_limit, const float * common, const float * chan_scales,
+                                          bool store = false);
+// Two K-segments at once, stored: dst = c0 * (cs0 * common0) then
+// fma(c1, cs1 * common1, .) - element-exact vs a store pass over src0
+// followed by an accumulate pass over src1, without re-reading dst.
+// Both sources share one native geometry.
+void dequant2_int16_tiled_perchan_rows(float * dst, size_t dst_stride, const int16_t * src0, const int16_t * src1,
+                                       int32_t m0, int32_t nrows, int32_t m_stride, int32_t outer, int32_t sub,
+                                       int32_t n_limit, const float * common0, const float * common1,
+                                       const float * chan0, const float * chan1);
+
+/**
+ * @brief Per-output-channel dequantize-accumulate for INT32 C matrices
+ * (the INT8 pipelines): dst[i] += src[i] * (chan_scales[i] * common).
+ */
+void dequant_acc_int32_to_fp32_perchan(float * dst, const int32_t * src, size_t n_elements,
+                                       float common, const float * chan_scales);
+// Row m of a native [outer, m_stride, sub] INT32 C, cell by cell with the
+// kernel above, so each element is computed exactly as in the NORM layout
+void dequant_acc_int32_tiled_perchan(float * dst, const int32_t * src_native,
+                                     int32_t m, int32_t m_stride, int32_t outer, int32_t sub,
+                                     int32_t n_limit, float common, const float * chan_scales);
+
 // --- Dequantization to FP32 ---
 
 /**
