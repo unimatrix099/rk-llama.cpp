@@ -1332,6 +1332,62 @@ Final decision: default `RKNPU_FA_ONLINE_MIN=4096` (pp128-32k
 196/301/280/266/245/219/182/138) with the KV-cache fix. The KV-cache fix is an
 upstream candidate on its own (speculative decoding with any iSWA model).
 
+### 1o. Probe: decode/verify attention on the NPU with a persistent KV mirror (2026-10-10) — GO
+
+Question: at long context the CPU attention dominates generation. Can the
+global layers' decode (1 token) and MTP-verify (6 tokens) attention run on
+the NPU, with K/V kept in NPU-native layout and appended per token?
+Probe: `docs/backend/rknpu2-decode-attn-probe.c` (standalone, FP16, NATIVE
+A/B/C; per KV head one Q*K^T run over all positions, CPU softmax, P*V in
+2048-position chunks; the 2 KV heads of a layer on 2 cores in parallel).
+
+**CPU today** (llama-bench `-p 1,6 -n 0 -d 0,16384,32768`, ms per batch):
+
+| depth | 0 | 16k | 32k |
+|---|---|---|---|
+| decode (1 token) | 110.3 | 170.1 | 243.4 |
+| verify (6 tokens) | 127.3 | 337.3 | 531.0 |
+
+Attention growth over depth 0, divided by the 7 global layers (minus ~4 ms
+for the 35 sliding-window layers): decode ~8.0 ms/layer at 16k, ~18.4 at
+32k; verify ~29 at 16k, ~57 at 32k.
+
+**NPU, per global layer** (softmax on 2 threads per head; ms):
+
+| n_kv | decode M=4: QK / softmax / PV = layer | verify M=24 |
+|---|---|---|
+| 4096 | 0.40 / 0.15 / 0.43 = 1.04 | 1.50 |
+| 16384 | 1.53 / 0.39 / 1.69 = 3.70 | 5.63 |
+| 32768 | 3.04 / 0.71 / 3.38 = 7.23 | 11.12 |
+
+Checks (`CHECK=1`):
+- NPU rows are bit-identical between M=4 and M=24 contexts (Q*K^T and P*V),
+  so decode and verify on this path agree exactly (MTP identity holds if
+  the CPU/NPU choice does not depend on the batch).
+- Appending a token: `rknn_mem_sync` of the whole K buffer costs 0.85 ms at
+  32k; a sync through a `rknn_create_mem_from_fd` view does not flush (NPU
+  reads stale data); "non-cacheable" memory (`rknn_create_mem2`) is not
+  coherent either (1-7 of 16 positions stale, with or without `dsb`).
+  **What works:** write into the cacheable buffer, `dc cvac` the touched
+  64-byte lines, `dsb sy`: 20/20 trials correct, 1.7 us per 16 positions.
+
+**Projection** (7 global layers on the NPU, everything else unchanged):
+decode 16k 170 -> ~140 ms (5.9 -> ~7.1 t/s), 32k 243 -> ~165 ms (4.1 ->
+~6.1 t/s, +48%); verify 16k 337 -> ~175 ms, 32k 531 -> ~210 ms (2.5x),
+so MTP at long context gains most. Not yet counted: Q prep, native C/P
+gathers (~0.1-0.5 ms/layer), graph integration overhead.
+
+Design for the implementation:
+- A per-layer-cache NPU mirror of K (native B, positions outermost, so one
+  buffer serves every n_kv) and V (2048-position chunks), written when the
+  KV cache is written (prefill ubatches and decode tokens), lines cleaned
+  with `dc cvac`. Memory: 16 KiB per cell for the 4 caches, 512 MiB at 32k
+  (IOMMU domain headroom to check).
+- Use the NPU path for decode/verify of the global layers whenever the
+  mirror covers the KV range, independent of the batch size (exactness).
+- Numerics change against the CPU path (FP32 accumulation on the NPU): the
+  tolerant quality gate applies.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
