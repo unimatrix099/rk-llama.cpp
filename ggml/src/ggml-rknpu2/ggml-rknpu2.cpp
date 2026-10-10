@@ -1925,17 +1925,16 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
     // Online softmax per P*V chunk (RKNPU_FA_ONLINE, default on): the row is processed in
     // chunk-sized pieces (L1-resident scratch) and P holds exp(s - m_chunk); the chunk sums are
     // rescaled when the P*V outputs are accumulated. Needs FP16 scores and the native path.
-    // RKNPU_FA_ONLINE_MIN (default 0 = always): use it only above that many KV cells. 4096 is
-    // faster for short prompts (pp512 299 vs 289 t/s, break-even near 4096), but mixing the two
-    // softmax roundings within one prompt made MTP output differ from no-draft output on a 12.8k
-    // prompt (decode research #1n); with one method throughout MTP stays identical, so 0 is the default
+    // Used only above RKNPU_FA_ONLINE_MIN KV cells (default 4096; 0 = always): with one or two
+    // chunks the whole-row softmax is faster (pp512 299 vs 289 t/s; break-even near 4096). An MTP
+    // mismatch first blamed on this mix was the KV cache's cell order after rejected drafts (#1n)
     static const bool online_env = []() {
         const char* env = std::getenv("RKNPU_FA_ONLINE");
         return env == nullptr || std::atoi(env) != 0;
     }();
     static const int64_t online_min = []() {
         const char* env = std::getenv("RKNPU_FA_ONLINE_MIN");
-        return (int64_t)(env ? std::atoll(env) : 0);
+        return (int64_t)(env ? std::atoll(env) : 4096);
     }();
     // Early P*V (RKNPU_FA_EARLY_PV, default on with the online softmax): the softmax runs
     // chunk-major and each chunk's P*V starts on a helper thread as soon as its P is written,
