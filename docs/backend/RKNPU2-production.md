@@ -4,7 +4,9 @@ Measured on an Orange Pi 5 Ultra (RK3588, 16 GB LPDDR5, NPU at 1 GHz, DDR at
 2400 MHz, big cores pinned at 2.35 GHz). Model:
 `gemma-4-E4B-it-Q4_0` (the ggml-org GGUF), pure NPU, default W4A4.
 Branch `main` (code identical to the tested `rebase/w4a4-on-upstream`).
-Test logs: `~/bench-logs/2026-10-09-prod/` on the board.
+Test logs on the board: `~/bench-logs/2026-10-10-prod/` (full suite;
+numerically the same code as the final default), `~/bench-logs/2026-10-10-prod-fix/`
+(the `RKNPU_FA_ONLINE_MIN=4096` variant) and `~/bench-logs/2026-10-10-ident/`.
 
 ## 1. How to run it
 
@@ -42,9 +44,12 @@ Server, with the MTP drafter (fastest exact setup):
 | ubatch (`-ub`) | **512 (default)** | NPU attention is validated for this size only; larger ubatches fall back to CPU attention |
 | Parallel slots | 4 (server default), unified KV | all slots share the context window |
 
-Practical guidance (after the 2026-10-09 long-prompt work, decode
-research #1m): up to ~8k-token prompts prefill in under 40 s; 16k takes
-~1.5 minutes; 32k takes ~4 minutes.
+Practical guidance (measured 2026-10-10): up to ~8k-token prompts
+prefill in under 40 s; 16k takes ~1.5 minutes; 32k takes ~4 minutes.
+
+Memory (server, `-c 32768`, 4 slots, MTP drafter loaded): resident size
+8.3 GiB after a short prompt, 10.1 GiB peak after a 24.8k-token prompt;
+the board kept >= 9.9 GiB available throughout.
 
 ## 3. Speed
 
@@ -52,29 +57,32 @@ research #1m): up to ~8k-token prompts prefill in under 40 s; 16k takes
 
 | Prompt tokens | 128 | 512 | 1k | 2k | 4k | 8k | 16k | 32k |
 |---|---|---|---|---|---|---|---|---|
-| t/s (2026-10-09 morning) | 191.7 | 296.2 | 275.2 | 261.2 | 239.4 | 166.3 | 112.9 | 28.2 |
-| t/s (after #1m, same evening) | - | 292 | - | - | 249 | **~220** | **~181** | **~134** |
-| time (after #1m) | 0.7 s | 1.8 s | 3.7 s | 7.8 s | 16 s | 37 s | 1.5 min | 4.1 min |
+| t/s before #1m (2026-10-09) | 191.7 | 296.2 | 275.2 | 261.2 | 239.4 | 166.3 | 112.9 | 28.2 |
+| **t/s now (2026-10-10)** | **190** | **288** | **268** | **256** | **237** | **218** | **181** | **137** |
+| time now | 0.7 s | 1.8 s | 3.8 s | 8.0 s | 17 s | 38 s | 1.5 min | 4.0 min |
+| t/s with `RKNPU_FA_ONLINE_MIN=4096` | 196 | 301 | 280 | 266 | 245 | 219 | 182 | 138 |
 
-(#1m: P*V chunking, FP16 scores, online softmax, early P*V. The 128-2k
-figures are unchanged within noise; re-measure all rows with the full
-suite before the next production tag.)
+(#1m: P*V chunking, FP16 scores, online softmax, early P*V. The online
+softmax costs ~3-4% on prompts up to 4k. `RKNPU_FA_ONLINE_MIN=4096` uses it
+only above 4096 KV cells and wins that back, but mixing the two softmax
+roundings in one prompt broke MTP's output identity on a 12.8k prompt
+(#1n); use it only without a drafter.)
 
 ### Generation vs context already in the window (no drafter, llama-bench tg32)
 
 | Context depth | 0 | 1k | 2k | 4k | 8k | 16k | 32k |
 |---|---|---|---|---|---|---|---|
-| t/s | 8.97 | 8.26 | 7.98 | 7.53 | 6.74 | 5.65 | 4.27 |
+| t/s | 8.97 | 8.22 | 7.97 | 7.52 | 6.76 | 5.63 | 4.31 |
 
 ### Server with real prompts (needle + 256-token summary, `-c 32768`)
 
 | Prompt tokens | Prompt t/s | Gen t/s, no draft | Gen t/s, MTP | MTP speed-up |
 |---|---|---|---|---|
-| 784 | 229 | 8.27 | 12.55 | 1.52x |
-| 3,428 | 192 | 7.70 | 10.50 | 1.36x |
-| 6,637 | 155 | 7.15 | 9.00 | 1.26x |
-| 12,796 | 115 (now 165-169) | 6.27 | 7.43 | 1.19x |
-| 24,767 | 38 (now 139) | 5.03 | 5.65 | 1.12x |
+| 784 | 229 | 8.24 | 12.74 | 1.55x |
+| 3,428 | 209 | 7.66 | 11.39 | 1.49x |
+| 6,637 | 194 | 7.09 | 9.67 | 1.36x |
+| 12,796 | 170 (2026-10-09: 115) | 6.20 | 8.36 | 1.35x |
+| 24,767 | 139 (2026-10-09: 38) | 4.97 | 5.46 | 1.10x |
 
 Short prompts (the 4 bench prompts, 128-token answers): **18.37 t/s with MTP**
 vs 8.5 without (2.2x). MTP gains less on long contexts because every verify
@@ -86,19 +94,20 @@ text (summaries of long, mixed documents accept less).
 - **No garbage at any size:** the hidden code word was recalled in 10/10
   runs (prompts 0.8k-24.8k, with and without MTP). The 256-token summaries
   are coherent and on-topic up to 24.8k tokens.
-- **MTP is exact:** with the same server state, MTP output is byte-identical
-  to no-draft output (holdout 6/6 at 256 and 512 tokens; 12.8k-prompt
-  summary identical).
+- **MTP is exact:** MTP output is byte-identical to no-draft output
+  (2026-10-10: all 10 server answers, 0.8k-24.8k prompts; holdout 6/6 at
+  256 and 512 tokens). A 6-token verify batch gives bit-identical logits to
+  one-at-a-time decoding at 12.8k context (`docs/handover/profiling-patches/longdiff.cpp`).
 - **NPU vs CPU perplexity (wikitext-2):** see the table below.
 
 | Context | NPU PPL | CPU PPL (reference) |
 |---|---|---|
-| 512 (32 chunks, guard) | 27.2382 | 27.01 (#3d; same quantization) |
-| 2048 (8 chunks) | 22.78 +/- 0.87 | 25.11 +/- 1.06 |
-| 8192 (2 chunks) | 21.49 +/- 0.80 | 21.05 +/- 0.83 |
+| 512 (32 chunks, guard) | 27.2322 | 27.01 (#3d; same quantization) |
+| 2048 (8 chunks) | 22.64 +/- 0.85 | 24.88 +/- 1.05 |
+| 8192 (2 chunks) | 21.89 +/- 0.81 | 20.88 +/- 0.82 |
 
-KL divergence of the NPU output against the CPU reference: 0.587 at 512
-context (same top token 72.1%), 0.653 at 2048 (same top 66.0%). The NPU's
+KL divergence of the NPU output against the CPU reference: 0.610 at 512
+context (same top token 70.3%), 0.640 at 2048 (same top 65.9%). The NPU's
 W4A4 activations make its token distributions differ from the CPU's, but
 perplexity stays level with the CPU (within the error bars), and the
 long-context recall and summaries are correct. (llama-perplexity cannot
@@ -132,7 +141,7 @@ did pp128 25.2 / tg 4.9.
 | Long prompts | P*V in 2048-position chunks (the NPU FP16 matmul collapses past K 4096), NPU attention to 32k, FP16 scores, online softmax per chunk, early P*V, chunk outputs combined in host memory | pp8k 166 -> ~220, pp16k 113 -> ~181, pp32k 28 -> ~134 (#1m) |
 
 Total for E4B against the original backend's default: **prefill 4.8x**
-at pp128 (39.8 -> 191.7; larger prompts gain more, pp512 is now 296), **decode 2.7x without a drafter**
+at pp128 (39.8 -> 190; larger prompts gain more: pp512 288, pp16k 181), **decode 2.7x without a drafter**
 (3.3 -> 8.97) and **5.6x with MTP** (3.3 -> 18.4), at CPU-level accuracy.
 
 Every change is described, with its measurements and rejected

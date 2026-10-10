@@ -1270,6 +1270,43 @@ suite (`rknpu2-production-tests/prodtest.sh`: pp/tg tables, MTP identity
 on long prompts, NPU-vs-CPU perplexity at 2k/8k) and the memory headroom
 at 32k with 4 server slots, then update `RKNPU2-production.md`'s tables.
 
+### 1n. Full production suite and the online-softmax threshold (2026-10-10)
+
+Full suite (`docs/backend/rknpu2-production-tests/prodtest.sh`) on bf1700729,
+board logs `~/bench-logs/2026-10-10-prod/`: no crash; needle 10/10 at
+0.8k-24.8k prompts; MTP output byte-identical to no-draft on all 10 server
+answers; server peak RSS 10.1 GiB (24.8k prompt, MTP), >= 9.9 GiB available;
+tg depth 0-32k unchanged (8.97 -> 4.31). Numbers are in `RKNPU2-production.md`.
+
+The suite showed pp512-2k 3-5% under the 2026-10-09 morning figures. A same-binary
+A/B put it on the online softmax: with one P*V chunk it is slower than the
+whole-row softmax (pp512 288 vs 298, pp1k 269 vs 278, pp2k 255 vs 262, pp4k
+240 vs 241; it wins at pp8k 215 vs 209 and pp16k 179 vs 165).
+
+`RKNPU_FA_ONLINE_MIN` (online only above that many KV cells): 4096 gave
+pp128-32k 196/301/280/266/245/219/182/138 and passed the guard (PPL32 26.5468,
+KLD 0.599872, same-top 71.08, FA 12/12, RoPE 5/5, server 3x4/4). **But** the
+server suite then found the 12.8k summary differing between MTP and no draft,
+reproducibly on fresh servers ("five-bullet point" vs "five-point" at the 4th
+token). Checks:
+- NPU attention calls (shape, threshold decision, core) were identical in both
+  servers (temporary FADBG print).
+- `docs/handover/profiling-patches/longdiff.cpp` (12.8k prefill, then the same
+  tail decoded one token at a time vs as a 6-token batch): logits bit-identical,
+  with either threshold. Verify batches are exact.
+- As prompt text ("...five-" prefilled), both servers prefer "bullet"
+  (-0.31 vs -1.33); decoded token by token, the no-draft server prefers
+  "point" (-0.36 vs -1.20). Prefill and decode legitimately differ here; which
+  side the MTP server lands on is not explained yet.
+- With one softmax method throughout (`RKNPU_FA_ONLINE_MIN` 0 or 99999999) the
+  two servers agree on this prompt; bf1700729 (always online) agreed on 10/10.
+
+Decision: default `RKNPU_FA_ONLINE_MIN=0` (bf1700729 behaviour, MTP identity
+verified); 4096 stays an opt-in for deployments without a drafter (+3-6% on
+prompts up to 4k). Open: why the mixed setting moves the MTP server's
+decode; a chunk-count-independent softmax that is also fast at one chunk
+would remove the trade-off.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
@@ -2371,6 +2408,7 @@ becomes a server.
 | `RKNPU_FA_PV_CHUNK` | 2048 | P*V on the NPU in chunks of this many KV positions, partial outputs summed; 0 = one run (#1m) |
 | `RKNPU_FA_S16` | 1 | 0 = Q*K^T scores in FP32 instead of FP16 (#1m) |
 | `RKNPU_FA_ONLINE` | 1 | 0 = one-pass softmax over the whole row instead of the per-chunk online softmax (#1m) |
+| `RKNPU_FA_ONLINE_MIN` | 0 | online softmax only above this many KV cells; 4096 = +3-6% on prompts up to 4k but breaks MTP output identity on some long prompts (#1n) |
 | `RKNPU_FA_EARLY_PV` | 1 | 0 = P*V chunks run after the whole item's softmax instead of as each chunk's P is ready (#1m) |
 | `GGML_CPU_FA_GROUPED` | 1 | 0 = ggml-cpu flash attention handles each (query row, head) separately for small batches instead of per KV-head group (#1k) |
 | `GGML_CPU_FA_SPLIT_KV` | 0 | 1 = ggml-cpu flash attention splits the KV range for single-row decode at >= 512 cells (upstream default; faster only with few heads, breaks speculative-decoding identity; #1j) |
