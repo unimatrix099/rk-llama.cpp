@@ -402,20 +402,36 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
+        // freed cell that held the lowest position
+        uint32_t first_head = cells.size();
+        llama_pos first_pos = std::numeric_limits<llama_pos>::max();
+
         for (uint32_t i = 0; i < cells.size(); ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
             }
 
+            const llama_pos pos = cells.pos_get(i);
+
             if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
+                if (pos < first_pos) {
+                    first_pos  = pos;
+                    first_head = i;
+                }
             }
         }
 
-        // If we freed up a slot, set head to it so searching can start there.
-        if (new_head != cells.size() && new_head < head) {
+        if (p1 == std::numeric_limits<llama_pos>::max() && first_head != cells.size()) {
+            // Tail removal (e.g. rejected speculative drafts): continue from the cell of the first
+            // removed position, so the tokens that follow get the cells they would have got without
+            // the removed ones. In a full SWA ring the lowest freed index is not that cell, and the
+            // different cell order changes the attention's accumulation order (and its rounding).
+            head = first_head;
+        } else if (new_head != cells.size() && new_head < head) {
+            // If we freed up a slot, set head to it so searching can start there.
             head = new_head;
         }
     } else {
