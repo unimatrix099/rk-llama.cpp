@@ -1925,9 +1925,15 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
     // Online softmax per P*V chunk (RKNPU_FA_ONLINE, default on): the row is processed in
     // chunk-sized pieces (L1-resident scratch) and P holds exp(s - m_chunk); the chunk sums are
     // rescaled when the P*V outputs are accumulated. Needs FP16 scores and the native path.
+    // Used only above RKNPU_FA_ONLINE_MIN KV cells (default 4096): with one or two chunks the
+    // whole-row softmax is faster (pp512 299 vs 289 t/s; break-even near 4096, +3% pp8192)
     static const bool online_env = []() {
         const char* env = std::getenv("RKNPU_FA_ONLINE");
         return env == nullptr || std::atoi(env) != 0;
+    }();
+    static const int64_t online_min = []() {
+        const char* env = std::getenv("RKNPU_FA_ONLINE_MIN");
+        return (int64_t)(env ? std::atoll(env) : 4096);
     }();
     // Early P*V (RKNPU_FA_EARLY_PV, default on with the online softmax): the softmax runs
     // chunk-major and each chunk's P*V starts on a helper thread as soon as its P is written,
@@ -2008,7 +2014,7 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         while (FR > 1 && M % FR) FR /= 2;
         const bool native = qk->native && pv_native && M % FR == 0;
         GGML_ASSERT((native || !qk->c_fp16) && "RKNPU2: FP16 scores need the native attention path");
-        const bool online = online_env && native && qk->c_fp16;
+        const bool online = online_env && native && qk->c_fp16 && n_kv > online_min;
         if (online && st == 2 && (int64_t)bctx->fa_stats[core].size() < M * n_pvc * 2) bctx->fa_stats[core].resize(M * n_pvc * 2);
         const bool host_out = online || n_pvc > 1;
         if (host_out && st == 2 && bctx->fa_out[core].size() < pv->io_attr.C.size / 4) bctx->fa_out[core].resize(pv->io_attr.C.size / 4);

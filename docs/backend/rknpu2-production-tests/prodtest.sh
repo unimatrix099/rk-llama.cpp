@@ -2,7 +2,7 @@
 # Production limit tests for Gemma-4 E4B Q4_0 on RK3588 (RKNPU2 W4A4). Run on the board from the repo root.
 set -u
 ulimit -n 65536
-OUT=${OUT:-$HOME/bench-logs/2026-10-09-prod}; mkdir -p "$OUT"
+OUT=${OUT:-$HOME/bench-logs/2026-10-10-prod}; mkdir -p "$OUT"
 M=$HOME/models/gemma-4-E4B-it-Q4_0-ggmlorg.gguf
 DFT=$HOME/models/gemma-4-E4B-it-assistant-centroid-F16.gguf
 W=$HOME/wikitext-2-raw/wiki.test.raw
@@ -72,7 +72,17 @@ for n in (1000, 4000, 8000, 16000, 30000):
         res.append({"n": n, "task": task, "prompt_n": t["prompt_n"], "prompt_tps": t["prompt_per_second"], "gen_n": t["predicted_n"],
                     "gen_tps": t["predicted_per_second"], "draft_n": t.get("draft_n"), "draft_acc": t.get("draft_n_accepted"),
                     "wall_s": round(time.time() - t0, 1), "needle_ok": (p["code"] in txt) if task == "needle" else None, "text": txt})
-        print(label, n, task, res[-1]["prompt_n"], round(res[-1]["prompt_tps"], 1), round(res[-1]["gen_tps"], 2), res[-1]["needle_ok"], flush=True)
+        mem = {}
+        try:
+            import subprocess
+            pid = subprocess.run(["pgrep", "-f", "^build/bin/llama-server"], capture_output=True, text=True).stdout.split()[0]
+            for l in open(f"/proc/{pid}/status"):
+                if l.startswith(("VmRSS", "VmHWM")): mem[l.split(":")[0]] = int(l.split()[1]) // 1024
+            for l in open("/proc/meminfo"):
+                if l.startswith("MemAvailable"): mem["MemAvailable"] = int(l.split()[1]) // 1024
+        except Exception: pass
+        res[-1]["mem_mib"] = mem
+        print(label, n, task, res[-1]["prompt_n"], round(res[-1]["prompt_tps"], 1), round(res[-1]["gen_tps"], 2), res[-1]["needle_ok"], mem, flush=True)
 json.dump(res, open(f"{out}/server-{label}.json", "w"), indent=1)
 PY
   }
@@ -83,7 +93,7 @@ fi
 # 4. accuracy: NPU vs CPU perplexity at several context sizes; KLD at 2k
 if [[ " $STAGES " == *" ppl "* ]]; then
   CPUENV="RKNPU_HYBRID=W8A8_STANDARD RKNPU_CPU_DECODE=999999"
-  for cfg in "2048 8" "8192 2" "32768 1"; do
+  for cfg in "2048 8" "8192 2"; do   # a 32k window needs ~34 GB of logits in llama-perplexity
     set -- $cfg; c=$1; ch=$2
     log "ppl c=$c chunks=$ch NPU"
     timeout 7200 $PIN $BIN/llama-perplexity -m $M -f $W -c $c --chunks $ch -t 4 > "$OUT/ppl-npu-c$c.txt" 2>&1
