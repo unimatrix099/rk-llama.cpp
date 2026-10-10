@@ -1301,11 +1301,36 @@ token). Checks:
 - With one softmax method throughout (`RKNPU_FA_ONLINE_MIN` 0 or 99999999) the
   two servers agree on this prompt; bf1700729 (always online) agreed on 10/10.
 
-Decision: default `RKNPU_FA_ONLINE_MIN=0` (bf1700729 behaviour, MTP identity
-verified); 4096 stays an opt-in for deployments without a drafter (+3-6% on
-prompts up to 4k). Open: why the mixed setting moves the MTP server's
-decode; a chunk-count-independent softmax that is also fast at one chunk
-would remove the trade-off.
+First decision: default back to 0 (bf1700729 behaviour). Then the root cause:
+
+- Logging the target's top-2 logits at every sampled row in both servers
+  (temporary print in `common_sampler_sample`): MTP rows equal no-draft to 6
+  decimals up to the first **partial** acceptance (verify 1 accepted 2 of 5
+  drafts), and differ right after it (after "five": "-" 27.288 vs 27.333,
+  "bullet" 14.970 vs 16.724). A full rejection (MIN=0 run) did not disturb.
+- A temporary print of overwritten KV cells: the SWA cache is a ring of 2560
+  cells. No-draft decoding put positions 12800, 12801, ... in cells 0, 1, ...;
+  after the rollback MTP put 12801 in cell 2, 12802 in cell 3, ...
+  `llama_kv_cache::seq_rm` sets `head` to the lowest freed cell index, which
+  in a wrapped ring is not where the removed positions started.
+- Different cells = different order in the CPU flash attention's accumulation
+  = different rounding; W4A4 amplifies it over 42 layers. The threshold only
+  produced a near-tie at that spot. The same can happen with any setting;
+  the 10/10 identity before was luck. With `--swa-full` (no ring) both servers
+  agree under MIN=4096.
+- The standalone replay (`longrej.cpp`) did not reproduce it: its prompt
+  batching put the ring cursor elsewhere, so the freed cells came back in order.
+
+Fix (`src/llama-kv-cache.cpp`, generic): after a tail `seq_rm`, set `head` to
+the cell of the first removed position, so the following tokens get the cells
+they would have got without the drafts. Results: MIN=4096 12.8k summary MTP ==
+no-draft, every sampled row identical to 6 decimals; server suite 10/10
+identical with MIN=4096 and with MIN=0 (`~/bench-logs/2026-10-10-kvfix-*`).
+Generation speed does not depend on MIN (tg32 @16k 5.57-5.59 either way).
+
+Final decision: default `RKNPU_FA_ONLINE_MIN=4096` (pp128-32k
+196/301/280/266/245/219/182/138) with the KV-cache fix. The KV-cache fix is an
+upstream candidate on its own (speculative decoding with any iSWA model).
 
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
@@ -2408,7 +2433,7 @@ becomes a server.
 | `RKNPU_FA_PV_CHUNK` | 2048 | P*V on the NPU in chunks of this many KV positions, partial outputs summed; 0 = one run (#1m) |
 | `RKNPU_FA_S16` | 1 | 0 = Q*K^T scores in FP32 instead of FP16 (#1m) |
 | `RKNPU_FA_ONLINE` | 1 | 0 = one-pass softmax over the whole row instead of the per-chunk online softmax (#1m) |
-| `RKNPU_FA_ONLINE_MIN` | 0 | online softmax only above this many KV cells; 4096 = +3-6% on prompts up to 4k but breaks MTP output identity on some long prompts (#1n) |
+| `RKNPU_FA_ONLINE_MIN` | 4096 | online softmax only above this many KV cells (0 = always; 3-4% slower on prompts up to 4k) (#1n) |
 | `RKNPU_FA_EARLY_PV` | 1 | 0 = P*V chunks run after the whole item's softmax instead of as each chunk's P is ready (#1m) |
 | `GGML_CPU_FA_GROUPED` | 1 | 0 = ggml-cpu flash attention handles each (query row, head) separately for small batches instead of per KV-head group (#1k) |
 | `GGML_CPU_FA_SPLIT_KV` | 0 | 1 = ggml-cpu flash attention splits the KV range for single-row decode at >= 512 cells (upstream default; faster only with few heads, breaks speculative-decoding identity; #1j) |

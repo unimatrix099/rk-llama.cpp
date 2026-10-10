@@ -4,9 +4,10 @@ Measured on an Orange Pi 5 Ultra (RK3588, 16 GB LPDDR5, NPU at 1 GHz, DDR at
 2400 MHz, big cores pinned at 2.35 GHz). Model:
 `gemma-4-E4B-it-Q4_0` (the ggml-org GGUF), pure NPU, default W4A4.
 Branch `main` (code identical to the tested `rebase/w4a4-on-upstream`).
-Test logs on the board: `~/bench-logs/2026-10-10-prod/` (full suite;
-numerically the same code as the final default), `~/bench-logs/2026-10-10-prod-fix/`
-(the `RKNPU_FA_ONLINE_MIN=4096` variant) and `~/bench-logs/2026-10-10-ident/`.
+Test logs on the board: `~/bench-logs/2026-10-10-prod/` (full suite),
+`~/bench-logs/2026-10-10-prod-fix/` (prompt speeds of the final default),
+`~/bench-logs/2026-10-10-kvfix-4096/` and `-kvfix-0/` (server runs with the
+KV-cache fix) and `~/bench-logs/2026-10-10-ident/`.
 
 ## 1. How to run it
 
@@ -58,15 +59,12 @@ the board kept >= 9.9 GiB available throughout.
 | Prompt tokens | 128 | 512 | 1k | 2k | 4k | 8k | 16k | 32k |
 |---|---|---|---|---|---|---|---|---|
 | t/s before #1m (2026-10-09) | 191.7 | 296.2 | 275.2 | 261.2 | 239.4 | 166.3 | 112.9 | 28.2 |
-| **t/s now (2026-10-10)** | **190** | **288** | **268** | **256** | **237** | **218** | **181** | **137** |
-| time now | 0.7 s | 1.8 s | 3.8 s | 8.0 s | 17 s | 38 s | 1.5 min | 4.0 min |
-| t/s with `RKNPU_FA_ONLINE_MIN=4096` | 196 | 301 | 280 | 266 | 245 | 219 | 182 | 138 |
+| **t/s now (2026-10-10)** | **196** | **301** | **280** | **266** | **245** | **219** | **182** | **138** |
+| time now | 0.7 s | 1.7 s | 3.7 s | 7.7 s | 17 s | 37 s | 1.5 min | 4.0 min |
 
-(#1m: P*V chunking, FP16 scores, online softmax, early P*V. The online
-softmax costs ~3-4% on prompts up to 4k. `RKNPU_FA_ONLINE_MIN=4096` uses it
-only above 4096 KV cells and wins that back, but mixing the two softmax
-roundings in one prompt broke MTP's output identity on a 12.8k prompt
-(#1n); use it only without a drafter.)
+(#1m: P*V chunking, FP16 scores, online softmax above 4096 KV cells
+(`RKNPU_FA_ONLINE_MIN`; with it on for every size, prompts up to 4k are
+3-4% slower), early P*V.)
 
 ### Generation vs context already in the window (no drafter, llama-bench tg32)
 
@@ -78,11 +76,15 @@ roundings in one prompt broke MTP's output identity on a 12.8k prompt
 
 | Prompt tokens | Prompt t/s | Gen t/s, no draft | Gen t/s, MTP | MTP speed-up |
 |---|---|---|---|---|
-| 784 | 229 | 8.24 | 12.74 | 1.55x |
-| 3,428 | 209 | 7.66 | 11.39 | 1.49x |
-| 6,637 | 194 | 7.09 | 9.67 | 1.36x |
-| 12,796 | 170 (2026-10-09: 115) | 6.20 | 8.36 | 1.35x |
-| 24,767 | 139 (2026-10-09: 38) | 4.97 | 5.46 | 1.10x |
+| 784 | 234 | 8.26 | 12.76 | 1.54x |
+| 3,428 | 209 | 7.70 | 11.45 | 1.49x |
+| 6,637 | 194 | 7.10 | 9.74 | 1.37x |
+| 12,796 | 170 (2026-10-09: 115) | 6.23 | 8.39 | 1.35x |
+| 24,767 | 139 (2026-10-09: 38) | 4.96 | 5.42 | 1.09x |
+
+(Prompt t/s from the final default; generation from the `kvfix-0` run.
+Generation does not depend on `RKNPU_FA_ONLINE_MIN`: tg32 at 16k depth
+5.57-5.59 t/s with either value.)
 
 Short prompts (the 4 bench prompts, 128-token answers): **18.37 t/s with MTP**
 vs 8.5 without (2.2x). MTP gains less on long contexts because every verify
@@ -95,9 +97,11 @@ text (summaries of long, mixed documents accept less).
   runs (prompts 0.8k-24.8k, with and without MTP). The 256-token summaries
   are coherent and on-topic up to 24.8k tokens.
 - **MTP is exact:** MTP output is byte-identical to no-draft output
-  (2026-10-10: all 10 server answers, 0.8k-24.8k prompts; holdout 6/6 at
-  256 and 512 tokens). A 6-token verify batch gives bit-identical logits to
-  one-at-a-time decoding at 12.8k context (`docs/handover/profiling-patches/longdiff.cpp`).
+  (2026-10-10, with the KV-cache fix: all 10 server answers at 0.8k-24.8k
+  prompts, with `RKNPU_FA_ONLINE_MIN` 4096 and 0; holdout 6/6 at 256 and
+  512 tokens). This needs the `llama-kv-cache` fix on this branch (#1n):
+  without it, rejected drafts shift the sliding-window cache's cell order,
+  the attention rounds differently, and an answer can change at a near-tie.
 - **NPU vs CPU perplexity (wikitext-2):** see the table below.
 
 | Context | NPU PPL | CPU PPL (reference) |
@@ -135,7 +139,7 @@ did pp128 25.2 / tg 4.9.
 | Decode loop | NEON bf16 dot, segments on ggml's OpenMP team, per-thread collect, split A-prep, cached io bindings | tg 5.8 -> 8.24 (#1c), 8.78 after the rebase |
 | Prefill loops | pipelined chunks, whole-FFN schedule, NPU flash attention (native A/B/C, pipelined), ggml-cpu norm fusions, fused Q/K/V norms + RoPE + KV-cache writes, range-limited softmax | pp512 68 -> **296 t/s** (4.3x; #1d-#1h) |
 | MTP | `set_n_threads` fix, W8A8 native layout for verify batches, centroid drafter, drafter on CPU, `p_min` | decode with drafter 8.5 -> **18.4 t/s** (#1b, #1i) |
-| MTP exactness | ggml-cpu flash attention split-KV off by default | MTP output identical to no-draft (#1j) |
+| MTP exactness | ggml-cpu flash attention split-KV off by default; KV cache keeps the cell order after rejected drafts | MTP output identical to no-draft (#1j, #1n) |
 | Long context | GQA-grouped ggml-cpu attention for decode/verify | verify at 768 context -17% latency (#1k) |
 | Robustness | bounded NPU attention context cache, NPU attention limited to validated shapes, async-runner race fix | prompts >= 8k no longer crash; server no longer segfaults on prefill (#1l) |
 | Long prompts | P*V in 2048-position chunks (the NPU FP16 matmul collapses past K 4096), NPU attention to 32k, FP16 scores, online softmax per chunk, early P*V, chunk outputs combined in host memory | pp8k 166 -> ~220, pp16k 113 -> ~181, pp32k 28 -> ~134 (#1m) |
@@ -161,11 +165,13 @@ alternatives, in `RKNPU2-decode-research.md` (section numbers above) and
    - `ggml-cpu: RMS_NORM + MUL + ADD fusion`
    - `ggml-cpu: flash attention batch invariance + GQA-grouped kernel`
    - `gemma4-assistant: centroid draft logits`
+   - `llama-kv-cache: after a tail seq_rm, continue from the cell of the first removed position`
 3. `rknpu2:` the backend optimizations, then its tests and probes.
 4. `docs:` research notes and this guide (fork only).
 
-Checked on 2026-10-09: the five generic commits cherry-pick cleanly onto
-plain upstream `4ebdf2c74`, and each builds there on its own (backend off).
+Checked on 2026-10-09: the first five generic commits cherry-pick cleanly
+onto plain upstream `4ebdf2c74`, and each builds there on its own (backend
+off). The `llama-kv-cache` commit (2026-10-10) cherry-picks cleanly too.
 The original backend commits do not build against this newer upstream on
 their own (they predate API changes); the tree builds again from the
 `rknpu2:` optimization commit on. The full research history stays on
