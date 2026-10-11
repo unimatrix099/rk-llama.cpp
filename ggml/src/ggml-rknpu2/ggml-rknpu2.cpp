@@ -1260,16 +1260,7 @@ static inline int64_t rknpu_row_index(const struct ggml_tensor* idx, const void*
 // or on a row's position in M, so a verify row equals the one-token row (MTP stays exact).
 // The mirror is global: an MTP drafter attends to the target's cache from its own backend.
 #define RKNPU_DEC_DK 512
-// positions per P*V run (RKNPU_FA_DEC_CHUNK, 2048 or 4096: the FP16 matmul slows down past K 4096)
-static int64_t rknpu_dec_chunk() {
-    static const int64_t v = []() {
-        const char* env = std::getenv("RKNPU_FA_DEC_CHUNK");
-        const int64_t c = env ? std::atoll(env) : 2048;
-        return c == 4096 ? (int64_t)4096 : (int64_t)2048;
-    }();
-    return v;
-}
-#define RKNPU_DEC_CHUNK rknpu_dec_chunk()
+#define RKNPU_DEC_CHUNK 2048   // positions per P*V run (4096: tg32 @32k 4.87 vs 5.56 t/s)
 #define RKNPU_DEC_M 32
 
 static bool rknpu_fa_dec_enabled() {
@@ -1298,6 +1289,7 @@ struct rknpu_dec_ctx {   // one chunk's matmul: QK (A = Q, B = K chunk view, C =
     rknn_matmul_io_attr io;
     rknn_tensor_mem *A = nullptr, *B = nullptr, *C = nullptr;
     rknpu2_native_geom a_geom = {0, 0, 0}, c_geom = {0, 0, 0};
+    int core = 0;
     ~rknpu_dec_ctx() {
         if (!ctx) return;
         if (A) rknn_destroy_mem(ctx, A);
@@ -1434,7 +1426,8 @@ static rknpu_dec_ctx* rknpu_dec_get_ctx(rknpu_kv_mirror* m, int64_t h, int64_t c
         d->io.B.n_dims != 4 || (int)bd[2] != m->sN || (int)bd[3] != m->sK || d->io.B.size != b_bytes) {
         return nullptr;
     }
-    rknn_matmul_set_core_mask(d->ctx, h % 3 == 0 ? RKNN_NPU_CORE_0 : h % 3 == 1 ? RKNN_NPU_CORE_1 : RKNN_NPU_CORE_2);
+    d->core = (int)(m->is_v ? (h + c) % 3 : h % 3);   // P*V chunks spread over all three cores
+    rknn_matmul_set_core_mask(d->ctx, d->core == 0 ? RKNN_NPU_CORE_0 : d->core == 1 ? RKNN_NPU_CORE_1 : RKNN_NPU_CORE_2);
     const size_t off = h * m->head_bytes + (m->is_v ? (size_t)c * chunk_bytes : 0);
     d->B = rknn_create_mem_from_fd(d->ctx, m->mem->fd, (uint8_t*)m->mem->virt_addr + off, b_bytes, off);
     d->A = rknn_create_mem(d->ctx, d->io.A.size);
@@ -1632,15 +1625,20 @@ static void rknpu_flash_attn_decode(const void* user, struct ggml_tensor* dst, i
             rknpu2_native_scatter_row((uint8_t*)d->A->virt_addr, (const uint8_t*)(p.data() + c * RKNPU_DEC_CHUNK), (int32_t)r, d->a_geom.m_stride, d->a_geom.outer, d->a_geom.sub * 2);
         }
     }
-    // 3. P*V runs, outputs summed over the chunks in chunk order, rows to dst
-    #pragma omp parallel for num_threads(std::min<int64_t>(n_kvh, n_omp))
-    for (int64_t g = 0; g < n_kvh; ++g) {
-        for (int64_t c = 0; c < nc; ++c) {
-            rknpu_dec_ctx* d = pv[g * nc + c];
+    // 3. P*V runs, one thread per NPU core running that core's chunks; then the outputs, summed
+    // over the chunks in chunk order, to dst
+    #pragma omp parallel for num_threads(std::min<int>(3, n_omp))
+    for (int core = 0; core < 3; ++core) {
+        for (int64_t x = 0; x < n_kvh * nc; ++x) {
+            rknpu_dec_ctx* d = pv[x];
+            if (d->core != core) continue;
             rknn_mem_sync(d->ctx, d->A, RKNN_MEMORY_SYNC_TO_DEVICE);
             RKNN_CHECK(rknn_matmul_run(d->ctx), "decode P*V");
             rknn_mem_sync(d->ctx, d->C, RKNN_MEMORY_SYNC_FROM_DEVICE);
         }
+    }
+    #pragma omp parallel for num_threads(std::min<int64_t>(n_kvh, n_omp))
+    for (int64_t g = 0; g < n_kvh; ++g) {
         for (int64_t r = 0; r < R; ++r) {
             float* o = (float*)(d_base + ((r % n_q) * n_head + g * rk2 + r / n_q) * dst->nb[1]);
             for (int64_t c = 0; c < nc; ++c) {
