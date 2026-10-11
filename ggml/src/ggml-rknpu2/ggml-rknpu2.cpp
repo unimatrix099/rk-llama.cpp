@@ -1543,7 +1543,7 @@ static bool rknpu_fa_dec_supported(const struct ggml_tensor* op) {
 static int64_t rknpu_fa_dec_cpu_max() {
     static const int64_t v = []() {
         const char* env = std::getenv("RKNPU_FA_DEC_CPU_MAX");
-        return env ? (int64_t)std::atoll(env) : (int64_t)2048;
+        return env ? (int64_t)std::atoll(env) : (int64_t)1024;   // tg64: CPU and NPU even at 1k cells
     }();
     return v;
 }
