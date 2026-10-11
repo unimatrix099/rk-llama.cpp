@@ -1300,12 +1300,13 @@ struct rknpu_dec_ctx {   // one chunk's matmul: QK (A = Q, B = K chunk view, C =
     }
 };
 
-// INT8 K for the decode Q*K^T (RKNPU_FA_DEC_K8, default off): K per position and Q per row scaled
-// to INT8, INT8 x INT8 -> INT32 (1.6 vs 3.1 ms per head run at 32k); the RK3588 has no FP16 x INT8
+// INT8 K for the decode Q*K^T (RKNPU_FA_DEC_K8, default on): K per position and Q per row scaled
+// to INT8, INT8 x INT8 -> INT32 (1.6 vs 3.1 ms per head run at 32k; tg32 @32k +6%); the RK3588 has
+// no FP16 x INT8. Decode-path KLD vs CPU attention 0.341 (FP16 K: 0.347), MTP identity kept (#1o)
 static bool rknpu_fa_dec_k8() {
     static const bool v = []() {
         const char* env = std::getenv("RKNPU_FA_DEC_K8");
-        return env != nullptr && std::atoi(env) != 0;
+        return env == nullptr || std::atoi(env) != 0;
     }();
     return v;
 }
