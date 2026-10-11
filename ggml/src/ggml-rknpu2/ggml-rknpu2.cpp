@@ -1300,9 +1300,21 @@ struct rknpu_dec_ctx {   // one chunk's matmul: QK (A = Q, B = K chunk view, C =
     }
 };
 
+// INT8 K for the decode Q*K^T (RKNPU_FA_DEC_K8, default off): K per position and Q per row scaled
+// to INT8, INT8 x INT8 -> INT32 (1.6 vs 3.1 ms per head run at 32k); the RK3588 has no FP16 x INT8
+static bool rknpu_fa_dec_k8() {
+    static const bool v = []() {
+        const char* env = std::getenv("RKNPU_FA_DEC_K8");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return v;
+}
+
 struct rknpu_kv_mirror {   // one cache tensor (K or V), all its KV heads
     const struct ggml_tensor* cache = nullptr;
     bool is_v = false;
+    bool k8 = false;                  // K as INT8, one scale per (head, position) in kscale
+    std::vector<float> kscale;
     int64_t n_kvh = 0, kv_size = 0, n_chunks = 0;
     size_t head_bytes = 0;   // bytes per KV head (n_chunks chunks)
     int32_t domain = 0;
@@ -1342,6 +1354,16 @@ static void rknpu_mirrors_release(const void* user) {
 }
 
 static uint16_t* rknpu_mirror_head(rknpu_kv_mirror* m, int64_t h) { return (uint16_t*)((uint8_t*)m->mem->virt_addr + h * m->head_bytes); }
+static int8_t* rknpu_mirror_head8(rknpu_kv_mirror* m, int64_t h) { return (int8_t*)((uint8_t*)m->mem->virt_addr + h * m->head_bytes); }
+
+// one K row of one head as INT8 with a scale (max |k| / 127)
+static float rknpu_quant_row8(const uint16_t* src, int64_t n, int8_t* q) {
+    float amax = 0.0f;
+    for (int64_t d = 0; d < n; ++d) amax = std::max(amax, fabsf(ggml_fp16_to_fp32(src[d])));
+    const float sc = amax > 0.0f ? amax / 127.0f : 1.0f, inv = 1.0f / sc;
+    for (int64_t d = 0; d < n; ++d) q[d] = (int8_t)std::max(-127.0f, std::min(127.0f, nearbyintf(ggml_fp16_to_fp32(src[d]) * inv)));
+    return sc;
+}
 
 // element offsets (in FP16 units) inside one head's buffer
 static inline size_t rknpu_mirror_k_off(const rknpu_kv_mirror* m, int64_t pos, int64_t d) {
@@ -1360,7 +1382,16 @@ static void rknpu_mirror_store(rknpu_kv_mirror* m, int64_t pos, bool clean) {
     for (int64_t h = 0; h < m->n_kvh; ++h) {
         uint16_t* hb = rknpu_mirror_head(m, h);
         const uint16_t* src = row + h * RKNPU_DEC_DK;
-        if (!m->is_v) {   // runs of sK dims are contiguous
+        if (m->k8) {
+            int8_t q[RKNPU_DEC_DK];
+            m->kscale[h * m->kv_size + pos] = rknpu_quant_row8(src, RKNPU_DEC_DK, q);
+            int8_t* hb8 = rknpu_mirror_head8(m, h);
+            for (int64_t d = 0; d < RKNPU_DEC_DK; d += m->sK) {
+                int8_t* p = hb8 + rknpu_mirror_k_off(m, pos, d);
+                memcpy(p, q + d, m->sK);
+                if (clean) rknpu_clean_line(p);
+            }
+        } else if (!m->is_v) {   // runs of sK dims are contiguous
             for (int64_t d = 0; d < RKNPU_DEC_DK; d += m->sK) {
                 uint16_t* p = hb + rknpu_mirror_k_off(m, pos, d);
                 memcpy(p, src + d, m->sK * 2);
@@ -1391,6 +1422,16 @@ static void rknpu_mirror_validate(rknpu_kv_mirror* m, int64_t n_kv) {
     const int64_t probes[8] = { 0, n_kv / 7, 2 * n_kv / 7, 3 * n_kv / 7, 4 * n_kv / 7, 5 * n_kv / 7, 6 * n_kv / 7, n_kv - 1 };
     for (int64_t pos : probes) {
         const uint16_t* row = (const uint16_t*)((const char*)get_tensor_real_ptr(t) + pos * t->nb[1]);
+        if (m->k8) {
+            for (int64_t h = 0; h < m->n_kvh; ++h) {
+                int8_t q[RKNPU_DEC_DK];
+                const float sc = rknpu_quant_row8(row + h * RKNPU_DEC_DK, RKNPU_DEC_DK, q);
+                bool same = sc == m->kscale[h * m->kv_size + pos];
+                for (int64_t d = 0; d < RKNPU_DEC_DK && same; d += 61) same = rknpu_mirror_head8(m, h)[rknpu_mirror_k_off(m, pos, d)] == q[d];
+                if (!same) { rknpu_mirror_fill(m); return; }
+            }
+            continue;
+        }
         for (int64_t h = 0; h < m->n_kvh; ++h) for (int64_t d = 0; d < RKNPU_DEC_DK; d += 61) {
             const size_t o = m->is_v ? rknpu_mirror_v_off(m, pos, d) : rknpu_mirror_k_off(m, pos, d);
             if (rknpu_mirror_head(m, h)[o] != row[h * RKNPU_DEC_DK + d]) {
@@ -1413,13 +1454,13 @@ static rknpu_dec_ctx* rknpu_dec_get_ctx(rknpu_kv_mirror* m, int64_t h, int64_t c
     info.M = RKNPU_DEC_M;
     info.K = m->is_v ? RKNPU_DEC_CHUNK : RKNPU_DEC_DK;
     info.N = m->is_v ? RKNPU_DEC_DK : (int32_t)(span * RKNPU_DEC_CHUNK);
-    info.type = m->is_v ? RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32 : RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16;
+    info.type = m->is_v ? RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32 : m->k8 ? RKNN_INT8_MM_INT8_TO_INT32 : RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16;
     info.B_layout = RKNN_MM_LAYOUT_NATIVE;
     info.AC_layout = RKNN_MM_LAYOUT_NATIVE;
     info.iommu_domain_id = m->domain;
     if (rknn_matmul_create(&d->ctx, &info, &d->io) < 0) { d->ctx = 0; return nullptr; }
     const auto& bd = d->io.B.dims;
-    const size_t chunk_bytes = (size_t)RKNPU_DEC_CHUNK * RKNPU_DEC_DK * 2, b_bytes = span * chunk_bytes;
+    const size_t chunk_bytes = (size_t)RKNPU_DEC_CHUNK * RKNPU_DEC_DK * (m->k8 ? 1 : 2), b_bytes = span * chunk_bytes;
     if (rknpu2_native_geom_from_dims(d->io.A.dims, d->io.A.n_dims, &d->a_geom) != 0 ||
         rknpu2_native_geom_from_dims(d->io.C.dims, d->io.C.n_dims, &d->c_geom) != 0 ||
         d->a_geom.m_stride != RKNPU_DEC_M || d->c_geom.m_stride != RKNPU_DEC_M ||
@@ -1451,10 +1492,12 @@ static rknpu_kv_mirror* rknpu_mirror_get(const struct ggml_tensor* cache, bool i
     std::unique_ptr<rknpu_kv_mirror> m(new rknpu_kv_mirror());
     m->cache = cache;
     m->is_v = is_v;
+    m->k8 = !is_v && rknpu_fa_dec_k8();
     m->n_kvh = n_kvh;
     m->kv_size = cache->ne[1];
     m->n_chunks = (m->kv_size + RKNPU_DEC_CHUNK - 1) / RKNPU_DEC_CHUNK;
-    m->head_bytes = (size_t)m->n_chunks * RKNPU_DEC_CHUNK * RKNPU_DEC_DK * 2;
+    m->head_bytes = (size_t)m->n_chunks * RKNPU_DEC_CHUNK * RKNPU_DEC_DK * (m->k8 ? 1 : 2);
+    if (m->k8) m->kscale.assign(n_kvh * m->kv_size, 1.0f);
     // the native B cell geometry, from a throwaway context of the chunk shape
     {
         rknn_matmul_info info;
@@ -1462,7 +1505,7 @@ static rknpu_kv_mirror* rknpu_mirror_get(const struct ggml_tensor* cache, bool i
         info.M = RKNPU_DEC_M;
         info.K = is_v ? RKNPU_DEC_CHUNK : RKNPU_DEC_DK;
         info.N = is_v ? RKNPU_DEC_DK : RKNPU_DEC_CHUNK;
-        info.type = is_v ? RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32 : RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16;
+        info.type = is_v ? RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32 : m->k8 ? RKNN_INT8_MM_INT8_TO_INT32 : RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16;
         info.B_layout = RKNN_MM_LAYOUT_NATIVE;
         info.AC_layout = RKNN_MM_LAYOUT_NATIVE;
         rknn_matmul_ctx ctx = 0;
@@ -1679,6 +1722,14 @@ static void rknpu_flash_attn_decode(const void* user, struct ggml_tensor* dst, i
             const struct ggml_tensor* t = m->cache;
             for (int64_t pos = 0; pos < n_kv; ++pos) {
                 const uint16_t* row = (const uint16_t*)((const char*)get_tensor_real_ptr(t) + pos * t->nb[1]);
+                if (m->k8) {
+                    for (int64_t h = 0; h < n_kvh; ++h) {
+                        int8_t q[RKNPU_DEC_DK];
+                        bad += rknpu_quant_row8(row + h * RKNPU_DEC_DK, RKNPU_DEC_DK, q) != m->kscale[h * m->kv_size + pos];
+                        for (int64_t d = 0; d < RKNPU_DEC_DK; ++d) bad += rknpu_mirror_head8(m, h)[rknpu_mirror_k_off(m, pos, d)] != q[d];
+                    }
+                    continue;
+                }
                 for (int64_t h = 0; h < n_kvh; ++h) for (int64_t d = 0; d < RKNPU_DEC_DK; ++d) {
                     const size_t o = m->is_v ? rknpu_mirror_v_off(m, pos, d) : rknpu_mirror_k_off(m, pos, d);
                     bad += rknpu_mirror_head(m, h)[o] != row[h * RKNPU_DEC_DK + d];
@@ -1700,14 +1751,21 @@ static void rknpu_flash_attn_decode(const void* user, struct ggml_tensor* dst, i
     auto q_row = [&](int64_t g, int64_t r) { return (const float*)(q_base + (r % n_q) * q->nb[1] + (g * rk2 + r / n_q) * q->nb[2]); };
     auto m_row = [&](int64_t r) { return (const ggml_fp16_t*)(m_base + (r % n_q) * mask->nb[1]); };
 
+    std::vector<float> qscale(n_kvh * R, 1.0f);   // INT8 Q scales (RKNPU_FA_DEC_K8)
     // 1. Q -> A of every QK chunk context, then the Q*K^T runs (one thread per KV head, on its own core)
     #pragma omp parallel for num_threads(std::min<int64_t>(n_kvh, n_omp))
     for (int64_t g = 0; g < n_kvh; ++g) {
         uint16_t qh[RKNPU_DEC_DK];
+        int8_t q8[RKNPU_DEC_DK];
         rknpu_dec_ctx* d = qk[g];
         for (int64_t r = 0; r < R; ++r) {
             rknpu_fp32_to_fp16(q_row(g, r), qh, RKNPU_DEC_DK);
-            rknpu2_native_scatter_row((uint8_t*)d->A->virt_addr, (const uint8_t*)qh, (int32_t)r, d->a_geom.m_stride, d->a_geom.outer, d->a_geom.sub * 2);
+            if (mk->k8) {
+                qscale[g * R + r] = rknpu_quant_row8(qh, RKNPU_DEC_DK, q8);
+                rknpu2_native_scatter_row((uint8_t*)d->A->virt_addr, (const uint8_t*)q8, (int32_t)r, d->a_geom.m_stride, d->a_geom.outer, d->a_geom.sub);
+            } else {
+                rknpu2_native_scatter_row((uint8_t*)d->A->virt_addr, (const uint8_t*)qh, (int32_t)r, d->a_geom.m_stride, d->a_geom.outer, d->a_geom.sub * 2);
+            }
         }
         rknn_mem_sync(d->ctx, d->A, RKNN_MEMORY_SYNC_TO_DEVICE);
         RKNN_CHECK(rknn_matmul_run(d->ctx), "decode Q*K^T");
@@ -1726,9 +1784,16 @@ static void rknpu_flash_attn_decode(const void* user, struct ggml_tensor* dst, i
         int64_t lo, hi;
         rknpu_softmax_range(mr, n_kv, &lo, &hi);
         const rknpu_dec_ctx* dq = qk[g];
-        const ggml_fp16_t* S = (const ggml_fp16_t*)dq->C->virt_addr;
         const int64_t sub = dq->c_geom.sub;
-        for (int64_t j = lo; j < hi; ++j) s[j] = ggml_fp16_to_fp32(S[((size_t)(j / sub) * RKNPU_DEC_M + r) * sub + j % sub]);
+        if (mk->k8) {
+            const int32_t* S = (const int32_t*)dq->C->virt_addr;
+            const float sq = qscale[g * R + r];
+            const float* ks = mk->kscale.data() + g * mk->kv_size;
+            for (int64_t j = lo; j < hi; ++j) s[j] = (float)S[((size_t)(j / sub) * RKNPU_DEC_M + r) * sub + j % sub] * sq * ks[j];
+        } else {
+            const ggml_fp16_t* S = (const ggml_fp16_t*)dq->C->virt_addr;
+            for (int64_t j = lo; j < hi; ++j) s[j] = ggml_fp16_to_fp32(S[((size_t)(j / sub) * RKNPU_DEC_M + r) * sub + j % sub]);
+        }
         rknpu_softmax_row(s.data(), mr, n_kv, lo, hi, scale, softcap, tmp.data(), p.data());
         memset(p.data() + n_kv, 0, (np - n_kv) * sizeof(uint16_t));
         for (int64_t c = 0; c < nc; ++c) {

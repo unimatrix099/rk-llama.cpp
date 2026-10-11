@@ -237,7 +237,36 @@ static int check_rowpos(void) {
     return 0;
 }
 
+// INT8=1: time Q*K^T (K = 512, N = n_kv) and one P*V chunk (K = 2048, N = 512) at M = 32, FP16 B vs INT8 B
+static int int8_timing(void) {
+    const int nkvs[] = { 4096, 16384, 32768 };
+    printf("M=32, ms per run (mean of 20): QK FP16xFP16->FP16 | QK INT8xINT8->INT32 | PV FP16xFP16->FP32 | PV INT8xINT8->FP32\n");
+    for (int a = 0; a < 3; ++a) {
+        const int n = nkvs[a];
+        int types[4] = { RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT16, RKNN_INT8_MM_INT8_TO_INT32, RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32, RKNN_INT8_MM_INT8_TO_FLOAT32 };
+        double t[4];
+        for (int k = 0; k < 4; ++k) {
+            rknn_matmul_info info; memset(&info, 0, sizeof info);
+            info.M = 32; info.K = k < 2 ? DK : PVC; info.N = k < 2 ? n : DV; info.type = types[k];
+            info.B_layout = RKNN_MM_LAYOUT_NATIVE; info.AC_layout = RKNN_MM_LAYOUT_NATIVE;
+            rknn_matmul_ctx ctx; rknn_matmul_io_attr io;
+            if (rknn_matmul_create(&ctx, &info, &io) != 0) { t[k] = -1; continue; }
+            rknn_tensor_mem *A = rknn_create_mem(ctx, io.A.size), *B = rknn_create_mem(ctx, io.B.size), *C = rknn_create_mem(ctx, io.C.size);
+            memset(A->virt_addr, 0, io.A.size); memset(B->virt_addr, 1, io.B.size);
+            rknn_matmul_set_io_mem(ctx, A, &io.A); rknn_matmul_set_io_mem(ctx, B, &io.B); rknn_matmul_set_io_mem(ctx, C, &io.C);
+            rknn_mem_sync(ctx, B, RKNN_MEMORY_SYNC_TO_DEVICE);
+            for (int w = 0; w < 3; ++w) rknn_matmul_run(ctx);
+            double t0 = now_ms(); for (int it = 0; it < 20; ++it) rknn_matmul_run(ctx); t[k] = (now_ms() - t0) / 20;
+            if (a == 0) printf("  type %d B dims [%u %u %u %u] size %u\n", types[k], io.B.dims[0], io.B.dims[1], io.B.dims[2], io.B.dims[3], io.B.size);
+            rknn_destroy_mem(ctx, A); rknn_destroy_mem(ctx, B); rknn_destroy_mem(ctx, C); rknn_matmul_destroy(ctx);
+        }
+        printf("n_kv %5d: %.3f | %.3f | %.3f | %.3f\n", n, t[0], t[1], t[2], t[3]);
+    }
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (getenv("INT8")) return int8_timing();
     if (getenv("CHECK") && atoi(getenv("CHECK")) == 2) return check_rowpos();
     if (getenv("CHECK")) return check();
     const int reps = 10;
