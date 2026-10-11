@@ -1527,7 +1527,7 @@ static bool rknpu_fa_dec_supported(const struct ggml_tensor* op) {
     const int64_t n_q = q->ne[1], n_kvh = k->ne[2];
     if (k->ne[0] != RKNPU_DEC_DK || v->ne[0] != RKNPU_DEC_DK || n_q < 1) return false;
     if (q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || mask->ne[3] != 1 || mask->ne[2] != 1) return false;
-    if ((q->ne[2] / n_kvh) * n_q > RKNPU_DEC_M) return false;
+    if ((q->ne[2] / n_kvh) * n_q > RKNPU_DEC_M || (q->ne[2] / n_kvh) % 2 != 0) return false;   // CPU rows go in pairs of heads
     // K and V are views of whole cache rows: cell j at j * nb[1], head h at h * DK
     for (const struct ggml_tensor* t : { k, v }) {
         const struct ggml_tensor* c = t->view_src;
@@ -1547,52 +1547,67 @@ static int64_t rknpu_fa_dec_cpu_max() {
     }();
     return v;
 }
-static void rknpu_attn_row_cpu(const float* qr, const char* kb, size_t k_nb1, const char* vb, size_t v_nb1, int64_t lo, int64_t hi,
-                               const ggml_fp16_t* mrow, float scale, float softcap, float* w, float* out) {
+#define RKNPU_DEC_CPU_HEADS 2   // query heads per CPU work item (always the same split: decode and verify agree)
+// NH query heads sharing one KV head, one query: each K and V row is read once for all of them
+static void rknpu_attn_rows_cpu(int NH, const float* const* qr, const char* kb, size_t k_nb1, const char* vb, size_t v_nb1,
+                                int64_t lo, int64_t hi, const ggml_fp16_t* mrow, float scale, float softcap,
+                                float* w /* NH x n */, int64_t n, float* const* out) {
     const int64_t D = RKNPU_DEC_DK;
-    float mx = -INFINITY;
+    float mx[RKNPU_DEC_CPU_HEADS];
+    for (int t = 0; t < NH; ++t) mx[t] = -INFINITY;
     for (int64_t j = lo; j < hi; ++j) {
-        const ggml_fp16_t* kr = (const ggml_fp16_t*)(kb + j * k_nb1);
-        float s = 0.0f;
+        const uint16_t* kr = (const uint16_t*)(kb + j * k_nb1);
+        const float mval = mrow ? ggml_fp16_to_fp32(mrow[j]) : 0.0f;
+        for (int t = 0; t < NH; ++t) {
+            float s = 0.0f;
 #ifdef __ARM_NEON
-        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
-        for (int64_t d = 0; d < D; d += 16) {
-            const float16x8_t k0 = vreinterpretq_f16_u16(vld1q_u16((const uint16_t*)kr + d));
-            const float16x8_t k1 = vreinterpretq_f16_u16(vld1q_u16((const uint16_t*)kr + d + 8));
-            a0 = vfmaq_f32(a0, vld1q_f32(qr + d),      vcvt_f32_f16(vget_low_f16(k0)));
-            a1 = vfmaq_f32(a1, vld1q_f32(qr + d + 4),  vcvt_f32_f16(vget_high_f16(k0)));
-            a2 = vfmaq_f32(a2, vld1q_f32(qr + d + 8),  vcvt_f32_f16(vget_low_f16(k1)));
-            a3 = vfmaq_f32(a3, vld1q_f32(qr + d + 12), vcvt_f32_f16(vget_high_f16(k1)));
-        }
-        s = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+            const float* q = qr[t];
+            float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+            for (int64_t d = 0; d < D; d += 16) {
+                const float16x8_t k0 = vreinterpretq_f16_u16(vld1q_u16(kr + d));
+                const float16x8_t k1 = vreinterpretq_f16_u16(vld1q_u16(kr + d + 8));
+                a0 = vfmaq_f32(a0, vld1q_f32(q + d),      vcvt_f32_f16(vget_low_f16(k0)));
+                a1 = vfmaq_f32(a1, vld1q_f32(q + d + 4),  vcvt_f32_f16(vget_high_f16(k0)));
+                a2 = vfmaq_f32(a2, vld1q_f32(q + d + 8),  vcvt_f32_f16(vget_low_f16(k1)));
+                a3 = vfmaq_f32(a3, vld1q_f32(q + d + 12), vcvt_f32_f16(vget_high_f16(k1)));
+            }
+            s = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
 #else
-        for (int64_t d = 0; d < D; ++d) s += qr[d] * ggml_fp16_to_fp32(kr[d]);
+            for (int64_t d = 0; d < D; ++d) s += qr[t][d] * ggml_fp16_to_fp32(((const ggml_fp16_t*)kr)[d]);
 #endif
-        float x = s * scale;
-        if (softcap != 0.0f) x = softcap * tanhf(x);
-        if (mrow) x += ggml_fp16_to_fp32(mrow[j]);
-        w[j] = x;
-        mx = std::max(mx, x);
+            float x = s * scale;
+            if (softcap != 0.0f) x = softcap * tanhf(x);
+            x += mval;
+            w[t * n + j] = x;
+            mx[t] = std::max(mx[t], x);
+        }
     }
-    for (int64_t d = 0; d < D; ++d) out[d] = 0.0f;
-    if (mx == -INFINITY) return;   // nothing visible
-    float sum = 0.0f;
-    for (int64_t j = lo; j < hi; ++j) { w[j] = expf(w[j] - mx); sum += w[j]; }
-    const float inv = 1.0f / sum;
+    float inv[RKNPU_DEC_CPU_HEADS];
+    for (int t = 0; t < NH; ++t) {
+        for (int64_t d = 0; d < D; ++d) out[t][d] = 0.0f;
+        inv[t] = 0.0f;
+        if (mx[t] == -INFINITY) continue;   // nothing visible
+        float sum = 0.0f;
+        for (int64_t j = lo; j < hi; ++j) { w[t * n + j] = expf(w[t * n + j] - mx[t]); sum += w[t * n + j]; }
+        inv[t] = 1.0f / sum;
+    }
     for (int64_t j = lo; j < hi; ++j) {
-        const float p = w[j] * inv;
-        if (p == 0.0f) continue;
-        const ggml_fp16_t* vr = (const ggml_fp16_t*)(vb + j * v_nb1);
+        const uint16_t* vr = (const uint16_t*)(vb + j * v_nb1);
+        for (int t = 0; t < NH; ++t) {
+            const float p = w[t * n + j] * inv[t];
+            if (p == 0.0f) continue;
+            float* o = out[t];
 #ifdef __ARM_NEON
-        const float32x4_t pv = vdupq_n_f32(p);
-        for (int64_t d = 0; d < D; d += 8) {
-            const float16x8_t v8 = vreinterpretq_f16_u16(vld1q_u16((const uint16_t*)vr + d));
-            vst1q_f32(out + d,     vfmaq_f32(vld1q_f32(out + d),     pv, vcvt_f32_f16(vget_low_f16(v8))));
-            vst1q_f32(out + d + 4, vfmaq_f32(vld1q_f32(out + d + 4), pv, vcvt_f32_f16(vget_high_f16(v8))));
-        }
+            const float32x4_t pv = vdupq_n_f32(p);
+            for (int64_t d = 0; d < D; d += 8) {
+                const float16x8_t v8 = vreinterpretq_f16_u16(vld1q_u16(vr + d));
+                vst1q_f32(o + d,     vfmaq_f32(vld1q_f32(o + d),     pv, vcvt_f32_f16(vget_low_f16(v8))));
+                vst1q_f32(o + d + 4, vfmaq_f32(vld1q_f32(o + d + 4), pv, vcvt_f32_f16(vget_high_f16(v8))));
+            }
 #else
-        for (int64_t d = 0; d < D; ++d) out[d] += p * ggml_fp16_to_fp32(vr[d]);
+            for (int64_t d = 0; d < D; ++d) o[d] += p * ggml_fp16_to_fp32(((const ggml_fp16_t*)vr)[d]);
 #endif
+        }
     }
 }
 
@@ -1622,15 +1637,25 @@ static void rknpu_flash_attn_decode(const void* user, struct ggml_tensor* dst, i
     if (any_cpu) {
         const char* k_base = (const char*)get_tensor_real_ptr(k);
         const char* v_base = (const char*)get_tensor_real_ptr(v);
+        // work item = (query, group of RKNPU_DEC_CPU_HEADS query heads of one KV head)
+        const int64_t n_grp = (n_head + RKNPU_DEC_CPU_HEADS - 1) / RKNPU_DEC_CPU_HEADS;
         #pragma omp parallel for num_threads(n_omp)
-        for (int64_t x = 0; x < n_head * n_q; ++x) {
-            const int64_t h = x % n_head, i = x / n_head;
+        for (int64_t x = 0; x < n_grp * n_q; ++x) {
+            const int64_t h0 = (x % n_grp) * RKNPU_DEC_CPU_HEADS, i = x / n_grp;
             if (!on_cpu[i]) continue;
+            const int NH = (int)std::min<int64_t>(RKNPU_DEC_CPU_HEADS, n_head - h0);
+            GGML_ASSERT(h0 / rk2 == (h0 + NH - 1) / rk2);   // one KV head per group
             static thread_local std::vector<float> w;
-            if ((int64_t)w.size() < n_kv) w.resize(n_kv);
-            const int64_t g = h / rk2;
-            rknpu_attn_row_cpu((const float*)(q_base + i * q->nb[1] + h * q->nb[2]), k_base + g * k->nb[2], k->nb[1], v_base + g * v->nb[2], v->nb[1],
-                               q_lo[i], q_hi[i], mq_row(i), scale, softcap, w.data(), (float*)(d_base + (i * n_head + h) * dst->nb[1]));
+            if ((int64_t)w.size() < RKNPU_DEC_CPU_HEADS * n_kv) w.resize(RKNPU_DEC_CPU_HEADS * n_kv);
+            const float* qr[RKNPU_DEC_CPU_HEADS];
+            float* out[RKNPU_DEC_CPU_HEADS];
+            for (int t = 0; t < NH; ++t) {
+                qr[t] = (const float*)(q_base + i * q->nb[1] + (h0 + t) * q->nb[2]);
+                out[t] = (float*)(d_base + (i * n_head + h0 + t) * dst->nb[1]);
+            }
+            const int64_t g = h0 / rk2;
+            rknpu_attn_rows_cpu(NH, qr, k_base + g * k->nb[2], k->nb[1], v_base + g * v->nb[2], v->nb[1],
+                                q_lo[i], q_hi[i], mq_row(i), scale, softcap, w.data(), n_kv, out);
         }
     }
     if (!any_npu) return;
