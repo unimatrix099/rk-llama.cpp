@@ -1388,58 +1388,49 @@ Design for the implementation:
 - Numerics change against the CPU path (FP32 accumulation on the NPU): the
   tolerant quality gate applies.
 
-#### 1o implementation status (2026-10-10 night, branch `wip/npu-decode-attn`, NOT production)
+#### 1o implementation (2026-10-10/11) — KEPT, default on (`RKNPU_FA_DEC`)
 
-Done (commits on `wip/npu-decode-attn`, on top of `rebase/w4a4-on-upstream` 0719a6579):
-- `RKNPU_FA_DEC` (default on in the wip branch): FLASH_ATTN with n_q < 32 and head dim 512
-  runs `rknpu_flash_attn_decode` over a global KV mirror (`g_kv_mirrors`, keyed by cache tensor).
-  K mirror: one Q*K^T run per KV head over all chunks (positions outermost -> one contiguous B);
-  V mirror: 2048-position P*V chunks; M = 32 contexts for decode and verify (n_q <= 8).
-- Mirror updated inside `rknpu_kv_store_row` (both the fused and the standalone KV write);
-  <= 8 rows clean their lines (`dc cvac`, 12 us per row), bigger writes set `needs_sync`
-  (one whole-buffer sync before the next decode). An update after the node was wrong: decode
-  collects are deferred, so the cache rows were not written yet.
-- Spot check per call (8 cells): a cache changed behind the backend's back (llama-bench clears
-  the KV cache between repetitions; a new context can reuse a tensor address) triggers a refill.
-  `RKNPU_FA_DEC_CHECK=1` compares the whole mirror with the cache every call (debug; passes).
-- `src/llama-context.cpp`: the auto flash-attention probe disabled FA for the whole model when
-  RKNPU took the 1-token attention from a CPU layer (pp512 fell to 177); now allowed.
-- Probe additions: rows are bit-identical for M = 4 vs 24 and at any row position in M = 32.
+How it works:
+- FLASH_ATTN with n_q < 32, head dim 512 (the 7 global layers; the sliding-window layers stay
+  on ggml-cpu) runs `rknpu_flash_attn_decode`. Per query, the visible range [lo, hi) comes from
+  the mask; **rows that see <= `RKNPU_FA_DEC_CPU_MAX` (1024) cells run on the CPU** (own NEON
+  kernel, two query heads per K/V read, FP32), longer rows on the NPU. The choice is per row and
+  depends only on the row's own position, so a verify row and the one-token row take the same
+  path (MTP identity).
+- NPU rows: a global KV mirror (`g_kv_mirrors`, keyed by cache tensor; an MTP drafter attends
+  to the target cache from another backend) in native B layout. Q*K^T is one run per KV head
+  over all chunks (positions outermost in the K layout -> one contiguous B view); the softmax
+  is on the CPU; P*V runs in 2048-position chunks spread over the three cores ((head + chunk) % 3,
+  fixed per context). Decode and verify use the same M = 32 contexts; NPU rows are bit-identical
+  for any M and any row position (probe `CHECK=1`, `CHECK=2`).
+- Mirror maintenance: written in `rknpu_kv_store_row` (fused and standalone KV writes; an
+  update after the node was wrong because decode collects are deferred). <= 8 rows clean their
+  lines with `dc cvac` (12 us per row); bigger writes set `needs_sync` for one whole-buffer sync
+  before the next NPU use. 8-cell spot check per call; a cache changed behind the backend
+  (llama-bench clears the KV cache between repetitions) triggers a refill (V ~100 ms, K ~6 ms per
+  cache at 16k). `RKNPU_FA_DEC_CHECK=1` compares the whole mirror every call (debug).
+- Mirrors are freed with the last backend that used them. Freeing prints one
+  "failed to destroy handle" per mirror from librknnrt (the from_fd views share the buffer's
+  handle); all calls return 0 and the memory is released. Cosmetic; only at context free.
+- `src/llama-context.cpp`: the auto flash-attention probe no longer disables FA when an
+  accelerator takes the op from a CPU layer (it turned FA off model-wide: pp512 177).
+- Memory: +16 KiB per cell for the 4 global caches (512 MiB at 32k); server peak RSS 10.6 GiB
+  at a 24.8k prompt with MTP, >= 9.3 GiB available.
+- Not covered: context shift (`--context-shift`) rewrites the cache outside this backend; the
+  spot check may miss it. Use `RKNPU_FA_DEC=0` with context shift.
 
-Measured (llama-bench tg32, t/s; tg includes one mirror refill per repetition):
+Rejected along the way: 4096-position V chunks (tg32 @32k 4.87 vs 5.56: the FP16 matmul slows
+down at K 4096); per-chunk Q*K^T runs (4.8 vs 1.5 ms at 16k); a view sync / non-cacheable memory
+for appends (not coherent); a per-row CPU kernel without head grouping (slower than ggml-cpu).
 
-| depth | CPU attention (before) | NPU decode attention |
-|---|---|---|
-| 0 | 8.98 | 8.60 (-4%: fixed per-call overhead) |
-| 4096 | 7.52 | 7.71 |
-| 16384 | 5.63 | 6.59 (+17%) |
-| 32768 | 4.31 | 5.52-5.58 (+29%) |
-
-Per global layer at 32k: Q*K^T 3.4 ms, softmax 1.0, P*V 4.0 (17 chunk runs per head) = 8.4 ms
-(probe: 7.2). pp512 300, pp16384 182 (unchanged).
-
-To do next (in order):
-1. MTP exactness on the server with the decode path: `~/ident.sh` (base1 vs mtp1, 12.8k
-   summary) and the 10-request server stage (`STAGES=server ~/prodtest.sh`); then the 6-prompt
-   holdout. Decode now differs numerically from the CPU path (expected), but MTP vs no-draft must
-   stay byte-identical.
-2. Quality: guard (PPL/KLD unaffected - prefill only - but run it), plus a long-context check:
-   needle + summaries at 12.8k/24.8k vs the CPU-attention outputs (coherent, needle found).
-3. Speed: P*V is now the largest part (17 runs per head at 32k, each with A/C syncs): try 4096-
-   position V chunks (the FP16 K-collapse starts past 4096), or spread the P*V chunks over all 3
-   cores; drop the per-call vector allocations. Fixed overhead at short context (-4% at depth 0):
-   consider using the CPU below ~2k cells ONLY if it can be done without breaking MTP identity
-   (the choice must not depend on the batch; n_kv is the same for... check), otherwise accept.
-4. Teardown: "failed to destroy handle" at exit (the from_fd B views are destroyed after the
-   mirror memory / domain contexts); destroy views before the mirror buffer.
-5. Context shift (`--context-shift`) rewrites the cache without this backend: the spot check
-   may miss it; document or hook ROPE-on-cache.
-6. Then: production suite with RKNPU_FA_DEC on, docs, fold into `main` as its own `rknpu2:`
-   commit (+ the llama-context commit as a generic one), push after review.
-
-Board state at shutdown: checkout = wip commit 46462ce68 (decode path ON by default), clean
-tree. **Before production use, check out `main` (d73e89936) and rebuild** - or run with
-`RKNPU_FA_DEC=0`.
+Results (final build a70ff7099):
+- Server (`~/bench-logs/2026-10-11-dec2/`): MTP == no-draft 10/10 (0.8k-24.8k prompts),
+  needle 10/10, holdout 6/6 at 256 and 512 tokens; guard PPL32 26.5468, KLD 0.599872,
+  same-top 71.08, FA 12/12, RoPE 5/5, server 3x4/4 (even the old CPU-attention texts).
+- Short context: holdout base 8.68 / MTP 17.52 t/s (CPU attention 8.73 / 17.14).
+- Long context, server summaries (no draft / MTP, t/s): 12.8k 6.20 / 8.39 -> 6.97 / 10.92;
+  24.8k 4.96 / 5.42 -> 6.18 / 8.51 (MTP +57%).
+- pp unchanged (pp512 299, pp16384 182, pp32768 137).
 
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
@@ -2543,6 +2534,9 @@ becomes a server.
 | `RKNPU_FA_S16` | 1 | 0 = Q*K^T scores in FP32 instead of FP16 (#1m) |
 | `RKNPU_FA_ONLINE` | 1 | 0 = one-pass softmax over the whole row instead of the per-chunk online softmax (#1m) |
 | `RKNPU_FA_ONLINE_MIN` | 4096 | online softmax only above this many KV cells (0 = always; 3-4% slower on prompts up to 4k) (#1n) |
+| `RKNPU_FA_DEC` | 1 | decode/verify attention of the head-dim-512 layers on the NPU over a KV mirror (#1o); 0 = ggml-cpu |
+| `RKNPU_FA_DEC_CPU_MAX` | 1024 | rows that see at most this many cells use the backend's CPU kernel instead (#1o) |
+| `RKNPU_FA_DEC_CHECK` | 0 | debug: compare the whole KV mirror with the cache at every decode attention |
 | `RKNPU_FA_EARLY_PV` | 1 | 0 = P*V chunks run after the whole item's softmax instead of as each chunk's P is ready (#1m) |
 | `GGML_CPU_FA_GROUPED` | 1 | 0 = ggml-cpu flash attention handles each (query row, head) separately for small batches instead of per KV-head group (#1k) |
 | `GGML_CPU_FA_SPLIT_KV` | 0 | 1 = ggml-cpu flash attention splits the KV range for single-row decode at >= 512 cells (upstream default; faster only with few heads, breaks speculative-decoding identity; #1j) |

@@ -7,7 +7,9 @@ Branch `main` (code identical to the tested `rebase/w4a4-on-upstream`).
 Test logs on the board: `~/bench-logs/2026-10-10-prod/` (full suite),
 `~/bench-logs/2026-10-10-prod-fix/` (prompt speeds of the final default),
 `~/bench-logs/2026-10-10-kvfix-4096/` and `-kvfix-0/` (server runs with the
-KV-cache fix) and `~/bench-logs/2026-10-10-ident/`.
+KV-cache fix), `~/bench-logs/2026-10-10-ident/`, and for the NPU decode
+attention (2026-10-11) `~/bench-logs/2026-10-11-dec2/` (server) and
+`~/bench-logs/2026-10-11-dec-pptg/` (prompt speeds).
 
 ## 1. How to run it
 
@@ -35,6 +37,10 @@ Server, with the MTP drafter (fastest exact setup):
   answers benefit from it, but count the thinking tokens in `max_tokens`.
 - Without a drafter, drop the `-md`/`--spec-*` options: decode is then
   ~8.5-9 t/s at short context.
+- Decode attention of the global layers runs on the NPU over a KV mirror
+  (`RKNPU_FA_DEC`, default on; decode research #1o). It costs 512 MiB of
+  extra memory at 32k and is not compatible with `--context-shift` (off by
+  default): with context shift, set `RKNPU_FA_DEC=0`.
 
 ## 2. Supported sizes
 
@@ -48,9 +54,9 @@ Server, with the MTP drafter (fastest exact setup):
 Practical guidance (measured 2026-10-10): up to ~8k-token prompts
 prefill in under 40 s; 16k takes ~1.5 minutes; 32k takes ~4 minutes.
 
-Memory (server, `-c 32768`, 4 slots, MTP drafter loaded): resident size
-8.3 GiB after a short prompt, 10.1 GiB peak after a 24.8k-token prompt;
-the board kept >= 9.9 GiB available throughout.
+Memory (server, `-c 32768`, 4 slots, MTP drafter loaded, NPU decode
+attention): resident size 8.7 GiB after a short prompt, 10.6 GiB peak after
+a 24.8k-token prompt; the board kept >= 9.3 GiB available throughout.
 
 ## 3. Speed
 
@@ -66,30 +72,33 @@ the board kept >= 9.9 GiB available throughout.
 (`RKNPU_FA_ONLINE_MIN`; with it on for every size, prompts up to 4k are
 3-4% slower), early P*V.)
 
-### Generation vs context already in the window (no drafter, llama-bench tg32)
+### Generation vs context already in the window (no drafter, llama-bench tg32, median of 3)
 
 | Context depth | 0 | 1k | 2k | 4k | 8k | 16k | 32k |
 |---|---|---|---|---|---|---|---|
-| t/s | 8.97 | 8.22 | 7.97 | 7.52 | 6.76 | 5.63 | 4.31 |
+| **t/s, NPU decode attention (default)** | **8.98** | **8.18** | **7.97** | **7.85** | **7.40** | **6.87** | **5.98** |
+| t/s, CPU attention (`RKNPU_FA_DEC=0`) | 8.99 | 8.25 | 8.03 | 7.63 | 6.70 | 5.72 | 4.43 |
+
+(The first generation after the context grows past a new 2048-position
+block creates that block's NPU contexts, a one-time cost per block.)
 
 ### Server with real prompts (needle + 256-token summary, `-c 32768`)
 
 | Prompt tokens | Prompt t/s | Gen t/s, no draft | Gen t/s, MTP | MTP speed-up |
 |---|---|---|---|---|
-| 784 | 234 | 8.26 | 12.76 | 1.54x |
-| 3,428 | 209 | 7.70 | 11.45 | 1.49x |
-| 6,637 | 194 | 7.10 | 9.74 | 1.37x |
-| 12,796 | 170 (2026-10-09: 115) | 6.23 | 8.39 | 1.35x |
-| 24,767 | 139 (2026-10-09: 38) | 4.96 | 5.42 | 1.09x |
+| 784 | 233 | 8.15 | 10.44 (*) | 1.28x |
+| 3,428 | 208 | 7.77 | 13.21 | 1.70x |
+| 6,637 | 193 | 7.06 | 12.25 | 1.74x |
+| 12,796 | 169 (2026-10-09: 115) | 6.97 (CPU attention: 6.23) | **10.92** (8.39) | 1.57x |
+| 24,767 | 138 (2026-10-09: 38) | 6.18 (4.96) | **8.51** (5.42) | 1.38x |
 
-(Prompt t/s from the final default; generation from the `kvfix-0` run.
-Generation does not depend on `RKNPU_FA_ONLINE_MIN`: tg32 at 16k depth
-5.57-5.59 t/s with either value.)
+(`~/bench-logs/2026-10-11-dec2/`. (*) This summary's text differs from the
+CPU-attention run's and accepts fewer drafts (117 of 271 vs 137 of 278);
+MTP speed depends on the text.)
 
-Short prompts (the 4 bench prompts, 128-token answers): **18.37 t/s with MTP**
-vs 8.5 without (2.2x). MTP gains less on long contexts because every verify
-step's CPU attention grows with the context, and acceptance depends on the
-text (summaries of long, mixed documents accept less).
+Short prompts (holdout, 6 prompts x 256 tokens): **17.5 t/s with MTP** vs
+8.7 without (2.0x); the 4 bench prompts gave 18.4 t/s. With the NPU decode
+attention, MTP's verify steps no longer slow down much with the context.
 
 ## 4. Accuracy
 
@@ -97,9 +106,8 @@ text (summaries of long, mixed documents accept less).
   runs (prompts 0.8k-24.8k, with and without MTP). The 256-token summaries
   are coherent and on-topic up to 24.8k tokens.
 - **MTP is exact:** MTP output is byte-identical to no-draft output
-  (2026-10-10, with the KV-cache fix: all 10 server answers at 0.8k-24.8k
-  prompts, with `RKNPU_FA_ONLINE_MIN` 4096 and 0; holdout 6/6 at 256 and
-  512 tokens). This needs the `llama-kv-cache` fix on this branch (#1n):
+  (2026-10-11, with the NPU decode attention: all 10 server answers at
+  0.8k-24.8k prompts; holdout 6/6 at 256 and 512 tokens). This needs the `llama-kv-cache` fix on this branch (#1n):
   without it, rejected drafts shift the sliding-window cache's cell order,
   the attention rounds differently, and an answer can change at a near-tie.
 - **NPU vs CPU perplexity (wikitext-2):** see the table below.
@@ -143,9 +151,10 @@ did pp128 25.2 / tg 4.9.
 | Long context | GQA-grouped ggml-cpu attention for decode/verify | verify at 768 context -17% latency (#1k) |
 | Robustness | bounded NPU attention context cache, NPU attention limited to validated shapes, async-runner race fix | prompts >= 8k no longer crash; server no longer segfaults on prefill (#1l) |
 | Long prompts | P*V in 2048-position chunks (the NPU FP16 matmul collapses past K 4096), NPU attention to 32k, FP16 scores, online softmax per chunk, early P*V, chunk outputs combined in host memory | pp8k 166 -> ~220, pp16k 113 -> ~181, pp32k 28 -> ~134 (#1m) |
+| Long-context decode | NPU decode/verify attention for the global layers over a persistent native-layout KV mirror; short rows on a grouped CPU kernel | tg32 @16k 5.72 -> 6.87, @32k 4.43 -> 5.98; MTP on a 24.8k summary 5.42 -> 8.51 (#1o) |
 
 Total for E4B against the original backend's default: **prefill 4.8x**
-at pp128 (39.8 -> 190; larger prompts gain more: pp512 288, pp16k 181), **decode 2.7x without a drafter**
+at pp128 (39.8 -> 192; larger prompts gain more: pp512 299, pp16k 182), **decode 2.7x without a drafter**
 (3.3 -> 8.97) and **5.6x with MTP** (3.3 -> 18.4), at CPU-level accuracy.
 
 Every change is described, with its measurements and rejected
@@ -166,12 +175,14 @@ alternatives, in `RKNPU2-decode-research.md` (section numbers above) and
    - `ggml-cpu: flash attention batch invariance + GQA-grouped kernel`
    - `gemma4-assistant: centroid draft logits`
    - `llama-kv-cache: after a tail seq_rm, continue from the cell of the first removed position`
+   - `llama-context: a fused op an accelerator takes from a CPU layer does not disable it`
 3. `rknpu2:` the backend optimizations, then its tests and probes.
 4. `docs:` research notes and this guide (fork only).
 
 Checked on 2026-10-09: the first five generic commits cherry-pick cleanly
 onto plain upstream `4ebdf2c74`, and each builds there on its own (backend
-off). The `llama-kv-cache` commit (2026-10-10) cherry-picks cleanly too.
+off). The `llama-kv-cache` (2026-10-10) and `llama-context` (2026-10-11)
+commits cherry-pick cleanly too.
 The original backend commits do not build against this newer upstream on
 their own (they predate API changes); the tree builds again from the
 `rknpu2:` optimization commit on. The full research history stays on
