@@ -744,8 +744,11 @@ static const char * ggml_backend_rknpu_name(ggml_backend_t backend) {
     return "RKNPU";
 }
 
+static void rknpu_mirrors_release(const void* user);
+
 static void ggml_backend_rknpu_free(ggml_backend_t backend) {
     ggml_backend_rknpu_context * ctx = (ggml_backend_rknpu_context *)backend->context;
+    rknpu_mirrors_release(ctx);
     delete ctx;
     delete backend;
 }
@@ -1257,7 +1260,16 @@ static inline int64_t rknpu_row_index(const struct ggml_tensor* idx, const void*
 // or on a row's position in M, so a verify row equals the one-token row (MTP stays exact).
 // The mirror is global: an MTP drafter attends to the target's cache from its own backend.
 #define RKNPU_DEC_DK 512
-#define RKNPU_DEC_CHUNK 2048
+// positions per P*V run (RKNPU_FA_DEC_CHUNK, 2048 or 4096: the FP16 matmul slows down past K 4096)
+static int64_t rknpu_dec_chunk() {
+    static const int64_t v = []() {
+        const char* env = std::getenv("RKNPU_FA_DEC_CHUNK");
+        const int64_t c = env ? std::atoll(env) : 2048;
+        return c == 4096 ? (int64_t)4096 : (int64_t)2048;
+    }();
+    return v;
+}
+#define RKNPU_DEC_CHUNK rknpu_dec_chunk()
 #define RKNPU_DEC_M 32
 
 static bool rknpu_fa_dec_enabled() {
@@ -1289,7 +1301,8 @@ struct rknpu_dec_ctx {   // one chunk's matmul: QK (A = Q, B = K chunk view, C =
     ~rknpu_dec_ctx() {
         if (!ctx) return;
         if (A) rknn_destroy_mem(ctx, A);
-        if (B) rknn_destroy_mem(ctx, B);
+        // B is a view of the mirror buffer imported from its fd: it shares the buffer's handle, so
+        // destroying it would close the handle the buffer itself is freed with (the mirror frees it)
         if (C) rknn_destroy_mem(ctx, C);
         rknn_matmul_destroy(ctx);
     }
@@ -1306,13 +1319,35 @@ struct rknpu_kv_mirror {   // one cache tensor (K or V), all its KV heads
     int sN = 0, sK = 0;               // native B cell geometry
     std::vector<std::unique_ptr<rknpu_dec_ctx>> ctxs;   // [head][chunk], created on first use
     std::atomic<bool> needs_sync{false};                // bulk writes: one whole-buffer sync before the next use
+    std::unordered_set<const void*> users;              // backends that attended through it; freed with the last
+    ~rknpu_kv_mirror() {
+        ctxs.clear();   // the contexts and their B views first, then the buffer they view
+        if (mem) {
+            rknn_destroy_mem(alloc_ctx, mem);
+            g_domain_manager.release_domain_memory(domain, head_bytes * n_kvh);
+        }
+    }
 };
 
 struct rknpu_kv_mirrors {
     std::mutex mu;
     std::unordered_map<const struct ggml_tensor*, std::unique_ptr<rknpu_kv_mirror>> by_cache[2];   // [is_v]
 };
-static rknpu_kv_mirrors g_kv_mirrors;
+// never destroyed: mirrors are freed with their last backend (rknpu_mirrors_release), not at
+// static destruction, when the NPU runtime may already be gone
+static rknpu_kv_mirrors& g_kv_mirrors = *new rknpu_kv_mirrors();
+
+// a backend is being freed: drop it from every mirror, free the mirrors nobody uses any more
+static void rknpu_mirrors_release(const void* user) {
+    std::lock_guard<std::mutex> lock(g_kv_mirrors.mu);
+    for (auto& map : g_kv_mirrors.by_cache) {
+        for (auto it = map.begin(); it != map.end();) {
+            it->second->users.erase(user);
+            if (it->second->users.empty()) it = map.erase(it);
+            else ++it;
+        }
+    }
+}
 
 static uint16_t* rknpu_mirror_head(rknpu_kv_mirror* m, int64_t h) { return (uint16_t*)((uint8_t*)m->mem->virt_addr + h * m->head_bytes); }
 
@@ -1509,7 +1544,7 @@ static bool rknpu_fa_dec_supported(const struct ggml_tensor* op) {
     return true;
 }
 
-static void rknpu_flash_attn_decode(struct ggml_tensor* dst, int n_omp) {
+static void rknpu_flash_attn_decode(const void* user, struct ggml_tensor* dst, int n_omp) {
     const struct ggml_tensor *q = dst->src[0], *k = dst->src[1], *v = dst->src[2], *mask = dst->src[3];
     const int64_t n_q = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1], n_kvh = k->ne[2];
     const int64_t rk2 = n_head / n_kvh, R = rk2 * n_q;
@@ -1521,6 +1556,11 @@ static void rknpu_flash_attn_decode(struct ggml_tensor* dst, int n_omp) {
     rknpu_kv_mirror* mk = rknpu_mirror_get(k->view_src, false, n_kvh);
     rknpu_kv_mirror* mv = rknpu_mirror_get(v->view_src, true, n_kvh);
     GGML_ASSERT(mk && mv && "RKNPU2: KV mirror unavailable");
+    {
+        std::lock_guard<std::mutex> lock(g_kv_mirrors.mu);
+        mk->users.insert(user);
+        mv->users.insert(user);
+    }
     for (rknpu_kv_mirror* m : { mk, mv }) {
         rknpu_mirror_validate(m, n_kv);
         if (m->needs_sync.exchange(false)) rknn_mem_sync(m->alloc_ctx, m->mem, RKNN_MEMORY_SYNC_TO_DEVICE);
@@ -2291,7 +2331,7 @@ static int rknpu_fa_rows() {
 
 static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tensor* dst, int n_omp) {
     if (dst->src[0]->ne[1] < 32) {   // decode / verify: NPU attention over the KV mirror (supports_op only lets these through)
-        rknpu_flash_attn_decode(dst, n_omp);
+        rknpu_flash_attn_decode(bctx, dst, n_omp);
         return;
     }
     const struct ggml_tensor *q = dst->src[0], *k = dst->src[1], *v = dst->src[2], *mask = dst->src[3];
