@@ -8,8 +8,8 @@ Test logs on the board: `~/bench-logs/2026-10-10-prod/` (full suite),
 `~/bench-logs/2026-10-10-prod-fix/` (prompt speeds of the final default),
 `~/bench-logs/2026-10-10-kvfix-4096/` and `-kvfix-0/` (server runs with the
 KV-cache fix), `~/bench-logs/2026-10-10-ident/`, and for the NPU decode
-attention (2026-10-11) `~/bench-logs/2026-10-11-dec2/` (server) and
-`~/bench-logs/2026-10-11-dec-pptg/` (prompt speeds).
+attention (2026-10-11) `~/bench-logs/2026-10-11-k8/` (server, final build with
+INT8 K) and `~/bench-logs/2026-10-11-dec-pptg/` (prompt speeds).
 
 ## 1. How to run it
 
@@ -38,8 +38,8 @@ Server, with the MTP drafter (fastest exact setup):
 - Without a drafter, drop the `-md`/`--spec-*` options: decode is then
   ~8.5-9 t/s at short context.
 - Decode attention of the global layers runs on the NPU over a KV mirror
-  (`RKNPU_FA_DEC`, default on; decode research #1o). It costs 512 MiB of
-  extra memory at 32k and is not compatible with `--context-shift` (off by
+  (`RKNPU_FA_DEC`, default on; decode research #1o; K stored as INT8,
+  `RKNPU_FA_DEC_K8`). It costs ~384 MiB of extra memory at 32k and is not compatible with `--context-shift` (off by
   default): with context shift, set `RKNPU_FA_DEC=0`.
 
 ## 2. Supported sizes
@@ -55,8 +55,8 @@ Practical guidance (measured 2026-10-10): up to ~8k-token prompts
 prefill in under 40 s; 16k takes ~1.5 minutes; 32k takes ~4 minutes.
 
 Memory (server, `-c 32768`, 4 slots, MTP drafter loaded, NPU decode
-attention): resident size 8.7 GiB after a short prompt, 10.6 GiB peak after
-a 24.8k-token prompt; the board kept >= 9.3 GiB available throughout.
+attention): resident size 8.5 GiB after a short prompt, 10.3 GiB peak after
+a 24.8k-token prompt; the board kept >= 8.2 GiB available throughout.
 
 ## 3. Speed
 
@@ -76,7 +76,8 @@ a 24.8k-token prompt; the board kept >= 9.3 GiB available throughout.
 
 | Context depth | 0 | 1k | 2k | 4k | 8k | 16k | 32k |
 |---|---|---|---|---|---|---|---|
-| **t/s, NPU decode attention (default)** | **8.98** | **8.18** | **7.97** | **7.85** | **7.40** | **6.87** | **5.98** |
+| **t/s, NPU decode attention, INT8 K (default)** | **9.00** | **8.18** | **7.84** | **7.92** | **7.55** | **6.96** | **6.30** |
+| t/s, NPU decode attention, FP16 K (`RKNPU_FA_DEC_K8=0`) | 8.98 | 8.18 | 7.97 | 7.85 | 7.40 | 6.87 | 5.98 |
 | t/s, CPU attention (`RKNPU_FA_DEC=0`) | 8.99 | 8.25 | 8.03 | 7.63 | 6.70 | 5.72 | 4.43 |
 
 (The first generation after the context grows past a new 2048-position
@@ -86,15 +87,16 @@ block creates that block's NPU contexts, a one-time cost per block.)
 
 | Prompt tokens | Prompt t/s | Gen t/s, no draft | Gen t/s, MTP | MTP speed-up |
 |---|---|---|---|---|
-| 784 | 233 | 8.15 | 10.44 (*) | 1.28x |
-| 3,428 | 208 | 7.77 | 13.21 | 1.70x |
-| 6,637 | 193 | 7.06 | 12.25 | 1.74x |
-| 12,796 | 169 (2026-10-09: 115) | 6.97 (CPU attention: 6.23) | **10.92** (8.39) | 1.57x |
-| 24,767 | 138 (2026-10-09: 38) | 6.18 (4.96) | **8.51** (5.42) | 1.38x |
+| 784 | 232 | 8.17 | 10.43 (*) | 1.28x |
+| 3,428 | 207 | 7.83 | 11.44 | 1.46x |
+| 6,637 | 193 | 7.54 | 11.11 | 1.47x |
+| 12,796 | 169 (2026-10-09: 115) | 7.17 (CPU attention: 6.23) | **11.46** (8.39) | 1.60x |
+| 24,767 | 138 (2026-10-09: 38) | 6.49 (4.96) | **8.49** (5.42) | 1.31x |
 
-(`~/bench-logs/2026-10-11-dec2/`. (*) This summary's text differs from the
-CPU-attention run's and accepts fewer drafts (117 of 271 vs 137 of 278);
-MTP speed depends on the text.)
+(`~/bench-logs/2026-10-11-k8/`, final build. (*) This summary's text differs
+from the CPU-attention run's and accepts fewer drafts; MTP speed depends on
+the text: the same build gave 8.5-8.7 t/s on the 24.8k summary in other
+runs.)
 
 Short prompts (holdout, 6 prompts x 256 tokens): **17.5 t/s with MTP** vs
 8.7 without (2.0x); the 4 bench prompts gave 18.4 t/s. With the NPU decode
@@ -151,7 +153,7 @@ did pp128 25.2 / tg 4.9.
 | Long context | GQA-grouped ggml-cpu attention for decode/verify | verify at 768 context -17% latency (#1k) |
 | Robustness | bounded NPU attention context cache, NPU attention limited to validated shapes, async-runner race fix | prompts >= 8k no longer crash; server no longer segfaults on prefill (#1l) |
 | Long prompts | P*V in 2048-position chunks (the NPU FP16 matmul collapses past K 4096), NPU attention to 32k, FP16 scores, online softmax per chunk, early P*V, chunk outputs combined in host memory | pp8k 166 -> ~220, pp16k 113 -> ~181, pp32k 28 -> ~134 (#1m) |
-| Long-context decode | NPU decode/verify attention for the global layers over a persistent native-layout KV mirror; short rows on a grouped CPU kernel | tg32 @16k 5.72 -> 6.87, @32k 4.43 -> 5.98; MTP on a 24.8k summary 5.42 -> 8.51 (#1o) |
+| Long-context decode | NPU decode/verify attention for the global layers over a persistent native-layout KV mirror (INT8 K), short rows on a grouped CPU kernel | tg32 @16k 5.72 -> 6.96, @32k 4.43 -> 6.30; MTP on a 24.8k summary 5.42 -> 8.5 (#1o, #1p) |
 
 Total for E4B against the original backend's default: **prefill 4.8x**
 at pp128 (39.8 -> 192; larger prompts gain more: pp512 299, pp16k 182), **decode 2.7x without a drafter**

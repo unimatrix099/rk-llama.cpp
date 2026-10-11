@@ -1432,6 +1432,24 @@ Results (final build a70ff7099):
   24.8k 4.96 / 5.42 -> 6.18 / 8.51 (MTP +57%).
 - pp unchanged (pp512 299, pp16384 182, pp32768 137).
 
+### 1p. Follow-up loop: six ideas after the NPU decode attention (2026-10-11)
+
+Gate per idea: its metric +2%, tolerant quality gate, MTP == no-draft on the 12.8k summary.
+Log: `autoresearch/loop-ideas6/results.tsv` (git-ignored).
+
+| # | Idea | Measurement | Verdict |
+|---|---|---|---|
+| 1 | Prefill attention reads the KV mirror instead of repacking K/V | stage timing: the repack (stage 0) is 6.9 s of 123 s global-layer attention per pp32768 run, already overlapped with the NPU runs (softmax 54 s, QK 35 s, PV 33 s) | NO-GO, ceiling ~3% |
+| 2 | INT8 K for the decode Q*K^T | INT8 x INT8 -> INT32 (no FP16 x INT8 on RK3588); probe 1.62 vs 3.05 ms per head run at 32k; tg32 @16k 6.87 -> 7.09, @32k 5.87 -> 6.22; decode-path KLD vs CPU attention 0.341 (FP16 K 0.347), same-top 70.8 / 71.2 (`llama-perplexity -c 4096 -ub 8`, `RKNPU_FA_DEC_CPU_MAX=0`); MTP identity kept | **KEPT** (`RKNPU_FA_DEC_K8`, default on) |
+| 3 | Overlap the drafter with the target's verify | impossible: the first draft needs the hidden state of the finished verify; variant Q8_0 drafter: on the NPU 17.59 vs 17.65 t/s (F16 on the CPU), on the CPU (excluding q8_0 also moves a target tensor) 14.10 | NO-GO |
+| 4 | MTP n_max / p_min for long context | 6 configs on the 12.8k / 24.8k summaries: 5/0.6 10.76/8.65, 3/0.6 10.75/8.75, 7/0.6 10.66/8.53, 5/0.4 10.66/8.24, 7/0.4 10.27/7.93, 4/0.5 11.16/8.38 | NO-GO, keep 5/0.6 |
+| 5 | Sliding-window attention on the NPU | those rows see <= ~512 cells: ~6-7 ms per token on the CPU for 35 layers vs ~0.6 ms fixed NPU cost per call (~21 ms) | NO-GO |
+| 6 | Create decode contexts in the background | ~9 ms per context; serving creates 16 per 2048-token block (~150 ms once), < 0.1% of steady state | NO-GO (latency hiccup only) |
+
+Final build (INT8 K): server suite MTP == no-draft 10/10, needle 10/10; tg32 medians
+0/1k/2k/4k/8k/16k/32k = 9.00/8.18/7.84/7.92/7.55/6.96/6.30 (CPU attention 8.99/8.25/8.03/7.63/6.70/5.72/4.43).
+Remaining large cost at long prompts: the prefill softmax on the CPU (54 s of a pp32768 run).
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
@@ -2535,6 +2553,7 @@ becomes a server.
 | `RKNPU_FA_ONLINE` | 1 | 0 = one-pass softmax over the whole row instead of the per-chunk online softmax (#1m) |
 | `RKNPU_FA_ONLINE_MIN` | 4096 | online softmax only above this many KV cells (0 = always; 3-4% slower on prompts up to 4k) (#1n) |
 | `RKNPU_FA_DEC` | 1 | decode/verify attention of the head-dim-512 layers on the NPU over a KV mirror (#1o); 0 = ggml-cpu |
+| `RKNPU_FA_DEC_K8` | 1 | decode Q*K^T with INT8 K (per position) and INT8 Q (per row); 0 = FP16 K (#1p) |
 | `RKNPU_FA_DEC_CPU_MAX` | 1024 | rows that see at most this many cells use the backend's CPU kernel instead (#1o) |
 | `RKNPU_FA_DEC_CHECK` | 0 | debug: compare the whole KV mirror with the cache at every decode attention |
 | `RKNPU_FA_EARLY_PV` | 1 | 0 = P*V chunks run after the whole item's softmax instead of as each chunk's P is ready (#1m) |
