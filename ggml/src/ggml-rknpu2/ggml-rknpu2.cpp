@@ -1537,6 +1537,65 @@ static bool rknpu_fa_dec_supported(const struct ggml_tensor* op) {
     return true;
 }
 
+// Short rows on the CPU (RKNPU_FA_DEC_CPU_MAX): one (head, query) row of attention over the cells
+// [lo, hi) it can see, FP32 throughout. A row's result depends only on its own data, so whether
+// it runs here or on the NPU is decided per row (by hi) and is the same in decode and verify.
+static int64_t rknpu_fa_dec_cpu_max() {
+    static const int64_t v = []() {
+        const char* env = std::getenv("RKNPU_FA_DEC_CPU_MAX");
+        return env ? (int64_t)std::atoll(env) : (int64_t)2048;
+    }();
+    return v;
+}
+static void rknpu_attn_row_cpu(const float* qr, const char* kb, size_t k_nb1, const char* vb, size_t v_nb1, int64_t lo, int64_t hi,
+                               const ggml_fp16_t* mrow, float scale, float softcap, float* w, float* out) {
+    const int64_t D = RKNPU_DEC_DK;
+    float mx = -INFINITY;
+    for (int64_t j = lo; j < hi; ++j) {
+        const ggml_fp16_t* kr = (const ggml_fp16_t*)(kb + j * k_nb1);
+        float s = 0.0f;
+#ifdef __ARM_NEON
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+        for (int64_t d = 0; d < D; d += 16) {
+            const float16x8_t k0 = vreinterpretq_f16_u16(vld1q_u16((const uint16_t*)kr + d));
+            const float16x8_t k1 = vreinterpretq_f16_u16(vld1q_u16((const uint16_t*)kr + d + 8));
+            a0 = vfmaq_f32(a0, vld1q_f32(qr + d),      vcvt_f32_f16(vget_low_f16(k0)));
+            a1 = vfmaq_f32(a1, vld1q_f32(qr + d + 4),  vcvt_f32_f16(vget_high_f16(k0)));
+            a2 = vfmaq_f32(a2, vld1q_f32(qr + d + 8),  vcvt_f32_f16(vget_low_f16(k1)));
+            a3 = vfmaq_f32(a3, vld1q_f32(qr + d + 12), vcvt_f32_f16(vget_high_f16(k1)));
+        }
+        s = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+#else
+        for (int64_t d = 0; d < D; ++d) s += qr[d] * ggml_fp16_to_fp32(kr[d]);
+#endif
+        float x = s * scale;
+        if (softcap != 0.0f) x = softcap * tanhf(x);
+        if (mrow) x += ggml_fp16_to_fp32(mrow[j]);
+        w[j] = x;
+        mx = std::max(mx, x);
+    }
+    for (int64_t d = 0; d < D; ++d) out[d] = 0.0f;
+    if (mx == -INFINITY) return;   // nothing visible
+    float sum = 0.0f;
+    for (int64_t j = lo; j < hi; ++j) { w[j] = expf(w[j] - mx); sum += w[j]; }
+    const float inv = 1.0f / sum;
+    for (int64_t j = lo; j < hi; ++j) {
+        const float p = w[j] * inv;
+        if (p == 0.0f) continue;
+        const ggml_fp16_t* vr = (const ggml_fp16_t*)(vb + j * v_nb1);
+#ifdef __ARM_NEON
+        const float32x4_t pv = vdupq_n_f32(p);
+        for (int64_t d = 0; d < D; d += 8) {
+            const float16x8_t v8 = vreinterpretq_f16_u16(vld1q_u16((const uint16_t*)vr + d));
+            vst1q_f32(out + d,     vfmaq_f32(vld1q_f32(out + d),     pv, vcvt_f32_f16(vget_low_f16(v8))));
+            vst1q_f32(out + d + 4, vfmaq_f32(vld1q_f32(out + d + 4), pv, vcvt_f32_f16(vget_high_f16(v8))));
+        }
+#else
+        for (int64_t d = 0; d < D; ++d) out[d] += p * ggml_fp16_to_fp32(vr[d]);
+#endif
+    }
+}
+
 static void rknpu_flash_attn_decode(const void* user, struct ggml_tensor* dst, int n_omp) {
     const struct ggml_tensor *q = dst->src[0], *k = dst->src[1], *v = dst->src[2], *mask = dst->src[3];
     const int64_t n_q = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1], n_kvh = k->ne[2];
@@ -1546,6 +1605,35 @@ static void rknpu_flash_attn_decode(const void* user, struct ggml_tensor* dst, i
     memcpy(&scale,   (const float*)dst->op_params + 0, sizeof(float));
     memcpy(&softcap, (const float*)dst->op_params + 2, sizeof(float));
     if (softcap != 0.0f) scale /= softcap;
+    const char* q_base = (const char*)get_tensor_real_ptr(q);
+    const char* m_base = (const char*)get_tensor_real_ptr(mask);
+    char* d_base = (char*)get_tensor_real_ptr(dst);
+    auto mq_row = [&](int64_t i) { return (const ggml_fp16_t*)(m_base + i * mask->nb[1]); };
+    // per query: the visible range, and whether its rows run on the CPU (short) or the NPU
+    std::vector<int64_t> q_lo(n_q), q_hi(n_q);
+    std::vector<char> on_cpu(n_q);
+    bool any_npu = false, any_cpu = false;
+    for (int64_t i = 0; i < n_q; ++i) {
+        rknpu_softmax_range(mq_row(i), n_kv, &q_lo[i], &q_hi[i]);
+        on_cpu[i] = q_hi[i] <= rknpu_fa_dec_cpu_max();
+        any_cpu = any_cpu || on_cpu[i];
+        any_npu = any_npu || !on_cpu[i];
+    }
+    if (any_cpu) {
+        const char* k_base = (const char*)get_tensor_real_ptr(k);
+        const char* v_base = (const char*)get_tensor_real_ptr(v);
+        #pragma omp parallel for num_threads(n_omp)
+        for (int64_t x = 0; x < n_head * n_q; ++x) {
+            const int64_t h = x % n_head, i = x / n_head;
+            if (!on_cpu[i]) continue;
+            static thread_local std::vector<float> w;
+            if ((int64_t)w.size() < n_kv) w.resize(n_kv);
+            const int64_t g = h / rk2;
+            rknpu_attn_row_cpu((const float*)(q_base + i * q->nb[1] + h * q->nb[2]), k_base + g * k->nb[2], k->nb[1], v_base + g * v->nb[2], v->nb[1],
+                               q_lo[i], q_hi[i], mq_row(i), scale, softcap, w.data(), (float*)(d_base + (i * n_head + h) * dst->nb[1]));
+        }
+    }
+    if (!any_npu) return;
     rknpu_kv_mirror* mk = rknpu_mirror_get(k->view_src, false, n_kvh);
     rknpu_kv_mirror* mv = rknpu_mirror_get(v->view_src, true, n_kvh);
     GGML_ASSERT(mk && mv && "RKNPU2: KV mirror unavailable");
@@ -1583,9 +1671,6 @@ static void rknpu_flash_attn_decode(const void* user, struct ggml_tensor* dst, i
             GGML_ASSERT(pv[g * nc + c] && "RKNPU2: decode attention context creation failed");
         }
     }
-    const char* q_base = (const char*)get_tensor_real_ptr(q);
-    const char* m_base = (const char*)get_tensor_real_ptr(mask);
-    char* d_base = (char*)get_tensor_real_ptr(dst);
     // row r of a KV head's batch = (head-in-group hh, query i): r = hh * n_q + i (as in the prefill path)
     auto q_row = [&](int64_t g, int64_t r) { return (const float*)(q_base + (r % n_q) * q->nb[1] + (g * rk2 + r / n_q) * q->nb[2]); };
     auto m_row = [&](int64_t r) { return (const ggml_fp16_t*)(m_base + (r % n_q) * mask->nb[1]); };
@@ -1607,6 +1692,7 @@ static void rknpu_flash_attn_decode(const void* user, struct ggml_tensor* dst, i
     #pragma omp parallel for num_threads(n_omp)
     for (int64_t x = 0; x < n_kvh * R; ++x) {
         const int64_t g = x / R, r = x % R;
+        if (on_cpu[r % n_q]) continue;
         static thread_local std::vector<float> s, tmp;
         static thread_local std::vector<uint16_t> p;
         const int64_t np = nc * RKNPU_DEC_CHUNK;
@@ -1640,6 +1726,7 @@ static void rknpu_flash_attn_decode(const void* user, struct ggml_tensor* dst, i
     #pragma omp parallel for num_threads(std::min<int64_t>(n_kvh, n_omp))
     for (int64_t g = 0; g < n_kvh; ++g) {
         for (int64_t r = 0; r < R; ++r) {
+            if (on_cpu[r % n_q]) continue;
             float* o = (float*)(d_base + ((r % n_q) * n_head + g * rk2 + r / n_q) * dst->nb[1]);
             for (int64_t c = 0; c < nc; ++c) {
                 const rknpu_dec_ctx* d = pv[g * nc + c];
