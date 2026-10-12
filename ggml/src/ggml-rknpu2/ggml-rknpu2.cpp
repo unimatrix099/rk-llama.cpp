@@ -2548,7 +2548,17 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
     const int64_t DK = k->ne[0], DV = v->ne[0];
     const int64_t n_q = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1], n_kvh = k->ne[2];
     const int64_t rk2 = n_head / n_kvh;
-    const int64_t M = rk2 * n_q;
+    // Rows of a KV group (rk2 heads x n_q queries) in S blocks (RKNPU_FA_SPLIT, 1 = off): more,
+    // smaller pipeline items, so the CPU softmax overlaps the NPU runs at the start and end of
+    // a layer too. Block 0 of a group packs K/V; the other blocks bind its B. Same math per row.
+    static const int64_t split_env = []() {
+        const char* env = std::getenv("RKNPU_FA_SPLIT");
+        const int64_t v = env ? std::atoll(env) : 1;
+        return v == 2 || v == 4 ? v : (int64_t)1;
+    }();
+    const int64_t M_all = rk2 * n_q;
+    const int64_t S = M_all % (split_env * 32) == 0 ? split_env : 1;
+    const int64_t M = M_all / S;   // rows per pipeline item
     const int64_t n_seq = q->ne[3];
 
     float scale = 1.0f, softcap = 0.0f;
@@ -2584,7 +2594,8 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
     // Stage st of the attention of group g of sequence i3: 0 = fill A (Q) and
     // B (K, V), 1 = Q*K^T run, 2 = softmax into P, 3 = P*V run, 4 = output.
     // Groups run on their own NPU core and contexts.
-    auto stage = [&](int64_t i3, int64_t g, int st, int core) {
+    auto stage = [&](int64_t i3, int64_t g, int64_t b, int st, int core, int core0) {
+        const int64_t rb = b * M;   // first row of this block in the group
         const int64_t ik3 = i3 / (n_seq / k->ne[3]);
         const int64_t iv3 = i3 / (n_seq / v->ne[3]);
         const char* m_seq = mask ? m_base + (i3 % mask->ne[3]) * mask->nb[3] : nullptr;
@@ -2618,7 +2629,7 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         const bool host_out = online || n_pvc > 1;
         if (host_out && st == 2 && bctx->fa_out[core].size() < pv->io_attr.C.size / 4) bctx->fa_out[core].resize(pv->io_attr.C.size / 4);
         auto q_row = [&](int64_t r) {
-            const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
+            const int64_t hh = (r + rb) / n_q, i = (r + rb) % n_q, h = g * rk2 + hh;
             return (const float*)(q_base + i * q->nb[1] + h * q->nb[2] + i3 * q->nb[3]);
         };
         if (st == 0) {
@@ -2637,6 +2648,21 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
             } else {
                 #pragma omp parallel for num_threads(n_omp)
                 for (int64_t r = 0; r < M; ++r) rknpu_fp32_to_fp16(q_row(r), a + r * DK, DK);
+            }
+            if (b > 0) {   // K and V were packed by block 0 of this group (on core0): bind its B
+                GGML_ASSERT(qk->b_native && pv_b_native && "RKNPU2: split attention needs native B");
+                rknpu_attn_context* qk0 = bctx->get_attn_ctx((int)M, (int)DK, (int)n_kv, RKNN_MM_LAYOUT_TP_NORM, core0, 0, s16);
+                RKNN_CHECK(rknn_matmul_set_io_mem(qk->ctx, qk0->B, &qk->io_attr.B), "set_io_mem attn K (split)");
+                for (int c = 0; c < n_pvc; ++c) {
+                    rknpu_attn_context* pv0 = bctx->get_attn_ctx((int)M, (int)std::min(KC, n_kv - c * KC), (int)DV, RKNN_MM_LAYOUT_NORM, core0, c);
+                    RKNN_CHECK(rknn_matmul_set_io_mem(pvs[c]->ctx, pv0->B, &pvs[c]->io_attr.B), "set_io_mem attn V (split)");
+                }
+                rknn_mem_sync(qk->ctx, qk->A, RKNN_MEMORY_SYNC_TO_DEVICE);
+                return;
+            }
+            if (S > 1) {   // these contexts may still be bound to another group's B: bind their own
+                RKNN_CHECK(rknn_matmul_set_io_mem(qk->ctx, qk->B, &qk->io_attr.B), "set_io_mem attn K");
+                for (int c = 0; c < n_pvc; ++c) RKNN_CHECK(rknn_matmul_set_io_mem(pvs[c]->ctx, pvs[c]->B, &pvs[c]->io_attr.B), "set_io_mem attn V");
             }
             // B = K rows (n_kv x DK, TP_NORM) and V rows (n_kv x DV, NORM)
             uint16_t* bk = (uint16_t*)qk->B->virt_addr;
@@ -2697,7 +2723,7 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
             if (!native && (int64_t)p_full.size() < M * n_kv) p_full.resize(M * n_kv);
             uint16_t* P = native ? nullptr : p_full.data();
             auto m_row = [&](int64_t r) {
-                return mask ? (const ggml_fp16_t*)(m_seq + (r % n_q) * mask->nb[1]) : nullptr;
+                return mask ? (const ggml_fp16_t*)(m_seq + ((r + rb) % n_q) * mask->nb[1]) : nullptr;
             };
             if (native && online && early_pv) {
                 // chunk-major: softmax of chunk c for every row block, then chunk c's P*V starts
@@ -2729,7 +2755,7 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                         int64_t blo = n_kv, bhi = 0;
                         for (int k = 0; k < FR; ++k) {
                             if (!m_lo.empty()) {
-                                const int64_t x = (i3 % mask->ne[3]) * n_q + (r0 + k) % n_q;
+                                const int64_t x = (i3 % mask->ne[3]) * n_q + (r0 + k + rb) % n_q;
                                 lo[k] = m_lo[x]; hi[k] = m_hi[x];
                             } else {
                                 rknpu_softmax_range(m_row(r0 + k), n_kv, &lo[k], &hi[k]);
@@ -2788,7 +2814,7 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                     int64_t blo = n_kv, bhi = 0;
                     for (int k = 0; k < FR; ++k) {
                         if (!m_lo.empty()) {
-                            const int64_t x = (i3 % mask->ne[3]) * n_q + (r0 + k) % n_q;
+                            const int64_t x = (i3 % mask->ne[3]) * n_q + (r0 + k + rb) % n_q;
                             lo[k] = m_lo[x]; hi[k] = m_hi[x];
                         } else {
                             rknpu_softmax_range(m_row(r0 + k), n_kv, &lo[k], &hi[k]);
@@ -2926,7 +2952,7 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
             const float* O = host_out ? bctx->fa_out[core].data() : (const float*)pv->C->virt_addr;
             // permute(0, 2, 1, 3): row (i3*n_q*n_head + i*n_head + h)
             auto d_row = [&](int64_t r) {
-                const int64_t hh = r / n_q, i = r % n_q, h = g * rk2 + hh;
+                const int64_t hh = (r + rb) / n_q, i = (r + rb) % n_q, h = g * rk2 + hh;
                 return d_base + (i3 * n_q * n_head + i * n_head + h) * dst->nb[1];
             };
             if (native) {
@@ -2952,11 +2978,13 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         const char* env = std::getenv("RKNPU_FA_OVERLAP");
         return env == nullptr || std::atoi(env) != 0;
     }();
-    const int n = (int)(n_seq * n_kvh);   // items it = (i3, g), i3-major
+    const int n = (int)(n_seq * n_kvh * S);   // items it = (i3, g, b), i3-major, then g, then block b
     if (!overlap_enabled || n < 2) {
         for (int64_t i3 = 0; i3 < n_seq; ++i3) {
             for (int64_t g = 0; g < n_kvh; ++g) {
-                for (int st = 0; st < 5; ++st) stage(i3, g, st, (int)(g % 3));
+                for (int64_t b = 0; b < S; ++b) {
+                    for (int st = 0; st < 5; ++st) stage(i3, g, b, st, (int)(g % 3), (int)(g % 3));
+                }
             }
         }
         return;
@@ -2971,7 +2999,13 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
             GGML_ASSERT(bctx->get_attn_ctx((int)M, (int)std::min(KC, n_kv - k0), (int)DV, RKNN_MM_LAYOUT_NORM, c, (int)i));
         }
     }
-    auto st_k = [&](int it, int st) { stage(it / n_kvh, it % n_kvh, st, it % 3); };
+    // item it runs on core it % 3; with S > 1 a block binds the B of its group's block 0, on
+    // core (it - b) % 3, which is still in flight or done but not yet reused (S is not a
+    // multiple of 3, and at most three items are in flight)
+    auto st_k = [&](int it, int st) {
+        const int64_t b = it % S, g = (it / S) % n_kvh, i3 = it / (S * n_kvh);
+        stage(i3, g, b, st, it % 3, (int)((it - b) % 3));
+    };
     std::vector<rknpu_fn_pool::ticket> t_qk(n), t_pv(n);
     st_k(0, 0);
     bctx->fa_pool.submit(t_qk[0], [&] { st_k(0, 1); });
