@@ -993,8 +993,9 @@ static void rknpu_softmax_row(const float* s_row, const ggml_fp16_t* mrow, int64
 // style; the P*V accumulation weights the chunks by exp(m - M) l / L). P is normalized per
 // chunk so its magnitudes match the one-pass softmax (unnormalized P cost 1% perplexity on
 // the NPU's FP16 multiply-accumulate). An all-masked chunk gives m = -inf, l = 0.
-static void rknpu_softmax_chunk16(const uint16_t* s16, const ggml_fp16_t* mrow, int64_t n, float scale, float softcap,
-                                  float* tmp, uint16_t* out, float* m_out, float* l_out) {
+template <class Ld>
+static void rknpu_softmax_chunk16_ld(Ld ld, const ggml_fp16_t* mrow, int64_t n, float scale, float softcap,
+                                     float* tmp, uint16_t* out, float* m_out, float* l_out) {
     int64_t j = 0;
     float mx = -INFINITY;
 #ifdef __ARM_NEON
@@ -1002,7 +1003,7 @@ static void rknpu_softmax_chunk16(const uint16_t* s16, const ggml_fp16_t* mrow, 
     const float32x4_t vs = vdupq_n_f32(scale), vcap = vdupq_n_f32(softcap);
     const float32x4_t one = vdupq_n_f32(1.0f), two = vdupq_n_f32(2.0f);
     for (; j + 4 <= n; j += 4) {
-        float32x4_t x = vmulq_f32(vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(s16 + j))), vs);
+        float32x4_t x = vmulq_f32(vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(ld(j)))), vs);
         if (softcap != 0.0f) x = vmulq_f32(vcap, vsubq_f32(one, vdivq_f32(two, vaddq_f32(rknpu_v_expf(vmulq_f32(two, x)), one))));
         if (mrow) x = vaddq_f32(x, vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16((const uint16_t*)mrow + j))));
         vst1q_f32(tmp + j, x);
@@ -1011,7 +1012,7 @@ static void rknpu_softmax_chunk16(const uint16_t* s16, const ggml_fp16_t* mrow, 
     mx = vmaxvq_f32(vmx);
 #endif
     for (; j < n; ++j) {
-        float x = ggml_fp16_to_fp32(s16[j]) * scale;
+        float x = ggml_fp16_to_fp32(*ld(j)) * scale;
         if (softcap != 0.0f) x = softcap * tanhf(x);
         if (mrow) x += ggml_fp16_to_fp32(mrow[j]);
         tmp[j] = x;
@@ -1050,6 +1051,10 @@ static void rknpu_softmax_chunk16(const uint16_t* s16, const ggml_fp16_t* mrow, 
 #endif
     for (; j < n; ++j) out[j] = ggml_fp32_to_fp16(tmp[j] * inv);
     *m_out = mx; *l_out = sum;
+}
+static void rknpu_softmax_chunk16(const uint16_t* s16, const ggml_fp16_t* mrow, int64_t n, float scale, float softcap,
+                                  float* tmp, uint16_t* out, float* m_out, float* l_out) {
+    rknpu_softmax_chunk16_ld([s16](int64_t j) { return s16 + j; }, mrow, n, scale, softcap, tmp, out, m_out, l_out);
 }
 
 // GEGLU (gate, up) on the backend, so [up, gate, GLU, down] stay in one NPU
@@ -2545,6 +2550,10 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         const char* env = std::getenv("RKNPU_FA_S16");
         return env == nullptr || std::atoi(env) != 0;
     }();
+    static const bool fuse_gather_env = []() {
+        const char* env = std::getenv("RKNPU_FA_FUSE_GATHER");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
     const int64_t DK = k->ne[0], DV = v->ne[0];
     const int64_t n_q = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1], n_kvh = k->ne[2];
     const int64_t rk2 = n_head / n_kvh;
@@ -2614,6 +2623,8 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         const bool native = qk->native && pv_native && M % FR == 0;
         GGML_ASSERT((native || !qk->c_fp16) && "RKNPU2: FP16 scores need the native attention path");
         const bool online = online_env && native && qk->c_fp16 && n_kv > online_min;
+        // the 4-element groups the softmax loads start at multiples of 4 (range ends are rounded to 4)
+        const bool fuse_gather = fuse_gather_env && online && qk->c_geom.sub % 4 == 0;
         if (online && st == 2 && (int64_t)bctx->fa_stats[core].size() < M * n_pvc * 2) bctx->fa_stats[core].resize(M * n_pvc * 2);
         const bool host_out = online || n_pvc > 1;
         if (host_out && st == 2 && bctx->fa_out[core].size() < pv->io_attr.C.size / 4) bctx->fa_out[core].resize(pv->io_attr.C.size / 4);
@@ -2739,7 +2750,9 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                         const int sub = qk->c_geom.sub;
                         if (!range_enabled) { blo = 0; bhi = n_kv; }
                         const int64_t ga = std::max(blo, c0), gb = std::min(bhi, c1);
-                        if (gb > ga) {
+                        // RKNPU_FA_FUSE_GATHER: the softmax reads the scores straight from the native C
+                        // layout (cells of `sub` positions, row stride sub, cell stride M * sub)
+                        if (gb > ga && !fuse_gather) {
                             uint8_t* hrows[512];
                             for (int k = 0; k < FR; ++k) hrows[k] = (uint8_t*)(h_buf.data() + k * n_kv);
                             rknpu_native_gather_rows(hrows, FR, (const uint8_t*)S, (int)r0, qk->c_geom, sub * 2, (int)(ga / sub), (int)((gb + sub - 1) / sub));
@@ -2758,7 +2771,14 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                             } else {
                                 memset(pk + c0, 0, (a - c0) * sizeof(uint16_t));
                                 memset(pk + b, 0, (c1 - b) * sizeof(uint16_t));
-                                rknpu_softmax_chunk16(h + a, mr ? mr + a : nullptr, b - a, scale, softcap, row.data(), pk + a, mlc, mlc + 1);
+                                if (fuse_gather) {
+                                    const uint16_t* S16 = (const uint16_t*)S;
+                                    const int64_t rr = r0 + k, Ms = qk->c_geom.m_stride;
+                                    rknpu_softmax_chunk16_ld([S16, rr, Ms, sub, a](int64_t j) { const int64_t x = a + j; return S16 + ((x / sub) * Ms + rr) * sub + x % sub; },
+                                                             mr ? mr + a : nullptr, b - a, scale, softcap, row.data(), pk + a, mlc, mlc + 1);
+                                } else {
+                                    rknpu_softmax_chunk16(h + a, mr ? mr + a : nullptr, b - a, scale, softcap, row.data(), pk + a, mlc, mlc + 1);
+                                }
                             }
                             pr[k] = (uint8_t*)(pk + c0);
                         }
