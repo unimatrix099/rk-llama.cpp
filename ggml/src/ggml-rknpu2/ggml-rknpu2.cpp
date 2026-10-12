@@ -1850,11 +1850,11 @@ struct rknpu_lmhead_state {
 };
 static rknpu_lmhead_state g_lmhead;
 static bool rknpu_lmhead_w4() {
-    static const bool v = []() { const char* e = std::getenv("RKNPU_LMHEAD_W4"); return e != nullptr && std::atoi(e) != 0; }();
+    static const bool v = []() { const char* e = std::getenv("RKNPU_LMHEAD_W4"); return e == nullptr || std::atoi(e) != 0; }();
     return v;
 }
 static float rknpu_lmhead_margin() {
-    static const float v = []() { const char* e = std::getenv("RKNPU_LMHEAD_MARGIN"); return e ? (float)std::atof(e) : 3.0f; }();
+    static const float v = []() { const char* e = std::getenv("RKNPU_LMHEAD_MARGIN"); return e ? (float)std::atof(e) : 12.0f; }();   // wikitext: max INT4 error 5.7 (#1r)
     return v;
 }
 static bool rknpu_lmhead_check() {

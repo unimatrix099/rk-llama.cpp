@@ -283,11 +283,11 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
 
     // Defining default quantization sequences for each supported ggml_type
     rk3588_config.default_patterns[(int)GGML_TYPE_F16]  = {"W16A16_STANDARD"};
-    // RKNPU_LMHEAD_W4=1: Q8_0 weights (in the Gemma-4 GGUFs only the tied LM head) on W4A4; the
+    // RKNPU_LMHEAD_W4 (default 1): Q8_0 weights (in the Gemma-4 GGUFs only the tied LM head) on W4A4; the
     // backend then re-scores the near-top logits exactly from the Q8_0 bytes (decode research #1r)
     static const bool lmhead_w4 = []() {
         const char* e = std::getenv("RKNPU_LMHEAD_W4");
-        return e != nullptr && std::atoi(e) != 0;
+        return e == nullptr || std::atoi(e) != 0;
     }();
     rk3588_config.default_patterns[(int)GGML_TYPE_Q8_0] = lmhead_w4 ? std::vector<std::string>{"W4A4_HADAMARD"} : std::vector<std::string>{"W8A8_STANDARD"};
     // BF16 weights (Gemma-4's per_layer_model_proj, 2560x10752) otherwise
