@@ -2605,10 +2605,6 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         const char* env = std::getenv("RKNPU_FA_S16");
         return env == nullptr || std::atoi(env) != 0;
     }();
-    static const int64_t little_tail = []() {
-        const char* env = std::getenv("RKNPU_FA_LITTLE_TAIL");
-        return env ? (int64_t)std::atoll(env) : (int64_t)8;
-    }();
     static const int little_n = []() {
         const char* env = std::getenv("RKNPU_FA_LITTLE");
         return env ? std::max(0, std::min(4, std::atoi(env))) : 0;
@@ -2836,14 +2832,12 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                         }
                         rknpu_native_scatter_rows((uint8_t*)pvs[c]->A->virt_addr, pr, FR, (int)r0, pvs[c]->a_geom, pvs[c]->a_geom.sub * 2);
                     };
-                    auto pull = [&](int64_t stop) {
-                        for (int64_t bi; (bi = next_blk.fetch_add(1)) < stop;) block(bi * FR);
+                    const std::function<void()> pull = [&] {
+                        for (int64_t bi; (bi = next_blk.fetch_add(1)) < n_blk;) block(bi * FR);
                     };
-                    // a little core takes ~3x longer per block: the last blocks stay on the big cores
-                    const std::function<void()> pull_little = [&] { pull(n_blk - little_tail); };
-                    if (little_n > 0) bctx->little_pool.run(pull_little, little_n);
+                    if (little_n > 0) bctx->little_pool.run(pull, little_n);
                     #pragma omp parallel num_threads(n_omp)
-                    pull(n_blk);
+                    pull();
                     if (little_n > 0) bctx->little_pool.wait();
                     {
                         std::lock_guard<std::mutex> lk(bctx->fa_pv_mu[core]);
