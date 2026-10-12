@@ -1540,6 +1540,20 @@ Two things were fixed on the way:
   buffer every token (holdout MTP 18.78 -> 18.50); reverted to creation/refill only (18.78,
   tg64 9.79, tg64 @4k 8.45).
 
+### 1t. Five more generation ideas (2026-10-12) — all NO-GO
+
+| # | Idea | Measurement | Verdict |
+|---|---|---|---|
+| 1 | One K-segment for `ffn_down` (K limit 8192 -> 10240, one NPU run per node instead of two) | tg64 9.86 -> 10.0 (+1.5%), pp512 302 -> 309; but PPL32 = 1.2e9: the pipelined prefill produces garbage at K 10240 (driver or pipeline limit) | NO-GO, reverted |
+| 2 | n-gram drafter first, MTP as fallback (`--spec-type ngram-simple,draft-mtp` / `ngram-mod,draft-mtp`) for copy-heavy summaries | 12.8k / 24.8k summaries / holdout: draft-mtp 11.35 / 8.97 / 16.99 t/s; ngram-simple 11.29 / 8.98 / 16.32; ngram-mod 11.28 / 8.86 / 16.88 (at 24.8k it drafted 275 vs 199 tokens, 113 vs 97 accepted, still slower: its drafts displace MTP's better ones). 3 of 16 outputs differed (the #1n near-tie effect after different rejection patterns) | NO-GO |
+| 3 | The drafter's global-attention layer on the NPU decode path | its 4 query heads cost ~1.5 ms per step on the CPU at 12.8k; the NPU path costs 2.6 ms per call regardless of heads | NO-GO by bound |
+| 4 | Shared Hadamard signs: the A-side transform computed once for Q/K/V and once for gate/up | 126 node-rows x ~9 us = ~1.1 ms per token or verify row (~1%) | NO-GO by bound |
+| 5 | Lazy LM-head re-scoring after the first rejected verify row | the re-scoring is < 1 ms of the 3.4 ms per extra LM-head row (the rest is the C dequant and the output rows); ~2 skipped rows per cycle | NO-GO by bound |
+
+Where generation stands: plain decode 9.8 t/s against ~11 at 2.3 GB per token; MTP 18.8 /
+11.5 / 9.7 t/s at 0.8k / 12.8k / 24.8k. Everything cheap has been measured; the remaining
+software headroom is ~10% of small CPU work between NPU runs and the verify row cost (#1s).
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
