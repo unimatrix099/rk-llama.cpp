@@ -1861,22 +1861,43 @@ static bool rknpu_lmhead_check() {
     static const bool v = []() { const char* e = std::getenv("RKNPU_LMHEAD_CHECK"); return e != nullptr && std::atoi(e) != 0; }();
     return v;
 }
-// exact logit of row n: dequantized Q8_0 row . FP32 activation
-static float rknpu_lmhead_exact(const rknpu_lmhead_state& L, int64_t n, const float* x, float* tmp) {
-    dequantize_row_q8_0((const block_q8_0*)L.q8.data() + n * (L.K / QK8_0), tmp, L.K);
+// exact logit of row n: Q8_0 row . Q8_0-quantized activation (ggml-cpu's own reference math:
+// per 32-block, d_w * d_x * sum of the INT8 products), ~0.1 us per row
+static float rknpu_lmhead_exact(const rknpu_lmhead_state& L, int64_t n, const block_q8_0* xq) {
+    const block_q8_0* w = (const block_q8_0*)L.q8.data() + n * (L.K / QK8_0);
+    const int nb = (int)(L.K / QK8_0);
     float s = 0.0f;
-    int64_t k = 0;
 #ifdef __ARM_NEON
-    float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
-    for (; k + 16 <= L.K; k += 16) {
-        a0 = vfmaq_f32(a0, vld1q_f32(tmp + k),      vld1q_f32(x + k));
-        a1 = vfmaq_f32(a1, vld1q_f32(tmp + k + 4),  vld1q_f32(x + k + 4));
-        a2 = vfmaq_f32(a2, vld1q_f32(tmp + k + 8),  vld1q_f32(x + k + 8));
-        a3 = vfmaq_f32(a3, vld1q_f32(tmp + k + 12), vld1q_f32(x + k + 12));
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    int b = 0;
+    for (; b + 4 <= nb; b += 4) {
+        float ds[4];
+        int32_t is[4];
+        for (int j = 0; j < 4; ++j) {
+            const int8x16_t w0 = vld1q_s8(w[b + j].qs), w1 = vld1q_s8(w[b + j].qs + 16);
+            const int8x16_t x0 = vld1q_s8(xq[b + j].qs), x1 = vld1q_s8(xq[b + j].qs + 16);
+            int16x8_t p = vmull_s8(vget_low_s8(w0), vget_low_s8(x0));
+            p = vmlal_s8(p, vget_high_s8(w0), vget_high_s8(x0));
+            p = vmlal_s8(p, vget_low_s8(w1), vget_low_s8(x1));
+            p = vmlal_s8(p, vget_high_s8(w1), vget_high_s8(x1));
+            is[j] = vaddlvq_s16(p);
+            ds[j] = ggml_fp16_to_fp32(w[b + j].d) * ggml_fp16_to_fp32(xq[b + j].d);
+        }
+        acc = vfmaq_f32(acc, vld1q_f32(ds), vcvtq_f32_s32(vld1q_s32(is)));
     }
-    s = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+    s = vaddvq_f32(acc);
+    for (; b < nb; ++b) {
+        int32_t i = 0;
+        for (int k = 0; k < QK8_0; ++k) i += (int32_t)w[b].qs[k] * xq[b].qs[k];
+        s += ggml_fp16_to_fp32(w[b].d) * ggml_fp16_to_fp32(xq[b].d) * (float)i;
+    }
+#else
+    for (int b = 0; b < nb; ++b) {
+        int32_t i = 0;
+        for (int k = 0; k < QK8_0; ++k) i += (int32_t)w[b].qs[k] * xq[b].qs[k];
+        s += ggml_fp16_to_fp32(w[b].d) * ggml_fp16_to_fp32(xq[b].d) * (float)i;
+    }
 #endif
-    for (; k < L.K; ++k) s += tmp[k] * x[k];
     return s;
 }
 static void rknpu_lmhead_rescore(struct ggml_tensor* node, int n_omp) {
@@ -1889,6 +1910,9 @@ static void rknpu_lmhead_rescore(struct ggml_tensor* node, int n_omp) {
     for (int64_t m = 0; m < M; ++m) {
         float* y = (float*)((char*)get_tensor_real_ptr(node) + m * node->nb[1]);
         const float* xr = (const float*)((const char*)get_tensor_real_ptr(x) + m * x->nb[1]);
+        static std::vector<block_q8_0> xq;
+        if ((int64_t)xq.size() < L.K / QK8_0) xq.resize(L.K / QK8_0);
+        quantize_row_q8_0_ref(xr, xq.data(), L.K);
         float mx = -INFINITY;
         int64_t imx = 0;
         for (int64_t n = 0; n < N; ++n) if (y[n] > mx) { mx = y[n]; imx = n; }
@@ -1896,11 +1920,7 @@ static void rknpu_lmhead_rescore(struct ggml_tensor* node, int n_omp) {
             static std::vector<float> ex;
             if ((int64_t)ex.size() < N) ex.resize(N);
             #pragma omp parallel for num_threads(n_omp)
-            for (int64_t n = 0; n < N; ++n) {
-                static thread_local std::vector<float> tmp;
-                if ((int64_t)tmp.size() < L.K) tmp.resize(L.K);
-                ex[n] = rknpu_lmhead_exact(L, n, xr, tmp.data());
-            }
+            for (int64_t n = 0; n < N; ++n) ex[n] = rknpu_lmhead_exact(L, n, xq.data());
             double me = 0.0; int64_t iex = 0; float emx = -INFINITY; long cand = 0;
             for (int64_t n = 0; n < N; ++n) {
                 me = std::max(me, (double)fabsf(ex[n] - y[n]));
@@ -1921,10 +1941,7 @@ static void rknpu_lmhead_rescore(struct ggml_tensor* node, int n_omp) {
         const float thr = mx - margin;
         #pragma omp parallel for num_threads(n_omp)
         for (int64_t n = 0; n < N; ++n) {
-            if (y[n] < thr) continue;
-            static thread_local std::vector<float> tmp;
-            if ((int64_t)tmp.size() < L.K) tmp.resize(L.K);
-            y[n] = rknpu_lmhead_exact(L, n, xr, tmp.data());
+            if (y[n] >= thr) y[n] = rknpu_lmhead_exact(L, n, xq.data());
         }
     }
 }
