@@ -1503,6 +1503,43 @@ depth 0; the 35 sliding-window layers' ggml-cpu attention walks the whole 2560-c
 row (only 512 are visible). A mask-range skip there (bit-identical) is the next candidate for
 MTP at long context.
 
+### 1s. MTP verify cost at long context (2026-10-12)
+
+Measured in llama-server itself (a temporary timer around `llama_process` + `llama_synchronize`
+and around `common_speculative_draft`; 128-token summaries of the 0.8k / 12.8k / 24.8k
+production prompts, MTP n_max 5, p_min 0.6). Steady-state decode batch cost, ms, by rows:
+
+| context | 1 row (no draft) | 1 | 2 | 3 | 4 | 5 | 6 rows (verify) | draft (CPU) |
+|---|---|---|---|---|---|---|---|---|
+| 0.8k | 115 | 112 | 127 | 140 | 152 | 170 | 181 | 16.6 |
+| 12.8k | 131 | 129 | 142 | 154 | 164 | 182 | 192 | 25.3 |
+| 24.8k | 146 | 143 | 160 | 173 | 187 | 207 | 220 | 26.0 |
+
+A verify row costs 12-15 ms at every context, against 2.8 ms per row in llama-bench's
+`-p 6` (which computes logits for the last row only). Where it goes (per row, 12.8k, from the
+decode-attention stage timers and a logits-for-every-row harness): LM head 3.4 ms (9 ms before
+this section's fix), NPU decode attention 2.5 ms (its per-row CPU softmax: 0.37 -> 1.86 ms per
+layer for 1 -> 6 rows), backend activation prep + dequant ~2.6 ms, the sliding-window layers'
+ggml-cpu attention + the other CPU ops ~2-3 ms, scheduler splits ~2 ms. No single lever; the
+draft-tree verdict of #1r stands (each extra row costs 7-10% of a cycle).
+
+Two things were fixed on the way:
+- **LM head re-scoring at flat positions.** At uncertain positions thousands of rows lie within
+  2 e of the INT4 top (an open-ended draft position had 10-14k rows), each re-scored from DRAM at
+  ~0.5 us: 5-7 ms per verify row. Now two stages: rows within e of the INT4 top, then rows
+  within e of the exact top found (a subset of the 2 e set; the INT4 top row's exact value is
+  >= mx - e, so a row can only win with INT4 value > exact top - e). Plus an SDOT kernel with
+  the Q8_0 block scales precomputed as FP32 (84 MiB). Harness, depth 800, every row with logits:
+  6 rows 207 -> 177 ms, 11 rows 260 -> 221 ms; tg64 9.76 -> 9.8. Same argmax guarantee; the
+  gate: PPL32 27.1383, KLD 0.6123, server 3x4/4 identical texts, 12.8k MTP == no-draft,
+  holdout 6/6. On the production prompts the verify rows were not flat (192 ms before and after).
+- **First decode after a prompt.** The KV mirror filled all 32768 cells of each of the 8 caches
+  (V ~100 ms each) at its creation; now [0, n_kv). First batch after the 12.8k prompt 2.2 -> 1.4 s,
+  after the 0.8k prompt 0.68 s (the rest is the decode contexts' creation, ~9 ms each, and the
+  first block's fills). A first version filled incrementally per token and re-synced the whole
+  buffer every token (holdout MTP 18.78 -> 18.50); reverted to creation/refill only (18.78,
+  tg64 9.79, tg64 @4k 8.45).
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do

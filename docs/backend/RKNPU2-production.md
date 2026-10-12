@@ -44,7 +44,7 @@ Server, with the MTP drafter (fastest exact setup):
   from the original Q8_0 bytes (`RKNPU_LMHEAD_W4`, default on; #1r): the
   argmax is exact (greedy output and MTP acceptance unchanged), the tail of
   the distribution is INT4-quality (PPL 27.0 instead of 26.5), +10% decode.
-  It keeps 680 MiB of Q8_0 bytes in host memory and is not compatible with `--context-shift` (off by
+  It keeps 680 MiB of Q8_0 bytes (+84 MiB of block scales) in host memory and is not compatible with `--context-shift` (off by
   default): with context shift, set `RKNPU_FA_DEC=0`.
 
 ## 2. Supported sizes
