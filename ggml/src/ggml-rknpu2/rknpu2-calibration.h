@@ -58,11 +58,90 @@ float calculate_entropy_amax(const float* data, size_t n_elements, int num_bins 
  */
 void hadamard_transform(float* dst, const float* src, int K, int padded_size);
 
+// mul_fp32(tmp, src, signs, K) then hadamard_transform(dst, tmp, K,
+// padded_size), fused: identical results, one pass and one buffer fewer.
+void hadamard_transform_signed(float* dst, const float* src, const float* signs, int K, int padded_size);
+
+// Only the blocks of [k_begin, k_begin + k_len) of hadamard_transform_signed
+// over a K-wide row (natural, unpadded case; range on block boundaries),
+// written to dst[0, k_len). For K-segmented weights: each segment needs only
+// its own blocks.
+void hadamard_transform_signed_range(float* dst, const float* src, const float* signs, int K, int k_begin, int k_len);
+
+// One block of hadamard_transform: writes dst[b*block, (b+1)*block) exactly
+// as hadamard_transform would (copy of src over [0, K), zero padding up to
+// padded_size, then the in-place FWHT of that block). Blocks are
+// independent, so callers may split them across threads with identical
+// results.
+void hadamard_transform_block(float* dst, const float* src, int K, int padded_size, int b);
+
 /**
  * @brief Calculates the next power of two for a given integer.
  * @param n The input integer.
  * @return The smallest power of two that is greater than or equal to n.
  */
 int next_power_of_two(int n);
+
+/**
+ * @brief The K the Hadamard pipelines operate at for a weight row of K elements.
+ *
+ * Block-diagonal mode (default): K itself - the FWHT is applied per
+ * power-of-two block (see hadamard_block_len), so no zero-padding is stored,
+ * uploaded, or read back. Legacy mode (RKNPU_HADAMARD_BLOCK=0): the next
+ * power of two, zero-padding the row for one full-length transform - on
+ * non-power-of-two models (Gemma-4 E4B: K=2560/10240/10752) that inflates
+ * every weight read by ~1.5-1.6x. The mode is read once from the
+ * environment; it must not change at runtime (packed buffers and matmul
+ * contexts depend on it).
+ */
+int hadamard_k_op(int K);
+
+/**
+ * @brief The FWHT block length used for rows of K elements.
+ *
+ * Block-diagonal mode: the largest power of two dividing K (K & -K) - for
+ * power-of-two K this is K, making the transform identical to the legacy
+ * full-length one. Also the dequantization divisor: H*H^T = B*I per block.
+ * Legacy mode: next_power_of_two(K).
+ */
+int hadamard_block_len(int K);
+
+/**
+ * @brief Whether INT4 weights get one scale per output channel (default)
+ * instead of one per matmul segment.
+ *
+ * The channel scale factors out of the hardware's K summation and is
+ * applied in the existing C dequant pass, so the finer granularity costs
+ * no NPU work. Per-channel scales use a plain amax (no entropy search -
+ * also removes the minutes-long W4A4 calibration at load). Legacy
+ * per-segment entropy scales behind RKNPU_PER_CHANNEL=0. Read once; the
+ * packed weights and scale-grid layout depend on it.
+ */
+bool per_channel_b_scales();
+
+/**
+ * @brief Clip factors for the INT4 quantization scales (decode research
+ * #3c follow-up). scale = clip * amax / 7: values above clip*amax
+ * saturate to +-7 (the packer clamps in int32), buying finer steps for
+ * everything below. Post-Hadamard rows are near-Gaussian, so amax is a
+ * far-tail sample and a clip < 1 can lower total quantization error.
+ * RKNPU_A_CLIP applies to the per-row activation scales (per token, hot
+ * path), RKNPU_B_CLIP to the per-channel weight scales (load time).
+ * Defaults 0.9 / 0.93 from a 32-chunk two-model sweep; set to 1.0 for
+ * plain amax. Out-of-range values fall back to the default.
+ * Read once - frozen for the process lifetime.
+ */
+float a_clip_factor();
+float b_clip_factor();
+
+// NOTE: there is deliberately no INT8 clip knob. Clipping was measured
+// (RKNPU_B_CLIP_INT8=0.95) and is catastrophic - PPL 12.2 -> 10106 -
+// because quantize_fp32_to_int8 has no clamp: it is only ever called with
+// scale = amax/127, so |v/scale| <= 127 by construction and the NEON
+// narrowing was allowed to wrap (pinned by a prep-kernel test). A clip < 1
+// pushes the extremes to ~134, which wraps to about -122 and sign-flips the
+// largest weights. Re-enabling would require clamping that kernel first,
+// and int8's 255 levels make the payoff unlikely. See
+// RKNPU2-decode-research.md #3e.
 
 } // namespace rknpu2_calibration

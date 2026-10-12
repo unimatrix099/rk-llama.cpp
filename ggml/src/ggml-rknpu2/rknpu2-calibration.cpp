@@ -3,9 +3,15 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <cassert>
+#include <cstdlib>
 #include <limits>
 #include <cstring>
 #include <omp.h>
+
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 namespace rknpu2_calibration {
 
@@ -113,7 +119,7 @@ float calculate_entropy_amax(const float* data, size_t n_elements, int num_bins,
     const double bin_width = (double)abs_max_val * 2.0 / num_bins;
     for (size_t i = 0; i < n_elements; ++i) {
         int bin_index = static_cast<int>(((data[i] + abs_max_val) / bin_width));
-        bin_index = std::min(num_bins - 1, bin_index);
+        bin_index = std::max(0, std::min(num_bins - 1, bin_index));
         p_dist[bin_index]++;
     }
 
@@ -187,6 +193,91 @@ static bool is_power_of_two(int n) {
 
 // Iterative Fast Walsh-Hadamard Transform (in-place)
 static void fwht_iterative(float* data, int size) {
+#ifdef __ARM_NEON
+    if (size >= 4) {
+        // stage h=1: pairwise butterflies inside each 4-lane vector.
+        // [a,b,c,d] -> [a+b, a-b, c+d, c-d]: even lanes from v+rev,
+        // odd lanes from v-rev (vtrn1 interleaves them back).
+        for (int i = 0; i < size; i += 4) {
+            float32x4_t v   = vld1q_f32(data + i);
+            float32x4_t sw  = vrev64q_f32(v);
+            float32x4_t sum = vaddq_f32(v, sw);
+            float32x4_t dif = vsubq_f32(v, sw);
+            vst1q_f32(data + i, vtrn1q_f32(sum, dif));
+        }
+        // stage h=2: butterflies between the two lane pairs of one vector
+        for (int i = 0; i < size; i += 4) {
+            float32x4_t v = vld1q_f32(data + i);
+            float32x2_t lo = vget_low_f32(v), hi = vget_high_f32(v);
+            vst1_f32(data + i,     vadd_f32(lo, hi));
+            vst1_f32(data + i + 2, vsub_f32(lo, hi));
+        }
+        // stages h>=4: contiguous 4-wide butterflies, two stages (h, 2h) per
+        // pass over the data (radix-4). Same adds and subtracts in the same
+        // order as two separate passes - stage h makes a+b, a-b, c+d, c-d and
+        // stage 2h combines them - so results are bit-identical, with half
+        // the load/store passes.
+        int h = 4;
+        // three stages (h, 2h, 4h) per pass while they fit (radix-8)
+        for (; h * 4 < size; h <<= 3) {
+            for (int i = 0; i < size; i += h * 8) {
+                for (int j = i; j < i + h; j += 4) {
+                    float32x4_t v0 = vld1q_f32(data + j),         v1 = vld1q_f32(data + j + h);
+                    float32x4_t v2 = vld1q_f32(data + j + 2 * h), v3 = vld1q_f32(data + j + 3 * h);
+                    float32x4_t v4 = vld1q_f32(data + j + 4 * h), v5 = vld1q_f32(data + j + 5 * h);
+                    float32x4_t v6 = vld1q_f32(data + j + 6 * h), v7 = vld1q_f32(data + j + 7 * h);
+                    // stage h
+                    float32x4_t t0 = vaddq_f32(v0, v1), t1 = vsubq_f32(v0, v1);
+                    float32x4_t t2 = vaddq_f32(v2, v3), t3 = vsubq_f32(v2, v3);
+                    float32x4_t t4 = vaddq_f32(v4, v5), t5 = vsubq_f32(v4, v5);
+                    float32x4_t t6 = vaddq_f32(v6, v7), t7 = vsubq_f32(v6, v7);
+                    // stage 2h
+                    v0 = vaddq_f32(t0, t2); v2 = vsubq_f32(t0, t2);
+                    v1 = vaddq_f32(t1, t3); v3 = vsubq_f32(t1, t3);
+                    v4 = vaddq_f32(t4, t6); v6 = vsubq_f32(t4, t6);
+                    v5 = vaddq_f32(t5, t7); v7 = vsubq_f32(t5, t7);
+                    // stage 4h
+                    vst1q_f32(data + j,         vaddq_f32(v0, v4));
+                    vst1q_f32(data + j + 4 * h, vsubq_f32(v0, v4));
+                    vst1q_f32(data + j + h,     vaddq_f32(v1, v5));
+                    vst1q_f32(data + j + 5 * h, vsubq_f32(v1, v5));
+                    vst1q_f32(data + j + 2 * h, vaddq_f32(v2, v6));
+                    vst1q_f32(data + j + 6 * h, vsubq_f32(v2, v6));
+                    vst1q_f32(data + j + 3 * h, vaddq_f32(v3, v7));
+                    vst1q_f32(data + j + 7 * h, vsubq_f32(v3, v7));
+                }
+            }
+        }
+        for (; h * 2 < size; h <<= 2) {
+            for (int i = 0; i < size; i += h * 4) {
+                for (int j = i; j < i + h; j += 4) {
+                    const float32x4_t a = vld1q_f32(data + j);
+                    const float32x4_t b = vld1q_f32(data + j + h);
+                    const float32x4_t c = vld1q_f32(data + j + 2 * h);
+                    const float32x4_t d = vld1q_f32(data + j + 3 * h);
+                    const float32x4_t a1 = vaddq_f32(a, b), b1 = vsubq_f32(a, b);
+                    const float32x4_t c1 = vaddq_f32(c, d), d1 = vsubq_f32(c, d);
+                    vst1q_f32(data + j,         vaddq_f32(a1, c1));
+                    vst1q_f32(data + j + h,     vaddq_f32(b1, d1));
+                    vst1q_f32(data + j + 2 * h, vsubq_f32(a1, c1));
+                    vst1q_f32(data + j + 3 * h, vsubq_f32(b1, d1));
+                }
+            }
+        }
+        // odd stage count: one last single stage
+        for (; h < size; h <<= 1) {
+            for (int i = 0; i < size; i += h * 2) {
+                for (int j = i; j < i + h; j += 4) {
+                    float32x4_t x = vld1q_f32(data + j);
+                    float32x4_t y = vld1q_f32(data + j + h);
+                    vst1q_f32(data + j,     vaddq_f32(x, y));
+                    vst1q_f32(data + j + h, vsubq_f32(x, y));
+                }
+            }
+        }
+        return;
+    }
+#endif
     for (int h = 1; h < size; h <<= 1) {
         for (int i = 0; i < size; i += h * 2) {
             for (int j = i; j < i + h; ++j) {
@@ -211,33 +302,156 @@ int next_power_of_two(int n) {
     return n;
 }
 
+// RKNPU_HADAMARD_BLOCK semantics (read once: packed buffers, matmul
+// contexts and the dequant divisor depend on it - no runtime changes):
+//   1 (default) pure block-diagonal: block = largest pow2 divisor of K,
+//               zero padding - fastest and smallest (E4B: tg +28%, NPU
+//               memory -29%) at a measured W4A4 quality cost (wikitext
+//               PPL 228.9 vs 198.4 legacy on an already heavily degraded
+//               capacity mode; W8A8 reference 37.8)
+//   0           legacy: pad K to the next power of two, one full FWHT -
+//               the pre-2026-08-16 behavior, bit-identical
+//   <pow2 n>    minimum block n, K padded to the next block multiple.
+//               Measured WORSE than both (n=1024: PPL 280.4, tg 5.13 -
+//               the half-empty pad block hurts more than small blocks
+//               do); kept for experiments only.
+// See RKNPU2-decode-research.md #3b for all measurements.
+static int hadamard_min_block() {
+    static const int min_block = []() {
+        const char* env = std::getenv("RKNPU_HADAMARD_BLOCK");
+        int v = env ? std::atoi(env) : 1;
+        if (v < 0) v = 0;
+        if (v > 1 && (v & (v - 1)) != 0) v = next_power_of_two(v);
+        return v;
+    }();
+    return min_block;
+}
+
+int hadamard_block_len(int K) {
+    const int mb = hadamard_min_block();
+    if (mb == 0) return next_power_of_two(K);   // legacy
+    // 1 = natural: the largest power of two dividing K, so the transform
+    // covers as many lanes as possible with no padding.
+    const int divisor = K & (-K);
+    if (mb == 1) return divisor;
+    // explicit block size. Smaller than the natural divisor still divides
+    // K exactly (any smaller power of two does), so it costs fewer FWHT
+    // passes with no padding - the speed/quality dial. Larger pads K up to
+    // a block multiple. Never exceed next_pow2(K): a K=256 row must not
+    // inflate to a 1024 block.
+    return std::min(mb, next_power_of_two(K));
+}
+
+int hadamard_k_op(int K) {
+    const int mb = hadamard_min_block();
+    if (mb == 0) return next_power_of_two(K);   // legacy
+    const int block = hadamard_block_len(K);
+    return ((K + block - 1) / block) * block;   // next multiple of block
+}
+
+bool per_channel_b_scales() {
+    static const bool per_channel = []() {
+        const char* env = std::getenv("RKNPU_PER_CHANNEL");
+        return !(env != nullptr && std::atoi(env) == 0);
+    }();
+    return per_channel;
+}
+
+static float clip_from_env(const char* name, float dflt) {
+    const char* env = std::getenv(name);
+    if (env == nullptr) return dflt;
+    float v = std::strtof(env, nullptr);
+    if (!(v > 0.0f) || v > 1.0f) return dflt;   // junk or out of range
+    return v;
+}
+
+// Defaults from a 32-chunk wikitext sweep on two models (E4B B-curve is a
+// smooth U with its minimum at 0.93; Qwen agrees 0.93 > 0.95). Set both to
+// 1.0 for unclipped amax scales. See RKNPU2-decode-research.md #3d.
+float a_clip_factor() {
+    static const float clip = clip_from_env("RKNPU_A_CLIP", 0.9f);
+    return clip;
+}
+
+float b_clip_factor() {
+    static const float clip = clip_from_env("RKNPU_B_CLIP", 0.93f);
+    return clip;
+}
+
+
 void hadamard_transform(float* dst, const float* src, int K, int padded_size) {
-    // If no padding is needed, copy and perform in-place.
-    if (K == padded_size) {
-        memcpy(dst, src, K * sizeof(float));
-        fwht_iterative(dst, K);
-        return;
-    }
+    // padded_size is hadamard_k_op(K): a multiple of the block length,
+    // which is a power of two. Legacy mode degenerates to one full-length
+    // transform (block == padded_size == next_pow2(K)); power-of-two K is
+    // bit-identical in every mode. dst must hold padded_size elements and
+    // never aliases src at the call sites.
+    const int block = hadamard_block_len(K);
 
-    // Using a thread-local buffer to avoid repeated heap allocations.
-    thread_local static std::vector<float> padded_data;
-    
-    // Resizing the buffer only if the current one is too small.
-    if (padded_data.size() < (size_t)padded_size) {
-        padded_data.resize(padded_size);
-    }
-    
-    // Copying source data and zero-fill the rest (padding).
-    memcpy(padded_data.data(), src, K * sizeof(float));
+    memcpy(dst, src, K * sizeof(float));
     if (padded_size > K) {
-        memset(padded_data.data() + K, 0, (padded_size - K) * sizeof(float));
+        memset(dst + K, 0, (padded_size - K) * sizeof(float));
     }
+    for (int off = 0; off < padded_size; off += block) {
+        fwht_iterative(dst + off, block);
+    }
+}
 
-    // Applying the transform to our temporary buffer
-    fwht_iterative(padded_data.data(), padded_size);
+void hadamard_transform_signed(float* dst, const float* src, const float* signs, int K, int padded_size) {
+    // == mul_fp32(tmp, src, signs, K) followed by hadamard_transform(dst,
+    // tmp, K, padded_size): the products go straight into dst instead of
+    // through a scratch row and a memcpy
+    int i = 0;
+#ifdef __ARM_NEON
+    for (; i + 4 <= K; i += 4) {
+        vst1q_f32(dst + i, vmulq_f32(vld1q_f32(src + i), vld1q_f32(signs + i)));
+    }
+#endif
+    for (; i < K; ++i) {
+        dst[i] = src[i] * signs[i];
+    }
+    if (padded_size > K) {
+        memset(dst + K, 0, (padded_size - K) * sizeof(float));
+    }
+    const int block = hadamard_block_len(K);
+    for (int off = 0; off < padded_size; off += block) {
+        fwht_iterative(dst + off, block);
+    }
+}
 
-    // Copying the result to the destination buffer
-    memcpy(dst, padded_data.data(), padded_size * sizeof(float));
+void hadamard_transform_signed_range(float* dst, const float* src, const float* signs, int K, int k_begin, int k_len) {
+    // The blocks covering [k_begin, k_begin + k_len) of the natural
+    // block-diagonal transform of a K-wide row, written to dst[0, k_len):
+    // identical to the same slice of hadamard_transform_signed, since blocks
+    // are independent. Requires the range to start and end on block bounds.
+    const int block = hadamard_block_len(K);
+    assert(k_begin % block == 0 && k_len % block == 0 && k_begin + k_len <= K);
+    int i = 0;
+#ifdef __ARM_NEON
+    for (; i + 4 <= k_len; i += 4) {
+        vst1q_f32(dst + i, vmulq_f32(vld1q_f32(src + k_begin + i), vld1q_f32(signs + k_begin + i)));
+    }
+#endif
+    for (; i < k_len; ++i) {
+        dst[i] = src[k_begin + i] * signs[k_begin + i];
+    }
+    for (int off = 0; off < k_len; off += block) {
+        fwht_iterative(dst + off, block);
+    }
+}
+
+void hadamard_transform_block(float* dst, const float* src, int K, int padded_size, int b) {
+    const int block = hadamard_block_len(K);
+    const int off = b * block;
+    if (off >= padded_size) return;
+    const int lim = std::min(off + block, K);
+    if (lim > off) {
+        memcpy(dst + off, src + off, (lim - off) * sizeof(float));
+    }
+    const int zero_from = std::max(off, lim);
+    if (off + block > zero_from) {
+        memset(dst + zero_from, 0, (off + block - zero_from) * sizeof(float));
+    }
+    fwht_iterative(dst + off, block);
 }
 
 } // namespace rknpu2_calibration
