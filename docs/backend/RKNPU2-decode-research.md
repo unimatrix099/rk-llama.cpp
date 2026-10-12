@@ -1450,6 +1450,34 @@ Final build (INT8 K): server suite MTP == no-draft 10/10, needle 10/10; tg32 med
 0/1k/2k/4k/8k/16k/32k = 9.00/8.18/7.84/7.92/7.55/6.96/6.30 (CPU attention 8.99/8.25/8.03/7.63/6.70/5.72/4.43).
 Remaining large cost at long prompts: the prefill softmax on the CPU (54 s of a pp32768 run).
 
+### 1q. Prefill softmax for long prompts (2026-10-12) — all NO-GO
+
+Probe (per pp32768 run, 240 s; global layers only; stage timers in the pipelined attention):
+the attention wall time is 89.5 s = main-thread CPU work 62.3 s (K/V repack 6.9, softmax
+54.4, output 0.9) + CPU idle at the start of a layer (first Q*K^T, 12.7 s) and at its end
+(last P*V, 14.1 s); the middle overlaps almost perfectly (0.35 s idle). NPU work: Q*K^T 35 s,
+P*V 32.4 s on two cores. pp16384: wall 23.8 s, CPU 16.0 s, head 3.1 s, tail 4.5 s.
+
+Softmax breakdown (pp16384, thread-seconds over the 4 big cores, online path): exp + sum 26.1
+(30%), gather of the scores out of the native C layout 24.4 (28%), scatter of P into the native
+A layout 16.5 (19%), load/scale/mask/max 13.9 (16%), normalize + FP16 5.3 (6%).
+
+| Try | Result | Verdict |
+|---|---|---|
+| A: rows of a KV group in 2/4 pipeline blocks (`RKNPU_FA_SPLIT`; block 0 packs K/V, the others bind its B) | pp16k/32k 177.7/133.3 (4 blocks), 174.8/128.3 (2) vs 180.8/135.9: every block re-reads K on the NPU, which becomes the bottleneck | NO-GO |
+| B2: softmax reads the scores straight from native C (no gather copy) | pp8k/16k 202.8/160.0 vs 218.7/180.9: 16-byte cells at 32 KB strides row by row; the blocked gather reads whole lines for 64 rows | NO-GO |
+| B4: 4 A55 helper threads pull 64-row blocks from a shared counter (bit-identical), optionally leaving the last 8/16 blocks to the A76 | pp16k 178.2-182.6 vs 181.8-183.3; the helpers did run (~15% CPU each) | NO-GO: memory-bound copies, the A55s compete for bandwidth |
+| exp: degree-4 polynomial / FP16 exp | ~1% / FP16 loses ~3% relative accuracy on scores of magnitude ~50 | not tried |
+| mask skip in the row interior | ~1% | not tried |
+
+Side result: NPU attention depends slightly on which core serves a KV group; shifting the core
+assignment alone moves PPL32 26.5468 -> 26.5275 / 26.5269 (open issue #1g confirmed). Prefill
+changes that move work between cores cannot be bit-identical.
+
+Conclusion: the prefill softmax is bound by memory traffic through the NPU's native layouts on
+these cores; the cheap software levers are exhausted. Prefill stays at pp512 299, pp16384 182,
+pp32768 137.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
