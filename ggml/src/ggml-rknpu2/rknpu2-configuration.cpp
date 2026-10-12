@@ -201,12 +201,7 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
     Rknpu2DeviceConfig rk3588_config;
     rk3588_config.device_name = "RK3588";
     rk3588_config.active_cores = custom_cores.empty() ? std::vector<int>{0, 1, 2} : custom_cores;
-    // RKNPU_K_LIMIT: largest K per NPU run (default 8192; ffn_down's K 10240 then runs as two
-    // K-segments, each quantizing its own activation slice; 10240 = one run per node, #1t)
-    rk3588_config.max_k_limit = []() {
-        const char* e = std::getenv("RKNPU_K_LIMIT");
-        return e ? std::atoi(e) : 8192;
-    }();
+    rk3588_config.max_k_limit = 8192;
     rk3588_config.hardware_pipelines = {
         {
             /* .pipeline_name = */ "W16A16_STANDARD",
