@@ -1324,6 +1324,7 @@ struct rknpu_kv_mirror {   // one cache tensor (K or V), all its KV heads
     int sN = 0, sK = 0;               // native B cell geometry
     std::vector<std::unique_ptr<rknpu_dec_ctx>> ctxs;   // [head][chunk], created on first use
     std::atomic<bool> needs_sync{false};                // bulk writes: one whole-buffer sync before the next use
+    int64_t filled = 0;                                 // cells [0, filled) were copied from the cache; beyond, zero until written
     std::unordered_set<const void*> users;              // backends that attended through it; freed with the last
     ~rknpu_kv_mirror() {
         ctxs.clear();   // the contexts and their B views first, then the buffer they view
@@ -1408,17 +1409,21 @@ static void rknpu_mirror_store(rknpu_kv_mirror* m, int64_t pos, bool clean) {
     }
 }
 
-// (re)fill the whole mirror from the cache: every cell, written or not, so no read sees stale bytes
-static void rknpu_mirror_fill(rknpu_kv_mirror* m) {
+// (re)fill the mirror from the cache over [lo, hi): the cells an attention over n_kv cells can
+// read. Cells past `filled` are zero (finite) until a KV write or a later fill reaches them
+static void rknpu_mirror_fill(rknpu_kv_mirror* m, int64_t lo, int64_t hi) {
+    hi = std::min(hi, m->kv_size);
     #pragma omp parallel for
-    for (int64_t pos = 0; pos < m->kv_size; ++pos) rknpu_mirror_store(m, pos, false);
+    for (int64_t pos = lo; pos < hi; ++pos) rknpu_mirror_store(m, pos, false);
     rknn_mem_sync(m->alloc_ctx, m->mem, RKNN_MEMORY_SYNC_TO_DEVICE);
     m->needs_sync = false;
+    m->filled = std::max(m->filled, hi);
 }
 
 // spot check: a few cells of [0, n_kv) equal in cache and mirror (a new cache at a reused tensor
 // address, or a write that bypassed this backend, would differ); refill when not
 static void rknpu_mirror_validate(rknpu_kv_mirror* m, int64_t n_kv) {
+    if (n_kv > m->filled) rknpu_mirror_fill(m, m->filled, n_kv);   // cells written before the mirror existed, or never
     const struct ggml_tensor* t = m->cache;
     const int64_t probes[8] = { 0, n_kv / 7, 2 * n_kv / 7, 3 * n_kv / 7, 4 * n_kv / 7, 5 * n_kv / 7, 6 * n_kv / 7, n_kv - 1 };
     for (int64_t pos : probes) {
@@ -1429,14 +1434,14 @@ static void rknpu_mirror_validate(rknpu_kv_mirror* m, int64_t n_kv) {
                 const float sc = rknpu_quant_row8(row + h * RKNPU_DEC_DK, RKNPU_DEC_DK, q);
                 bool same = sc == m->kscale[h * m->kv_size + pos];
                 for (int64_t d = 0; d < RKNPU_DEC_DK && same; d += 61) same = rknpu_mirror_head8(m, h)[rknpu_mirror_k_off(m, pos, d)] == q[d];
-                if (!same) { rknpu_mirror_fill(m); return; }
+                if (!same) { rknpu_mirror_fill(m, 0, n_kv); return; }
             }
             continue;
         }
         for (int64_t h = 0; h < m->n_kvh; ++h) for (int64_t d = 0; d < RKNPU_DEC_DK; d += 61) {
             const size_t o = m->is_v ? rknpu_mirror_v_off(m, pos, d) : rknpu_mirror_k_off(m, pos, d);
             if (rknpu_mirror_head(m, h)[o] != row[h * RKNPU_DEC_DK + d]) {
-                rknpu_mirror_fill(m);
+                rknpu_mirror_fill(m, 0, n_kv);
                 return;
             }
         }
@@ -1485,7 +1490,7 @@ static rknpu_dec_ctx* rknpu_dec_get_ctx(rknpu_kv_mirror* m, int64_t h, int64_t c
 }
 
 // the mirror of a K or V cache tensor; created and filled from the cache on first use
-static rknpu_kv_mirror* rknpu_mirror_get(const struct ggml_tensor* cache, bool is_v, int64_t n_kvh) {
+static rknpu_kv_mirror* rknpu_mirror_get(const struct ggml_tensor* cache, bool is_v, int64_t n_kvh, int64_t n_kv) {
     std::lock_guard<std::mutex> lock(g_kv_mirrors.mu);
     auto& map = g_kv_mirrors.by_cache[is_v];
     auto it = map.find(cache);
@@ -1528,9 +1533,9 @@ static rknpu_kv_mirror* rknpu_mirror_get(const struct ggml_tensor* cache, bool i
         g_domain_manager.release_domain_memory(m->domain, bytes);
         return nullptr;
     }
-    memset(m->mem->virt_addr, 0, bytes);   // cells past kv_size must be finite (P = 0 there)
+    memset(m->mem->virt_addr, 0, bytes);   // unfilled cells must be finite (P = 0 there)
     m->ctxs.resize(n_kvh * m->n_chunks);
-    rknpu_mirror_fill(m.get());
+    rknpu_mirror_fill(m.get(), 0, n_kv);
     rknpu_kv_mirror* r = m.get();
     map.emplace(cache, std::move(m));
     return r;
@@ -1703,8 +1708,8 @@ static void rknpu_flash_attn_decode(const void* user, struct ggml_tensor* dst, i
         }
     }
     if (!any_npu) return;
-    rknpu_kv_mirror* mk = rknpu_mirror_get(k->view_src, false, n_kvh);
-    rknpu_kv_mirror* mv = rknpu_mirror_get(v->view_src, true, n_kvh);
+    rknpu_kv_mirror* mk = rknpu_mirror_get(k->view_src, false, n_kvh, n_kv);
+    rknpu_kv_mirror* mv = rknpu_mirror_get(v->view_src, true, n_kvh, n_kv);
     GGML_ASSERT(mk && mv && "RKNPU2: KV mirror unavailable");
     {
         std::lock_guard<std::mutex> lock(g_kv_mirrors.mu);
@@ -1843,6 +1848,7 @@ struct rknpu_lmhead_state {
     std::mutex mu;
     const struct ggml_tensor* t = nullptr;
     std::vector<uint8_t> q8;   // the original Q8_0 bytes
+    std::vector<float> dw;     // the block scales as FP32, [N][K/32]
     int64_t K = 0, N = 0;
     // check mode statistics
     double max_err = 0.0, max_err_top = 0.0;
@@ -1861,41 +1867,42 @@ static bool rknpu_lmhead_check() {
     static const bool v = []() { const char* e = std::getenv("RKNPU_LMHEAD_CHECK"); return e != nullptr && std::atoi(e) != 0; }();
     return v;
 }
-// exact logit of row n: Q8_0 row . Q8_0-quantized activation (ggml-cpu's own reference math:
-// per 32-block, d_w * d_x * sum of the INT8 products), ~0.1 us per row
-static float rknpu_lmhead_exact(const rknpu_lmhead_state& L, int64_t n, const block_q8_0* xq) {
-    const block_q8_0* w = (const block_q8_0*)L.q8.data() + n * (L.K / QK8_0);
+// exact logit of row n: Q8_0 row . Q8_0-quantized activation (ggml-cpu's reference math: per
+// 32-block, d_w * d_x * sum of the INT8 products). dx = the activation's block scales as FP32.
+// Memory-bound at ~2.7 KB per row; the SDOT form keeps the compute under the DRAM time
+#if defined(__aarch64__)
+__attribute__((target("arch=armv8.2-a+dotprod")))
+#endif
+static float rknpu_lmhead_exact(const rknpu_lmhead_state& L, int64_t n, const block_q8_0* xq, const float* dx) {
     const int nb = (int)(L.K / QK8_0);
+    const block_q8_0* w = (const block_q8_0*)L.q8.data() + n * nb;
+    const float* dw = L.dw.data() + n * nb;
     float s = 0.0f;
-#ifdef __ARM_NEON
+#if defined(__aarch64__)
     float32x4_t acc = vdupq_n_f32(0.0f);
     int b = 0;
     for (; b + 4 <= nb; b += 4) {
-        float ds[4];
+        int32x4_t i4 = vdupq_n_s32(0);
         int32_t is[4];
         for (int j = 0; j < 4; ++j) {
-            const int8x16_t w0 = vld1q_s8(w[b + j].qs), w1 = vld1q_s8(w[b + j].qs + 16);
-            const int8x16_t x0 = vld1q_s8(xq[b + j].qs), x1 = vld1q_s8(xq[b + j].qs + 16);
-            int16x8_t p = vmull_s8(vget_low_s8(w0), vget_low_s8(x0));
-            p = vmlal_s8(p, vget_high_s8(w0), vget_high_s8(x0));
-            p = vmlal_s8(p, vget_low_s8(w1), vget_low_s8(x1));
-            p = vmlal_s8(p, vget_high_s8(w1), vget_high_s8(x1));
-            is[j] = vaddlvq_s16(p);
-            ds[j] = ggml_fp16_to_fp32(w[b + j].d) * ggml_fp16_to_fp32(xq[b + j].d);
+            int32x4_t p = vdotq_s32(vdupq_n_s32(0), vld1q_s8(w[b + j].qs), vld1q_s8(xq[b + j].qs));
+            p = vdotq_s32(p, vld1q_s8(w[b + j].qs + 16), vld1q_s8(xq[b + j].qs + 16));
+            is[j] = vaddvq_s32(p);
         }
-        acc = vfmaq_f32(acc, vld1q_f32(ds), vcvtq_f32_s32(vld1q_s32(is)));
+        (void)i4;
+        acc = vfmaq_f32(acc, vmulq_f32(vld1q_f32(dw + b), vld1q_f32(dx + b)), vcvtq_f32_s32(vld1q_s32(is)));
     }
     s = vaddvq_f32(acc);
     for (; b < nb; ++b) {
         int32_t i = 0;
         for (int k = 0; k < QK8_0; ++k) i += (int32_t)w[b].qs[k] * xq[b].qs[k];
-        s += ggml_fp16_to_fp32(w[b].d) * ggml_fp16_to_fp32(xq[b].d) * (float)i;
+        s += dw[b] * dx[b] * (float)i;
     }
 #else
     for (int b = 0; b < nb; ++b) {
         int32_t i = 0;
         for (int k = 0; k < QK8_0; ++k) i += (int32_t)w[b].qs[k] * xq[b].qs[k];
-        s += ggml_fp16_to_fp32(w[b].d) * ggml_fp16_to_fp32(xq[b].d) * (float)i;
+        s += dw[b] * dx[b] * (float)i;
     }
 #endif
     return s;
@@ -1905,14 +1912,22 @@ static void rknpu_lmhead_rescore(struct ggml_tensor* node, int n_omp) {
     if (!L.t || node->src[0] != L.t) return;
     const struct ggml_tensor* x = node->src[1];
     const int64_t M = x->ne[1], N = L.N;
-    const float margin = rknpu_lmhead_margin();
+    // e = the largest INT4 error (the margin is 2 e). The INT4 top row's exact value is >= mx - e,
+    // so a row can only beat the exact top found so far if its INT4 value is > that top - e:
+    // stage 1 re-scores the rows within e of mx, stage 2 the rows within e of the exact top found
+    // (a subset of the rows within 2 e of mx). Same argmax guarantee, far fewer rows when the
+    // distribution is flat (an uncertain position can have 10k rows within 2 e)
+    const float margin = rknpu_lmhead_margin(), e = 0.5f * margin;
     const bool check = rknpu_lmhead_check();
+    const int nb = (int)(L.K / QK8_0);
     for (int64_t m = 0; m < M; ++m) {
         float* y = (float*)((char*)get_tensor_real_ptr(node) + m * node->nb[1]);
         const float* xr = (const float*)((const char*)get_tensor_real_ptr(x) + m * x->nb[1]);
         static std::vector<block_q8_0> xq;
-        if ((int64_t)xq.size() < L.K / QK8_0) xq.resize(L.K / QK8_0);
+        static std::vector<float> dx;
+        if ((int64_t)xq.size() < nb) { xq.resize(nb); dx.resize(nb); }
         quantize_row_q8_0_ref(xr, xq.data(), L.K);
+        for (int b = 0; b < nb; ++b) dx[b] = ggml_fp16_to_fp32(xq[b].d);
         float mx = -INFINITY;
         int64_t imx = 0;
         for (int64_t n = 0; n < N; ++n) if (y[n] > mx) { mx = y[n]; imx = n; }
@@ -1920,7 +1935,7 @@ static void rknpu_lmhead_rescore(struct ggml_tensor* node, int n_omp) {
             static std::vector<float> ex;
             if ((int64_t)ex.size() < N) ex.resize(N);
             #pragma omp parallel for num_threads(n_omp)
-            for (int64_t n = 0; n < N; ++n) ex[n] = rknpu_lmhead_exact(L, n, xq.data());
+            for (int64_t n = 0; n < N; ++n) ex[n] = rknpu_lmhead_exact(L, n, xq.data(), dx.data());
             double me = 0.0; int64_t iex = 0; float emx = -INFINITY; long cand = 0;
             for (int64_t n = 0; n < N; ++n) {
                 me = std::max(me, (double)fabsf(ex[n] - y[n]));
@@ -1937,11 +1952,17 @@ static void rknpu_lmhead_rescore(struct ggml_tensor* node, int n_omp) {
             for (int64_t n = 0; n < N; ++n) y[n] = ex[n];   // check mode: every logit exact
             continue;
         }
-        // rows within the margin of the INT4 top: exact values
-        const float thr = mx - margin;
-        #pragma omp parallel for num_threads(n_omp)
+        float top = -INFINITY;
+        #pragma omp parallel for num_threads(n_omp) reduction(max : top)
         for (int64_t n = 0; n < N; ++n) {
-            if (y[n] >= thr) y[n] = rknpu_lmhead_exact(L, n, xq.data());
+            if (y[n] >= mx - e) { y[n] = rknpu_lmhead_exact(L, n, xq.data(), dx.data()); top = std::max(top, y[n]); }
+        }
+        const float thr2 = top - e;
+        if (thr2 < mx - e) {   // rows in [thr2, mx - e) were not re-scored yet
+            #pragma omp parallel for num_threads(n_omp)
+            for (int64_t n = 0; n < N; ++n) {
+                if (y[n] >= thr2 && y[n] < mx - e) y[n] = rknpu_lmhead_exact(L, n, xq.data(), dx.data());
+            }
         }
     }
 }
@@ -4759,6 +4780,10 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
             g_lmhead.K = tensor->ne[0];
             g_lmhead.N = tensor->ne[1];
             g_lmhead.q8.assign((const uint8_t*)data, (const uint8_t*)data + size);
+            const int64_t nb = tensor->ne[0] / QK8_0;
+            g_lmhead.dw.resize(tensor->ne[1] * nb);
+            const block_q8_0* w = (const block_q8_0*)data;
+            for (int64_t i = 0; i < tensor->ne[1] * nb; ++i) g_lmhead.dw[i] = ggml_fp16_to_fp32(w[i].d);
         }
     } else {
         memcpy((uint8_t*)tensor->data + offset, data, size);
