@@ -8,8 +8,8 @@ Test logs on the board: `~/bench-logs/2026-10-10-prod/` (full suite),
 `~/bench-logs/2026-10-10-prod-fix/` (prompt speeds of the final default),
 `~/bench-logs/2026-10-10-kvfix-4096/` and `-kvfix-0/` (server runs with the
 KV-cache fix), `~/bench-logs/2026-10-10-ident/`, and for the NPU decode
-attention (2026-10-11) `~/bench-logs/2026-10-11-k8/` (server, final build with
-INT8 K) and `~/bench-logs/2026-10-11-dec-pptg/` (prompt speeds).
+attention (2026-10-11) `~/bench-logs/2026-10-11-k8/` and, for the final build
+with the INT4 LM head (2026-10-12), `~/bench-logs/2026-10-12-lmhead/` (server).
 
 ## 1. How to run it
 
@@ -39,7 +39,12 @@ Server, with the MTP drafter (fastest exact setup):
   ~8.5-9 t/s at short context.
 - Decode attention of the global layers runs on the NPU over a KV mirror
   (`RKNPU_FA_DEC`, default on; decode research #1o; K stored as INT8,
-  `RKNPU_FA_DEC_K8`). It costs ~384 MiB of extra memory at 32k and is not compatible with `--context-shift` (off by
+  `RKNPU_FA_DEC_K8`). It costs ~384 MiB of extra memory at 32k.
+- The LM head streams INT4 weights and re-scores the near-top logits exactly
+  from the original Q8_0 bytes (`RKNPU_LMHEAD_W4`, default on; #1r): the
+  argmax is exact (greedy output and MTP acceptance unchanged), the tail of
+  the distribution is INT4-quality (PPL 27.0 instead of 26.5), +10% decode.
+  It keeps 680 MiB of Q8_0 bytes in host memory and is not compatible with `--context-shift` (off by
   default): with context shift, set `RKNPU_FA_DEC=0`.
 
 ## 2. Supported sizes
@@ -55,8 +60,9 @@ Practical guidance (measured 2026-10-10): up to ~8k-token prompts
 prefill in under 40 s; 16k takes ~1.5 minutes; 32k takes ~4 minutes.
 
 Memory (server, `-c 32768`, 4 slots, MTP drafter loaded, NPU decode
-attention): resident size 8.5 GiB after a short prompt, 10.3 GiB peak after
-a 24.8k-token prompt; the board kept >= 8.2 GiB available throughout.
+attention, INT4 LM head with its Q8_0 copy): resident size 8.8 GiB after a
+short prompt, 10.6 GiB peak after a 24.8k-token prompt; the board kept
+>= 9.0 GiB available throughout.
 
 ## 3. Speed
 
@@ -65,7 +71,7 @@ a 24.8k-token prompt; the board kept >= 8.2 GiB available throughout.
 | Prompt tokens | 128 | 512 | 1k | 2k | 4k | 8k | 16k | 32k |
 |---|---|---|---|---|---|---|---|---|
 | t/s before #1m (2026-10-09) | 191.7 | 296.2 | 275.2 | 261.2 | 239.4 | 166.3 | 112.9 | 28.2 |
-| **t/s now (2026-10-10)** | **196** | **301** | **280** | **266** | **245** | **219** | **182** | **138** |
+| **t/s now (2026-10-12)** | **201** | **299** | **280** | **263** | **245** | **219** | **181** | **136** |
 | time now | 0.7 s | 1.7 s | 3.7 s | 7.7 s | 17 s | 37 s | 1.5 min | 4.0 min |
 
 (#1m: P*V chunking, FP16 scores, online softmax above 4096 KV cells
@@ -76,8 +82,8 @@ a 24.8k-token prompt; the board kept >= 8.2 GiB available throughout.
 
 | Context depth | 0 | 1k | 2k | 4k | 8k | 16k | 32k |
 |---|---|---|---|---|---|---|---|
-| **t/s, NPU decode attention, INT8 K (default)** | **9.00** | **8.18** | **7.84** | **7.92** | **7.55** | **6.96** | **6.30** |
-| t/s, NPU decode attention, FP16 K (`RKNPU_FA_DEC_K8=0`) | 8.98 | 8.18 | 7.97 | 7.85 | 7.40 | 6.87 | 5.98 |
+| **t/s, final (NPU decode attention, INT8 K, INT4 LM head)** | **9.76** | **8.46** | **8.38** | **8.23** | **7.99** | **7.34** | **6.50** |
+| t/s, before the INT4 LM head (2026-10-11) | 9.00 | 8.18 | 7.84 | 7.92 | 7.55 | 6.96 | 6.30 |
 | t/s, CPU attention (`RKNPU_FA_DEC=0`) | 8.99 | 8.25 | 8.03 | 7.63 | 6.70 | 5.72 | 4.43 |
 
 (The first generation after the context grows past a new 2048-position
@@ -87,20 +93,18 @@ block creates that block's NPU contexts, a one-time cost per block.)
 
 | Prompt tokens | Prompt t/s | Gen t/s, no draft | Gen t/s, MTP | MTP speed-up |
 |---|---|---|---|---|
-| 784 | 232 | 8.17 | 10.43 (*) | 1.28x |
-| 3,428 | 207 | 7.83 | 11.44 | 1.46x |
-| 6,637 | 193 | 7.54 | 11.11 | 1.47x |
-| 12,796 | 169 (2026-10-09: 115) | 7.17 (CPU attention: 6.23) | **11.46** (8.39) | 1.60x |
-| 24,767 | 138 (2026-10-09: 38) | 6.49 (4.96) | **8.49** (5.42) | 1.31x |
+| 784 | 235 | 8.41 | 11.64 | 1.38x |
+| 3,428 | 209 | 8.51 | 11.66 | 1.37x |
+| 6,637 | 193 | 8.25 | 12.35 | 1.50x |
+| 12,796 | 170 (2026-10-09: 115) | 7.80 (CPU attention: 6.23) | **11.50** (8.39) | 1.47x |
+| 24,767 | 139 (2026-10-09: 38) | 6.99 (4.96) | **9.67** (5.42) | 1.38x |
 
-(`~/bench-logs/2026-10-11-k8/`, final build. (*) This summary's text differs
-from the CPU-attention run's and accepts fewer drafts; MTP speed depends on
-the text: the same build gave 8.5-8.7 t/s on the 24.8k summary in other
-runs.)
+(`~/bench-logs/2026-10-12-lmhead/`, final build. MTP speed depends on the
+text: how many drafts the summary accepts varies by +-10% between texts.)
 
-Short prompts (holdout, 6 prompts x 256 tokens): **17.5 t/s with MTP** vs
-8.7 without (2.0x); the 4 bench prompts gave 18.4 t/s. With the NPU decode
-attention, MTP's verify steps no longer slow down much with the context.
+Short prompts (holdout, 6 prompts x 256 tokens): **18.8 t/s with MTP** vs
+9.5 without (2.0x). With the NPU decode attention, MTP's verify steps no
+longer slow down much with the context.
 
 ## 4. Accuracy
 
@@ -108,15 +112,16 @@ attention, MTP's verify steps no longer slow down much with the context.
   runs (prompts 0.8k-24.8k, with and without MTP). The 256-token summaries
   are coherent and on-topic up to 24.8k tokens.
 - **MTP is exact:** MTP output is byte-identical to no-draft output
-  (2026-10-11, with the NPU decode attention: all 10 server answers at
-  0.8k-24.8k prompts; holdout 6/6 at 256 and 512 tokens). This needs the `llama-kv-cache` fix on this branch (#1n):
+  (2026-10-12, final build: all 10 server answers at 0.8k-24.8k prompts;
+  holdout 6/6 at 256 and 512 tokens; the 4 bench prompts still produce the
+  texts of the 2026-10-02 CPU-attention build). This needs the `llama-kv-cache` fix on this branch (#1n):
   without it, rejected drafts shift the sliding-window cache's cell order,
   the attention rounds differently, and an answer can change at a near-tie.
 - **NPU vs CPU perplexity (wikitext-2):** see the table below.
 
 | Context | NPU PPL | CPU PPL (reference) |
 |---|---|---|
-| 512 (32 chunks, guard) | 27.2322 | 27.01 (#3d; same quantization) |
+| 512 (32 chunks, guard) | 26.92 (INT4 LM head; 26.55 with the INT8 LM head) | 27.01 (#3d; same quantization) |
 | 2048 (8 chunks) | 22.64 +/- 0.85 | 24.88 +/- 1.05 |
 | 8192 (2 chunks) | 21.89 +/- 0.81 | 20.88 +/- 0.82 |
 
@@ -154,10 +159,11 @@ did pp128 25.2 / tg 4.9.
 | Robustness | bounded NPU attention context cache, NPU attention limited to validated shapes, async-runner race fix | prompts >= 8k no longer crash; server no longer segfaults on prefill (#1l) |
 | Long prompts | P*V in 2048-position chunks (the NPU FP16 matmul collapses past K 4096), NPU attention to 32k, FP16 scores, online softmax per chunk, early P*V, chunk outputs combined in host memory | pp8k 166 -> ~220, pp16k 113 -> ~181, pp32k 28 -> ~134 (#1m) |
 | Long-context decode | NPU decode/verify attention for the global layers over a persistent native-layout KV mirror (INT8 K), short rows on a grouped CPU kernel | tg32 @16k 5.72 -> 6.96, @32k 4.43 -> 6.30; MTP on a 24.8k summary 5.42 -> 8.5 (#1o, #1p) |
+| LM head bytes | INT4 LM head, near-top logits re-scored exactly from the Q8_0 bytes | tg 8.96 -> 9.8, MTP holdout 17.5 -> 18.8, long-prompt MTP 8.5 -> 9.7 (#1r) |
 
 Total for E4B against the original backend's default: **prefill 4.8x**
-at pp128 (39.8 -> 192; larger prompts gain more: pp512 299, pp16k 182), **decode 2.7x without a drafter**
-(3.3 -> 8.97) and **5.6x with MTP** (3.3 -> 18.4), at CPU-level accuracy.
+at pp128 (39.8 -> 201; larger prompts gain more: pp512 299, pp16k 181), **decode 3.0x without a drafter**
+(3.3 -> 9.8) and **5.7x with MTP** (3.3 -> 18.8), at CPU-level accuracy.
 
 Every change is described, with its measurements and rejected
 alternatives, in `RKNPU2-decode-research.md` (section numbers above) and

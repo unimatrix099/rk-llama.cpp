@@ -1478,6 +1478,31 @@ Conclusion: the prefill softmax is bound by memory traffic through the NPU's nat
 these cores; the cheap software levers are exhausted. Prefill stays at pp512 299, pp16384 182,
 pp32768 137.
 
+### 1r. Token generation vs the bandwidth ceiling: four ideas (2026-10-12)
+
+**Where a token goes** (tg128/tg256 differential, short context, 112 ms): NPU runs 99.5 ms
+(89%), backend CPU work between runs 8 ms, scheduler + ggml-cpu ops ~4.5 ms. Bytes streamed
+per token: FFN INT4 ~1.58 GB, LM head INT8 0.67 GB (25%), attention INT4 ~0.29 GB, PLE
+projection BF16 0.055 GB (CPU) = ~2.6 GB. Ceilings: LPDDR5 theoretical 38.4 GB/s (69 ms,
+14.5 t/s); the NPU's measured 3-core driver ceiling 26.6-28.6 GB/s (92-99 ms, 10.1-10.9 t/s);
+CPU + NPU on different bytes ~30 GB/s. The NPU runs sit at that ceiling (2.6 GB in 99.5 ms =
+26.5 GB/s): ~90% of the practical maximum for this byte count. Probe of the matmul types on
+this platform (`rknpu2-decode-attn-probe.c`-style, M = 1/8, K 2560): FP16xFP16, INT8xINT8 and
+INT4xINT4 run at 11.1-11.2 GB/s per core; FP16xINT4, INT8xINT4 and FP16xINT8 are unsupported,
+so the only remaining byte lever is the INT8 LM head.
+
+| # | Idea | Measurement | Verdict |
+|---|---|---|---|
+| 1 | **LM head on W4A4 with exact re-scoring** (`RKNPU_LMHEAD_W4`, `RKNPU_LMHEAD_MARGIN`): the Q8_0 LM head is packed as W4A4 (half the bytes) and its original bytes are kept; after the node, every row whose INT4 logit is within the margin of the INT4 maximum is recomputed with ggml-cpu's own Q8_0 x Q8_0 integer math (NEON, ~0.1 us per row). `RKNPU_LMHEAD_CHECK=1` recomputes every row: the largest INT4 error is 4.5 on llama-bench text and 5.7 on wikitext (1024 rows), and the INT4 argmax alone is wrong on ~7-10% of tokens (which is why the plain W4A4 LM head of #1i cost MTP 7% acceptance). Margin 14 (> 2 x 5.7) re-scores ~40 rows per token; margins past ~20 cover most of the vocabulary (logits are clustered) and cost 20%+. | tg64 8.96 -> 9.83 (+9.7%); holdout no-draft 8.68 -> 9.51, MTP 17.52 -> 18.78 (+7.2%). PPL32 27.0046 (W8A8 head 26.5468: the softmax tail is INT4-quality; margin 24/40 give 26.78/26.71 at a large speed cost), KLD 0.607, same-top 70.9; the 4 server decode texts identical to the old references; 12.8k MTP == no-draft; holdout 6/6 | **KEPT**, default on, margin 14 |
+| 2 | Fuse Q/K/V and gate/up into one NPU run each (fixed ~33 us per run) | standalone probe at the decode shapes, 3 cores, 64-aligned N segments: Q,K,V 0.227 -> 0.193 ms, gate/up 0.893 -> 0.875 ms per layer = 2.3 ms per token (~2.2%) before integration costs | NO-GO: at the bar for a change across weight packing, dispatch and the norm/RoPE fusions |
+| 3 | `per_layer_model_proj` on the NPU as W8A8 | 52.5 MiB BF16 on the CPU ~2.6 ms vs ~1.2 ms as INT8 on the NPU: ~1.4% | NO-GO: below the bar |
+| 4 | MTP draft trees (a sibling leaf from the drafter's 2nd candidate next to each chain token, verified in the same batch) | probe on the 6 holdout prompts (445 verifies, 3.45 tokens per verify, 54% of rejections at the first draft): a leaf at every position would add +0.17 tokens per verify (+4.9%; the 3rd candidate +0.07) but each extra verify row costs 2.8 ms at depth 0 (M 1/6/11/16: 102/118/132/144 ms, +12% for 5 rows) and ~11 ms at depth 4096; one leaf at the first position only: +2.7% tokens for +2.4-5% time | NO-GO: net <= 0 |
+
+Open from the per-row numbers: a verify row costs ~11 ms at depth 4096 against 2.8 ms at
+depth 0; the 35 sliding-window layers' ggml-cpu attention walks the whole 2560-cell ring per
+row (only 512 are visible). A mask-range skip there (bit-identical) is the next candidate for
+MTP at long context.
+
 ### 2. Cooperative CPU+NPU decode — MEASURED: NO-GO (probe, 2026-08-10)
 
 `rknpu2-coop-decode-probe` ran on the board (pinned clocks). Bandwidths do
@@ -2581,6 +2606,9 @@ becomes a server.
 | `RKNPU_FA_ONLINE` | 1 | 0 = one-pass softmax over the whole row instead of the per-chunk online softmax (#1m) |
 | `RKNPU_FA_ONLINE_MIN` | 4096 | online softmax only above this many KV cells (0 = always; 3-4% slower on prompts up to 4k) (#1n) |
 | `RKNPU_FA_DEC` | 1 | decode/verify attention of the head-dim-512 layers on the NPU over a KV mirror (#1o); 0 = ggml-cpu |
+| `RKNPU_LMHEAD_W4` | 1 | Q8_0 LM head packed as W4A4, near-top logits re-scored exactly from the Q8_0 bytes (#1r) |
+| `RKNPU_LMHEAD_MARGIN` | 14 | rows within this many logits of the INT4 maximum are re-scored (#1r) |
+| `RKNPU_LMHEAD_CHECK` | 0 | debug: re-score every row and report the largest INT4 error |
 | `RKNPU_FA_DEC_K8` | 1 | decode Q*K^T with INT8 K (per position) and INT8 Q (per row); 0 = FP16 K (#1p) |
 | `RKNPU_FA_DEC_CPU_MAX` | 1024 | rows that see at most this many cells use the backend's CPU kernel instead (#1o) |
 | `RKNPU_FA_DEC_CHECK` | 0 | debug: compare the whole KV mirror with the cache at every decode attention |
