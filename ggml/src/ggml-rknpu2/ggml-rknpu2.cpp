@@ -25,8 +25,6 @@
 #include <chrono>
 #include <deque>
 #include <unordered_set>
-#include <pthread.h>
-#include <sched.h>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -622,63 +620,6 @@ struct rknpu_fn_pool {
     bool quit = false;
 };
 
-// Helper threads on the little cores (RKNPU_FA_LITTLE = number of helpers, pinned to CPUs
-// 0..n-1; the process itself runs on the big cores): they take part of the prefill softmax.
-// run() hands every helper the same job (the job pulls work items from a shared counter),
-// wait() returns when all helpers are done with it.
-struct rknpu_little_pool {
-    void run(const std::function<void()>& fn, int n) {
-        std::unique_lock<std::mutex> lock(mutex);
-        while ((int)threads.size() < n) {
-            const int cpu = (int)threads.size();
-            threads.emplace_back([this, cpu] {
-                cpu_set_t set;
-                CPU_ZERO(&set);
-                CPU_SET(cpu, &set);
-                pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-                worker();
-            });
-        }
-        job = &fn;
-        active = (int)threads.size();
-        ++gen;
-        cv.notify_all();
-    }
-    void wait() {
-        std::unique_lock<std::mutex> lock(mutex);
-        cv_done.wait(lock, [&] { return active == 0; });
-        job = nullptr;
-    }
-    ~rknpu_little_pool() {
-        { std::lock_guard<std::mutex> lock(mutex); quit = true; cv.notify_all(); }
-        for (auto& th : threads) th.join();
-    }
-  private:
-    void worker() {
-        uint64_t seen = 0;
-        for (;;) {
-            const std::function<void()>* fn;
-            {
-                std::unique_lock<std::mutex> lock(mutex);
-                cv.wait(lock, [&] { return quit || gen != seen; });
-                if (quit) return;
-                seen = gen;
-                fn = job;
-            }
-            (*fn)();
-            { std::lock_guard<std::mutex> lock(mutex); --active; }
-            cv_done.notify_all();
-        }
-    }
-    std::vector<std::thread> threads;
-    std::mutex mutex;
-    std::condition_variable cv, cv_done;
-    const std::function<void()>* job = nullptr;
-    uint64_t gen = 0;
-    int active = 0;
-    bool quit = false;
-};
-
 // Backend main context
 struct ggml_backend_rknpu_context {
     std::string name;
@@ -702,7 +643,6 @@ struct ggml_backend_rknpu_context {
     // done inside its projection's dequant)
     std::unordered_set<const struct ggml_tensor*> done_nodes;
     rknpu_fn_pool fa_pool;
-    rknpu_little_pool little_pool;
     std::vector<float> fa_stats[3];   // online softmax: per in-flight item (core slot), [row][chunk][m, l]
     std::vector<float> fa_out[3];     // host-side P*V output per slot: the chunk outputs are combined here, never in the DMA buffers
     // early P*V (online path): per slot, a thread runs chunk c's P*V as soon as its softmax is done
@@ -2605,10 +2545,6 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
         const char* env = std::getenv("RKNPU_FA_S16");
         return env == nullptr || std::atoi(env) != 0;
     }();
-    static const int little_n = []() {
-        const char* env = std::getenv("RKNPU_FA_LITTLE");
-        return env ? std::max(0, std::min(4, std::atoi(env))) : 0;
-    }();
     const int64_t DK = k->ne[0], DV = v->ne[0];
     const int64_t n_q = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1], n_kvh = k->ne[2];
     const int64_t rk2 = n_head / n_kvh;
@@ -2782,12 +2718,8 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                 });
                 for (int c = 0; c < n_pvc; ++c) {
                     const int64_t c0 = c * KC, c1 = std::min(n_kv, c0 + KC);
-                    // row blocks from a shared counter: the OpenMP team and the little-core
-                    // helpers (RKNPU_FA_LITTLE) take blocks until none are left; a block is
-                    // computed the same way on any thread
-                    std::atomic<int64_t> next_blk{0};
-                    const int64_t n_blk = M / FR;
-                    auto block = [&](int64_t r0) {
+                    #pragma omp parallel for num_threads(n_omp)
+                    for (int64_t r0 = 0; r0 < M; r0 += FR) {
                         static thread_local std::vector<float> row;
                         static thread_local std::vector<uint16_t> p_buf, h_buf;
                         if ((int64_t)row.size() < n_kv) row.resize(n_kv);
@@ -2831,14 +2763,7 @@ static void rknpu_flash_attn(ggml_backend_rknpu_context* bctx, struct ggml_tenso
                             pr[k] = (uint8_t*)(pk + c0);
                         }
                         rknpu_native_scatter_rows((uint8_t*)pvs[c]->A->virt_addr, pr, FR, (int)r0, pvs[c]->a_geom, pvs[c]->a_geom.sub * 2);
-                    };
-                    const std::function<void()> pull = [&] {
-                        for (int64_t bi; (bi = next_blk.fetch_add(1)) < n_blk;) block(bi * FR);
-                    };
-                    if (little_n > 0) bctx->little_pool.run(pull, little_n);
-                    #pragma omp parallel num_threads(n_omp)
-                    pull();
-                    if (little_n > 0) bctx->little_pool.wait();
+                    }
                     {
                         std::lock_guard<std::mutex> lk(bctx->fa_pv_mu[core]);
                         bctx->fa_pv_ready[core] = c + 1;
