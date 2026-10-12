@@ -1854,7 +1854,7 @@ static bool rknpu_lmhead_w4() {
     return v;
 }
 static float rknpu_lmhead_margin() {
-    static const float v = []() { const char* e = std::getenv("RKNPU_LMHEAD_MARGIN"); return e ? (float)std::atof(e) : 12.0f; }();   // wikitext: max INT4 error 5.7 (#1r)
+    static const float v = []() { const char* e = std::getenv("RKNPU_LMHEAD_MARGIN"); return e ? (float)std::atof(e) : 14.0f; }();   // >= 2x the largest INT4 error seen (5.7 on wikitext, #1r), with headroom
     return v;
 }
 static bool rknpu_lmhead_check() {
