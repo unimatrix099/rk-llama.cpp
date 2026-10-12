@@ -1324,7 +1324,7 @@ struct rknpu_kv_mirror {   // one cache tensor (K or V), all its KV heads
     int sN = 0, sK = 0;               // native B cell geometry
     std::vector<std::unique_ptr<rknpu_dec_ctx>> ctxs;   // [head][chunk], created on first use
     std::atomic<bool> needs_sync{false};                // bulk writes: one whole-buffer sync before the next use
-    int64_t filled = 0;                                 // cells [0, filled) were copied from the cache; beyond, zero until written
+
     std::unordered_set<const void*> users;              // backends that attended through it; freed with the last
     ~rknpu_kv_mirror() {
         ctxs.clear();   // the contexts and their B views first, then the buffer they view
@@ -1409,21 +1409,20 @@ static void rknpu_mirror_store(rknpu_kv_mirror* m, int64_t pos, bool clean) {
     }
 }
 
-// (re)fill the mirror from the cache over [lo, hi): the cells an attention over n_kv cells can
-// read. Cells past `filled` are zero (finite) until a KV write or a later fill reaches them
-static void rknpu_mirror_fill(rknpu_kv_mirror* m, int64_t lo, int64_t hi) {
-    hi = std::min(hi, m->kv_size);
+// (re)fill the mirror from the cache over [0, n_kv): the cells an attention over n_kv cells can
+// read. Cells beyond are zero (finite) and are written through the store path before any
+// attention reaches them (a cell is only attended after it was written)
+static void rknpu_mirror_fill(rknpu_kv_mirror* m, int64_t n_kv) {
+    const int64_t hi = std::min(n_kv, m->kv_size);
     #pragma omp parallel for
-    for (int64_t pos = lo; pos < hi; ++pos) rknpu_mirror_store(m, pos, false);
+    for (int64_t pos = 0; pos < hi; ++pos) rknpu_mirror_store(m, pos, false);
     rknn_mem_sync(m->alloc_ctx, m->mem, RKNN_MEMORY_SYNC_TO_DEVICE);
     m->needs_sync = false;
-    m->filled = std::max(m->filled, hi);
 }
 
 // spot check: a few cells of [0, n_kv) equal in cache and mirror (a new cache at a reused tensor
 // address, or a write that bypassed this backend, would differ); refill when not
 static void rknpu_mirror_validate(rknpu_kv_mirror* m, int64_t n_kv) {
-    if (n_kv > m->filled) rknpu_mirror_fill(m, m->filled, n_kv);   // cells written before the mirror existed, or never
     const struct ggml_tensor* t = m->cache;
     const int64_t probes[8] = { 0, n_kv / 7, 2 * n_kv / 7, 3 * n_kv / 7, 4 * n_kv / 7, 5 * n_kv / 7, 6 * n_kv / 7, n_kv - 1 };
     for (int64_t pos : probes) {
@@ -1434,14 +1433,14 @@ static void rknpu_mirror_validate(rknpu_kv_mirror* m, int64_t n_kv) {
                 const float sc = rknpu_quant_row8(row + h * RKNPU_DEC_DK, RKNPU_DEC_DK, q);
                 bool same = sc == m->kscale[h * m->kv_size + pos];
                 for (int64_t d = 0; d < RKNPU_DEC_DK && same; d += 61) same = rknpu_mirror_head8(m, h)[rknpu_mirror_k_off(m, pos, d)] == q[d];
-                if (!same) { rknpu_mirror_fill(m, 0, n_kv); return; }
+                if (!same) { rknpu_mirror_fill(m, n_kv); return; }
             }
             continue;
         }
         for (int64_t h = 0; h < m->n_kvh; ++h) for (int64_t d = 0; d < RKNPU_DEC_DK; d += 61) {
             const size_t o = m->is_v ? rknpu_mirror_v_off(m, pos, d) : rknpu_mirror_k_off(m, pos, d);
             if (rknpu_mirror_head(m, h)[o] != row[h * RKNPU_DEC_DK + d]) {
-                rknpu_mirror_fill(m, 0, n_kv);
+                rknpu_mirror_fill(m, n_kv);
                 return;
             }
         }
@@ -1535,7 +1534,7 @@ static rknpu_kv_mirror* rknpu_mirror_get(const struct ggml_tensor* cache, bool i
     }
     memset(m->mem->virt_addr, 0, bytes);   // unfilled cells must be finite (P = 0 there)
     m->ctxs.resize(n_kvh * m->n_chunks);
-    rknpu_mirror_fill(m.get(), 0, n_kv);
+    rknpu_mirror_fill(m.get(), n_kv);
     rknpu_kv_mirror* r = m.get();
     map.emplace(cache, std::move(m));
     return r;
