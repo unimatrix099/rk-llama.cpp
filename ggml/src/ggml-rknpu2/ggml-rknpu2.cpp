@@ -1834,6 +1834,101 @@ static void rknpu_flash_attn_decode(const void* user, struct ggml_tensor* dst, i
 }
 // ---------------------------------------------------------------------------
 
+// LM head on W4A4 with exact re-scoring (RKNPU_LMHEAD_W4, decode research #1r). The INT4
+// pass gives every logit with a bounded error e; the rows whose INT4 logit is within
+// RKNPU_LMHEAD_MARGIN (>= 2 e) of the INT4 maximum are recomputed from the Q8_0 bytes in FP32,
+// so the argmax is exact while the LM head streams half the bytes. RKNPU_LMHEAD_CHECK=1
+// recomputes every row and reports the largest INT4 error (to set the margin).
+struct rknpu_lmhead_state {
+    std::mutex mu;
+    const struct ggml_tensor* t = nullptr;
+    std::vector<uint8_t> q8;   // the original Q8_0 bytes
+    int64_t K = 0, N = 0;
+    // check mode statistics
+    double max_err = 0.0, max_err_top = 0.0;
+    long rows = 0, argmax_changed = 0, cand_total = 0;
+};
+static rknpu_lmhead_state g_lmhead;
+static bool rknpu_lmhead_w4() {
+    static const bool v = []() { const char* e = std::getenv("RKNPU_LMHEAD_W4"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
+static float rknpu_lmhead_margin() {
+    static const float v = []() { const char* e = std::getenv("RKNPU_LMHEAD_MARGIN"); return e ? (float)std::atof(e) : 3.0f; }();
+    return v;
+}
+static bool rknpu_lmhead_check() {
+    static const bool v = []() { const char* e = std::getenv("RKNPU_LMHEAD_CHECK"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
+// exact logit of row n: dequantized Q8_0 row . FP32 activation
+static float rknpu_lmhead_exact(const rknpu_lmhead_state& L, int64_t n, const float* x, float* tmp) {
+    dequantize_row_q8_0((const block_q8_0*)L.q8.data() + n * (L.K / QK8_0), tmp, L.K);
+    float s = 0.0f;
+    int64_t k = 0;
+#ifdef __ARM_NEON
+    float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+    for (; k + 16 <= L.K; k += 16) {
+        a0 = vfmaq_f32(a0, vld1q_f32(tmp + k),      vld1q_f32(x + k));
+        a1 = vfmaq_f32(a1, vld1q_f32(tmp + k + 4),  vld1q_f32(x + k + 4));
+        a2 = vfmaq_f32(a2, vld1q_f32(tmp + k + 8),  vld1q_f32(x + k + 8));
+        a3 = vfmaq_f32(a3, vld1q_f32(tmp + k + 12), vld1q_f32(x + k + 12));
+    }
+    s = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+#endif
+    for (; k < L.K; ++k) s += tmp[k] * x[k];
+    return s;
+}
+static void rknpu_lmhead_rescore(struct ggml_tensor* node, int n_omp) {
+    rknpu_lmhead_state& L = g_lmhead;
+    if (!L.t || node->src[0] != L.t) return;
+    const struct ggml_tensor* x = node->src[1];
+    const int64_t M = x->ne[1], N = L.N;
+    const float margin = rknpu_lmhead_margin();
+    const bool check = rknpu_lmhead_check();
+    for (int64_t m = 0; m < M; ++m) {
+        float* y = (float*)((char*)get_tensor_real_ptr(node) + m * node->nb[1]);
+        const float* xr = (const float*)((const char*)get_tensor_real_ptr(x) + m * x->nb[1]);
+        float mx = -INFINITY;
+        int64_t imx = 0;
+        for (int64_t n = 0; n < N; ++n) if (y[n] > mx) { mx = y[n]; imx = n; }
+        if (check) {
+            static std::vector<float> ex;
+            if ((int64_t)ex.size() < N) ex.resize(N);
+            #pragma omp parallel for num_threads(n_omp)
+            for (int64_t n = 0; n < N; ++n) {
+                static thread_local std::vector<float> tmp;
+                if ((int64_t)tmp.size() < L.K) tmp.resize(L.K);
+                ex[n] = rknpu_lmhead_exact(L, n, xr, tmp.data());
+            }
+            double me = 0.0; int64_t iex = 0; float emx = -INFINITY; long cand = 0;
+            for (int64_t n = 0; n < N; ++n) {
+                me = std::max(me, (double)fabsf(ex[n] - y[n]));
+                if (ex[n] > emx) { emx = ex[n]; iex = n; }
+                cand += y[n] >= mx - margin;
+            }
+            std::lock_guard<std::mutex> lock(L.mu);
+            L.max_err = std::max(L.max_err, me);
+            L.max_err_top = std::max(L.max_err_top, (double)fabsf(ex[imx] - y[imx]));
+            L.argmax_changed += iex != imx;
+            L.cand_total += cand;
+            if (++L.rows % 64 == 0) fprintf(stderr, "LMHEAD_CHECK rows=%ld max|err| %.3f (at the INT4 top %.3f) argmax differs %ld, candidates/row at margin %.1f: %.1f\n",
+                                            L.rows, L.max_err, L.max_err_top, L.argmax_changed, margin, (double)L.cand_total / L.rows);
+            for (int64_t n = 0; n < N; ++n) y[n] = ex[n];   // check mode: every logit exact
+            continue;
+        }
+        // rows within the margin of the INT4 top: exact values
+        const float thr = mx - margin;
+        #pragma omp parallel for num_threads(n_omp)
+        for (int64_t n = 0; n < N; ++n) {
+            if (y[n] < thr) continue;
+            static thread_local std::vector<float> tmp;
+            if ((int64_t)tmp.size() < L.K) tmp.resize(L.K);
+            y[n] = rknpu_lmhead_exact(L, n, xr, tmp.data());
+        }
+    }
+}
+
 // KV-cache writes of the fused K (normed + roped) and V (normed) rows:
 // SET_ROWS from a view of those outputs into an F16 (or F32) cache, with
 // ggml-cpu's conversion (round to nearest even) (RKNPU_KV_WRITE)
@@ -4166,6 +4261,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute_impl(ggml_backend_t bac
                 }
             }
         }
+        rknpu_lmhead_rescore(node, n_omp);
         if (g_rknpu_profile.on) g_rknpu_profile.node_ns += rknpu_profile::ns(t_node, std::chrono::steady_clock::now());
         if (fuse_glu && all_k_segments.size() == 1) {
             ++node_i;   // the GLU was computed inside this node's dequant
@@ -4636,6 +4732,16 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
         // from them in place (get_alloc_size reserves the room).
         if (rknpu_cpu_decode_threshold() > 0) {
             memcpy((uint8_t*)tensor->data + offset, data, size);
+        }
+        // the Q8_0 LM head on W4A4 keeps its original bytes for the exact re-scoring
+        if (rknpu_lmhead_w4() && tensor->type == GGML_TYPE_Q8_0 && pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4 &&
+            offset == 0 && size == ggml_nbytes(tensor)) {
+            std::lock_guard<std::mutex> lock(g_lmhead.mu);
+            GGML_ASSERT((!g_lmhead.t || g_lmhead.t == tensor) && "RKNPU2: one Q8_0 LM head expected");
+            g_lmhead.t = tensor;
+            g_lmhead.K = tensor->ne[0];
+            g_lmhead.N = tensor->ne[1];
+            g_lmhead.q8.assign((const uint8_t*)data, (const uint8_t*)data + size);
         }
     } else {
         memcpy((uint8_t*)tensor->data + offset, data, size);
